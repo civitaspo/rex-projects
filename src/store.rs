@@ -477,6 +477,20 @@ impl ConfigStore {
         agent_launch_phase::mark_ambiguous(&mut self.connection, owner_generation, reservation)
     }
 
+    pub(crate) fn finalize_rejected_unstarted_agent_runs(
+        &mut self,
+        owner_generation: u64,
+        inventory: &crate::adapters::rex::CompleteRexSessionInventory,
+        now_unix: i64,
+    ) -> Result<usize, String> {
+        agent_launch_phase::finalize_rejected_unstarted_runs(
+            &mut self.connection,
+            owner_generation,
+            inventory,
+            now_unix,
+        )
+    }
+
     /// Open an existing controller database for read-only inspection.
     ///
     /// This path never creates the state root or database and never runs migrations.
@@ -6872,6 +6886,19 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn typed_failed_start_effect_finalizes_only_after_owner_restart() {
+        published_publication_fixture(
+            true,
+            Some(MergeClaimRecoveryFixture::RejectedLaunchFinalizer),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
     fn stale_ticket_run_after_create_attempt_is_never_typed_precreate_rejection() {
         published_publication_fixture(
             true,
@@ -7472,6 +7499,7 @@ pub(crate) mod tests {
         DuplicateObservedBlocks,
         MismatchedObservedBlockMetadata,
         FirstStartAckFence,
+        RejectedLaunchFinalizer,
         IntentLaunch,
         StaleCoordinatorConfig,
         StaleMergeDecisionConfig,
@@ -7510,11 +7538,16 @@ pub(crate) mod tests {
                     | MergeClaimRecoveryFixture::ContradictoryObservedBlock
                     | MergeClaimRecoveryFixture::DuplicateObservedBlocks
                     | MergeClaimRecoveryFixture::MismatchedObservedBlockMetadata
+                    | MergeClaimRecoveryFixture::RejectedLaunchFinalizer
             )
         );
         let exercise_stale_after_create_attempt = matches!(
             recovery_case,
             Some(MergeClaimRecoveryFixture::StaleAfterCreateAttempt)
+        );
+        let exercise_rejected_launch_finalizer = matches!(
+            recovery_case,
+            Some(MergeClaimRecoveryFixture::RejectedLaunchFinalizer)
         );
         let exercise_stale_at_create_cas = matches!(
             recovery_case,
@@ -7682,7 +7715,7 @@ pub(crate) mod tests {
             applied.config.runtime.environment.source = crate::config::EnvironmentSource::Inherit;
             let config_file = temp.path().join("recovery-runtime-config.toml");
             std::fs::write(&config_file, "fixture runtime config\n").unwrap();
-            Some((config_file, provider_cli))
+            Some((config_file, provider_cli, rex_cli))
         } else {
             None
         };
@@ -7739,7 +7772,7 @@ pub(crate) mod tests {
                 options: None,
             },
         );
-        if let Some((_, provider_cli)) = &runtime_launch_config {
+        if let Some((_, provider_cli, _)) = &runtime_launch_config {
             applied
                 .profiles
                 .get_mut(&crate::domain::ids::ProfileId::parse("worker_codex").unwrap())
@@ -10491,15 +10524,36 @@ pub(crate) mod tests {
                             attempt_count: 1,
                             created_at_unix: 20,
                         };
-                        let result = services.handle_start_agent_for_test(
-                            crate::effects::EffectMode::Reconcile,
-                            &request,
-                            &mut crate::effects::EffectContext {
-                                store: &mut store,
-                                owner_generation,
-                                now_unix: 20,
-                            },
-                        );
+                        let result = if exercise_rejected_launch_finalizer {
+                            let dispatch_now = crate::store::now_unix().unwrap();
+                            let dispatch = services
+                                .dispatch_start_agent_for_test(
+                                    &mut store,
+                                    owner_generation,
+                                    dispatch_now,
+                                )
+                                .unwrap();
+                            assert!(matches!(
+                                dispatch,
+                                crate::effects::DispatchTick::Completed { .. }
+                            ));
+                            let receipt: String = store.connection.query_row(
+                                "SELECT receipt_json FROM effects WHERE operation_id=?1 AND status='failed' AND kind='start_agent'",
+                                [reservation.operation_id.as_str()],
+                                |row| row.get(0),
+                            ).unwrap();
+                            Ok(crate::effects::EffectObservation::Rejected { receipt })
+                        } else {
+                            services.handle_start_agent_for_test(
+                                crate::effects::EffectMode::Reconcile,
+                                &request,
+                                &mut crate::effects::EffectContext {
+                                    store: &mut store,
+                                    owner_generation,
+                                    now_unix: 20,
+                                },
+                            )
+                        };
                         if exercise_stale_after_create_attempt {
                             let error = result.unwrap_err();
                             assert!(error.contains("after the Rex create boundary"), "{error}");
@@ -10647,6 +10701,392 @@ pub(crate) mod tests {
                             },
                             "{package_error}"
                         );
+                        if exercise_rejected_launch_finalizer {
+                            let pre_restart_inventory = crate::adapters::rex::complete_session_inventory_for_test(
+                                serde_json::json!({
+                                    "session_id": rex_identity.session_id,
+                                    "windows": [{"window_id":active_ticket_view.view.rex_window_id,"label":"ticket","layers":[{"blocks":[]}]}]
+                                }),
+                                &rex_identity.instance_id,
+                                &rex_identity.session_id,
+                            ).unwrap();
+                            assert_eq!(
+                                store
+                                    .finalize_rejected_unstarted_agent_runs(
+                                        owner_generation,
+                                        &pre_restart_inventory,
+                                        crate::store::now_unix().unwrap(),
+                                    )
+                                    .unwrap(),
+                                0,
+                                "the active original owner cannot finalize a pre-restart launch"
+                            );
+                            let new_generation = store
+                                .start_owner(&OwnerMetadata {
+                                    owner_nonce: "rejected-launch-finalizer-restart".into(),
+                                    state_root: temp.path().to_string_lossy().into_owned(),
+                                    config_source: "factory".into(),
+                                    process_start_identity: "rejected-launch-finalizer-test".into(),
+                                    executable_path: "/tmp/rex-projects-test".into(),
+                                    executable_digest: "e".repeat(64),
+                                    rex_endpoint: None,
+                                    rex_server_identity: None,
+                                    rex_session_id: None,
+                                    rex_block_id: None,
+                                })
+                                .unwrap();
+                            assert!(new_generation > owner_generation);
+                            services = crate::runtime_services::RuntimeServices::new(
+                                &applied,
+                                &environment,
+                                &runtime_launch_config.as_ref().unwrap().0,
+                                &runtime_state,
+                                new_generation,
+                                &rex_identity,
+                                crate::runtime_services::RuntimeExecutable {
+                                    path: &runtime_binary,
+                                    digest: &runtime_digest,
+                                },
+                            )
+                            .unwrap();
+                            use std::os::unix::fs::PermissionsExt;
+                            let rex_cli = &runtime_launch_config.as_ref().unwrap().2;
+                            std::fs::write(
+                                rex_cli,
+                                "#!/bin/sh\ncase \"$*\" in\n  *\"whoami --json\"*) printf '%s\\n' '{\"endpoint\":\"http://fixture\",\"instance_id\":\"fixture-rex\",\"host_id\":\"fixture-host\",\"rex_version\":\"test\"}' ;;\n  *\"api call session.view\"*) printf '%s\\n' '{\"session_id\":\"fixture-session\",\"windows\":[{\"window_id\":\"fixture-window\",\"label\":\"ticket\",\"layers\":[{\"blocks\":[{\"block_id\":\"anchor-block\",\"label\":\"anchor\"}]}]}]}' ;;\n  *\"events -s fixture-session --json\"*) exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+                            ).unwrap();
+                            let mut permissions = std::fs::metadata(rex_cli).unwrap().permissions();
+                            permissions.set_mode(0o700);
+                            std::fs::set_permissions(rex_cli, permissions).unwrap();
+                            let inventory_probe = services.observe_complete_rex_for_test().unwrap();
+                            assert!(
+                                inventory_probe.matches_view(
+                                    &rex_identity.instance_id,
+                                    &rex_identity.session_id,
+                                    &active_ticket_view.view.rex_window_id,
+                                ),
+                                "fixture inventory must exactly match the persisted Rex view"
+                            );
+                            assert!(
+                                !inventory_probe.contains_block_label(
+                                    &crate::adapters::rex::owned_agent_block_label(
+                                        agent_run_id.as_str()
+                                    )
+                                    .unwrap()
+                                )
+                            );
+                            let matching_block_inventory = crate::adapters::rex::complete_session_inventory_for_test(
+                                serde_json::json!({
+                                    "session_id": rex_identity.session_id,
+                                    "windows": [
+                                        {"window_id":active_ticket_view.view.rex_window_id,"label":"ticket","layers":[{"blocks":[{"block_id":"anchor-block","label":"anchor"}]}]},
+                                        {"window_id":"unowned-window","label":"other ticket","layers":[{"blocks":[{"block_id":"agent-block","label":crate::adapters::rex::owned_agent_block_label(agent_run_id.as_str()).unwrap()}]}]}
+                                    ]
+                                }),
+                                &rex_identity.instance_id,
+                                &rex_identity.session_id,
+                            ).unwrap();
+                            assert_eq!(
+                                store
+                                    .finalize_rejected_unstarted_agent_runs(
+                                        new_generation,
+                                        &matching_block_inventory,
+                                        crate::store::now_unix().unwrap()
+                                    )
+                                    .unwrap(),
+                                0,
+                                "an observed matching label anywhere in the session vetoes release"
+                            );
+                            let wrong_server_inventory = crate::adapters::rex::complete_session_inventory_for_test(
+                                serde_json::json!({
+                                    "session_id": rex_identity.session_id,
+                                    "windows": [{"window_id":active_ticket_view.view.rex_window_id,"label":"ticket","layers":[{"blocks":[]}]}]
+                                }),
+                                "other-server",
+                                &rex_identity.session_id,
+                            ).unwrap();
+                            assert_eq!(
+                                store
+                                    .finalize_rejected_unstarted_agent_runs(
+                                        new_generation,
+                                        &wrong_server_inventory,
+                                        crate::store::now_unix().unwrap()
+                                    )
+                                    .unwrap(),
+                                0,
+                                "a different server identity cannot finalize"
+                            );
+                            assert!(
+                                store
+                                    .finalize_rejected_unstarted_agent_runs(
+                                        owner_generation,
+                                        &inventory_probe,
+                                        crate::store::now_unix().unwrap()
+                                    )
+                                    .is_err(),
+                                "the former owner generation cannot finalize"
+                            );
+                            let operation_id = reservation.operation_id.as_str();
+                            let phase_trigger: String = store.connection.query_row(
+                                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='agent_launch_phase_transitions'",
+                                [], |row| row.get(0),
+                            ).unwrap();
+                            store
+                                .connection
+                                .execute_batch("DROP TRIGGER agent_launch_phase_transitions;")
+                                .unwrap();
+                            for phase in [
+                                "legacy_unknown",
+                                "not_started",
+                                "create_attempted",
+                                "ambiguous",
+                            ] {
+                                store.connection.execute(
+                                    "UPDATE agent_launch_reservations SET launch_phase=?2 WHERE agent_run_id=?1",
+                                    rusqlite::params![agent_run_id.as_str(), phase],
+                                ).unwrap();
+                                assert_eq!(
+                                    store
+                                        .finalize_rejected_unstarted_agent_runs(
+                                            new_generation,
+                                            &inventory_probe,
+                                            crate::store::now_unix().unwrap(),
+                                        )
+                                        .unwrap(),
+                                    0,
+                                    "non-rejected phase {phase} must remain held"
+                                );
+                            }
+                            store.connection.execute(
+                                "UPDATE agent_launch_reservations SET launch_phase='precreate_rejected' WHERE agent_run_id=?1",
+                                [agent_run_id.as_str()],
+                            ).unwrap();
+                            store.connection.execute_batch(&phase_trigger).unwrap();
+                            let (effect_request, effect_receipt): (String, String) = store.connection.query_row(
+                                "SELECT request_json,receipt_json FROM effects WHERE operation_id=?1 AND status='failed'",
+                                [operation_id], |row| Ok((row.get(0)?,row.get(1)?)),
+                            ).unwrap();
+                            store
+                                .connection
+                                .execute(
+                                    "UPDATE effects SET receipt_json='{}' WHERE operation_id=?1",
+                                    [operation_id],
+                                )
+                                .unwrap();
+                            assert_eq!(
+                                store
+                                    .finalize_rejected_unstarted_agent_runs(
+                                        new_generation,
+                                        &inventory_probe,
+                                        crate::store::now_unix().unwrap()
+                                    )
+                                    .unwrap(),
+                                0,
+                                "wrong typed receipts remain held"
+                            );
+                            store
+                                .connection
+                                .execute(
+                                    "UPDATE effects SET receipt_json=?2 WHERE operation_id=?1",
+                                    rusqlite::params![operation_id, effect_receipt],
+                                )
+                                .unwrap();
+                            store
+                                .connection
+                                .execute(
+                                    "UPDATE effects SET request_json='{}' WHERE operation_id=?1",
+                                    [operation_id],
+                                )
+                                .unwrap();
+                            assert_eq!(
+                                store
+                                    .finalize_rejected_unstarted_agent_runs(
+                                        new_generation,
+                                        &inventory_probe,
+                                        crate::store::now_unix().unwrap()
+                                    )
+                                    .unwrap(),
+                                0,
+                                "wrong StartAgent requests remain held"
+                            );
+                            store
+                                .connection
+                                .execute(
+                                    "UPDATE effects SET request_json=?2 WHERE operation_id=?1",
+                                    rusqlite::params![operation_id, effect_request],
+                                )
+                                .unwrap();
+                            store.connection.execute(
+                                "UPDATE execution_slots SET disposition='released' WHERE pool=?1 AND slot_index=?2",
+                                rusqlite::params![reservation.pool,reservation.slot_index],
+                            ).unwrap();
+                            assert_eq!(
+                                store
+                                    .finalize_rejected_unstarted_agent_runs(
+                                        new_generation,
+                                        &inventory_probe,
+                                        crate::store::now_unix().unwrap()
+                                    )
+                                    .unwrap(),
+                                0,
+                                "a changed slot disposition remains held"
+                            );
+                            store.connection.execute(
+                                "UPDATE execution_slots SET disposition='unknown' WHERE pool=?1 AND slot_index=?2 AND owner_id=?3",
+                                rusqlite::params![reservation.pool,reservation.slot_index,agent_run_id.as_str()],
+                            ).unwrap();
+                            let wake_id = reservation.wake_snapshot.inputs[0].wake_input_id;
+                            store.connection.execute(
+                                "UPDATE role_wake_inputs SET lifecycle='superseded' WHERE wake_input_id=?1",
+                                [wake_id],
+                            ).unwrap();
+                            assert_eq!(
+                                store
+                                    .finalize_rejected_unstarted_agent_runs(
+                                        new_generation,
+                                        &inventory_probe,
+                                        crate::store::now_unix().unwrap()
+                                    )
+                                    .unwrap(),
+                                0,
+                                "a changed wake set remains held"
+                            );
+                            store.connection.execute(
+                                "UPDATE role_wake_inputs SET lifecycle='assigned' WHERE wake_input_id=?1 AND consuming_agent_run_id=?2",
+                                rusqlite::params![wake_id,agent_run_id.as_str()],
+                            ).unwrap();
+                            store
+                                .connection
+                                .execute_batch("PRAGMA foreign_keys=OFF;")
+                                .unwrap();
+                            store.connection.execute(
+                                "INSERT INTO agent_launch_state(agent_run_id,state,last_observed_at_unix,updated_at_unix) VALUES (?1,'unknown',?2,?2)",
+                                rusqlite::params![agent_run_id.as_str(),crate::store::now_unix().unwrap()],
+                            ).unwrap();
+                            assert_eq!(
+                                store
+                                    .finalize_rejected_unstarted_agent_runs(
+                                        new_generation,
+                                        &inventory_probe,
+                                        crate::store::now_unix().unwrap()
+                                    )
+                                    .unwrap(),
+                                0,
+                                "any persisted launch state blocks rejected-launch finalization"
+                            );
+                            store
+                                .connection
+                                .execute(
+                                    "DELETE FROM agent_launch_state WHERE agent_run_id=?1",
+                                    [agent_run_id.as_str()],
+                                )
+                                .unwrap();
+                            store
+                                .connection
+                                .execute_batch("PRAGMA foreign_keys=ON;")
+                                .unwrap();
+                            let held_state: (String,String,String,String) = store.connection.query_row(
+                                "SELECT r.state,l.lifecycle,s.disposition,w.lifecycle FROM agent_runs r JOIN agent_launch_reservations l USING(agent_run_id) JOIN execution_slots s ON s.owner_kind='agent_run' AND s.owner_id=r.agent_run_id JOIN role_wake_inputs w ON w.consuming_agent_run_id=r.agent_run_id WHERE r.agent_run_id=?1 ORDER BY w.wake_input_id LIMIT 1",
+                                [agent_run_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+                            ).unwrap();
+                            assert_eq!(
+                                held_state,
+                                (
+                                    "unknown".into(),
+                                    "reserved".into(),
+                                    "unknown".into(),
+                                    "assigned".into()
+                                ),
+                                "all deliberately invalidated finalizer proofs are restored without releasing ownership"
+                            );
+                            crate::engine::factory_runtime::FactoryRuntimeObservationServices::recover_agents(
+                                &mut services,
+                                &mut store,
+                                new_generation,
+                                crate::store::now_unix().unwrap(),
+                            )
+                            .unwrap();
+                            let final_state: (String, String, String) = store
+                                .connection
+                                .query_row(
+                                    "SELECT r.state,s.disposition,l.lifecycle FROM agent_runs r JOIN execution_slots s ON s.owner_kind='agent_run' AND s.owner_id=r.agent_run_id JOIN agent_launch_reservations l USING(agent_run_id) WHERE r.agent_run_id=?1",
+                                    [agent_run_id.as_str()],
+                                    |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+                                )
+                                .unwrap();
+                            assert_eq!(
+                                final_state,
+                                ("cancelled".into(), "released".into(), "cancelled".into())
+                            );
+                            let remaining_assigned: u64 = store.connection.query_row(
+                                "SELECT COUNT(*) FROM role_wake_inputs WHERE consuming_agent_run_id=?1 AND lifecycle='assigned'",
+                                [agent_run_id.as_str()], |row| row.get(0),
+                            ).unwrap();
+                            assert_eq!(remaining_assigned, 0);
+                            let superseded: u64 = store.connection.query_row(
+                                "SELECT COUNT(*) FROM role_wake_inputs WHERE consuming_agent_run_id=?1 AND lifecycle='superseded'",
+                                [agent_run_id.as_str()], |row| row.get(0),
+                            ).unwrap();
+                            assert_eq!(superseded as usize, reservation.wake_snapshot.inputs.len());
+                            services.require_inventory_reconciliation_for_test();
+                            crate::engine::factory_runtime::FactoryRuntimeObservationServices::recover_agents(
+                                &mut services,&mut store,new_generation,crate::store::now_unix().unwrap()
+                            ).unwrap();
+                            store.connection.execute(
+                                "UPDATE execution_slots SET owner_id='replacement-run',reservation_epoch=reservation_epoch+1,controller_generation=?3,disposition='unknown' WHERE pool=?1 AND slot_index=?2 AND disposition='released'",
+                                rusqlite::params![reservation.pool,reservation.slot_index,new_generation],
+                            ).unwrap();
+                            let reused_slot: (String,u64,u64) = store.connection.query_row(
+                                "SELECT owner_id,reservation_epoch,controller_generation FROM execution_slots WHERE pool=?1 AND slot_index=?2",
+                                rusqlite::params![reservation.pool,reservation.slot_index],
+                                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+                            ).unwrap();
+                            assert_eq!(reused_slot.0, "replacement-run");
+                            services.require_inventory_reconciliation_for_test();
+                            crate::engine::factory_runtime::FactoryRuntimeObservationServices::recover_agents(
+                                &mut services,&mut store,new_generation,crate::store::now_unix().unwrap()
+                            ).unwrap();
+                            let after_replay: (String,u64,u64,String) = store.connection.query_row(
+                                "SELECT owner_id,reservation_epoch,controller_generation,disposition FROM execution_slots WHERE pool=?1 AND slot_index=?2",
+                                rusqlite::params![reservation.pool,reservation.slot_index],
+                                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+                            ).unwrap();
+                            assert_eq!(
+                                after_replay,
+                                (
+                                    "replacement-run".into(),
+                                    reused_slot.1,
+                                    reused_slot.2,
+                                    "unknown".into()
+                                ),
+                                "recovery replay cannot release a reused slot"
+                            );
+                            let retained_json: String = store.connection.query_row(
+                                "SELECT reservation_json FROM agent_launch_reservations WHERE agent_run_id=?1",
+                                [agent_run_id.as_str()], |row| row.get(0),
+                            ).unwrap();
+                            let retained: crate::launch::AgentLaunchReservation =
+                                crate::protocol::parse_unique(retained_json.as_bytes()).unwrap();
+                            assert_eq!(
+                                retained.workspace_path, reservation.workspace_path,
+                                "workspace ownership metadata remains retained"
+                            );
+                            let failed_effect: (String, String) = store
+                                .connection
+                                .query_row(
+                                    "SELECT status,receipt_json FROM effects WHERE operation_id=?1",
+                                    [reservation.operation_id.as_str()],
+                                    |row| Ok((row.get(0)?, row.get(1)?)),
+                                )
+                                .unwrap();
+                            assert_eq!(failed_effect.0, "failed");
+                            assert!(
+                                failed_effect
+                                    .1
+                                    .contains("ticket_run_stale_before_rex_create")
+                            );
+                            return;
+                        }
                         return;
                     }
                     let view = store

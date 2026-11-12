@@ -4,6 +4,344 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 
 use crate::launch::AgentLaunchReservation;
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RejectedStartReceipt {
+    schema_version: u32,
+    outcome: String,
+    reason: String,
+    agent_run_id: String,
+    operation_id: String,
+    reservation_digest: String,
+    ticket_run_id: Option<String>,
+    ticket_revision: Option<u64>,
+}
+
+type FailedStartEffectRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+);
+type RejectedAgentRunRow = (String, String, u64, String, String, String, String, u64);
+type RejectedAgentSlotRow = (
+    String,
+    u32,
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    u64,
+    u64,
+    Option<String>,
+    String,
+);
+
+/// Finalize only the post-restart shape produced by start_owner after the real
+/// StartAgent handler persisted its typed, pre-create rejection. Every proof
+/// and transition lives in this one immediate transaction.
+pub(crate) fn finalize_rejected_unstarted_runs(
+    connection: &mut Connection,
+    owner_generation: u64,
+    inventory: &crate::adapters::rex::CompleteRexSessionInventory,
+    now_unix: i64,
+) -> Result<usize, String> {
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    crate::store::validate_active_generation(&tx, owner_generation)?;
+    let candidates = {
+        let mut statement = tx
+            .prepare("SELECT agent_run_id,project_id,reservation_digest,reservation_json,operation_id,controller_generation,project_epoch FROM agent_launch_reservations WHERE lifecycle='reserved' AND launch_phase='precreate_rejected'")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, u64>(5)?,
+                    row.get::<_, u64>(6)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    let mut finalized = 0;
+    for (run_id, project_id, digest, json, operation_id, original_generation, project_epoch) in
+        candidates
+    {
+        if owner_generation <= original_generation {
+            continue;
+        }
+        let Ok(reservation) =
+            crate::protocol::parse_unique::<AgentLaunchReservation>(json.as_bytes())
+        else {
+            continue;
+        };
+        if crate::store::canonical_json(&reservation).as_deref() != Ok(json.as_str())
+            || reservation.validate().is_err()
+            || reservation.agent_run_id.as_str() != run_id
+            || reservation.project_id.as_str() != project_id
+            || reservation.operation_id.as_str() != operation_id
+            || reservation.controller_generation != original_generation
+            || reservation.project_epoch != project_epoch
+            || reservation
+                .digest()
+                .map(|value| value.as_str().to_owned())
+                .as_deref()
+                != Ok(digest.as_str())
+        {
+            continue;
+        }
+        let Ok(Phase::PrecreateRejected) = phase_for(&tx, &reservation, &digest) else {
+            continue;
+        };
+        let expected_receipt = match rejection_receipt(&reservation) {
+            Ok(receipt) => receipt,
+            Err(_) => continue,
+        };
+        let effect: Option<FailedStartEffectRow> = tx
+            .query_row(
+                "SELECT project_id,subject_type,subject_id,kind,request_json,request_digest,receipt_json FROM effects WHERE operation_id=?1 AND status='failed'",
+                [&operation_id],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((
+            effect_project,
+            subject_type,
+            subject_id,
+            kind,
+            request_json,
+            request_digest,
+            receipt_json,
+        )) = effect
+        else {
+            continue;
+        };
+        let payload: crate::launch::StartAgentEffectPayload =
+            match crate::protocol::parse_unique(request_json.as_bytes()) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+        if effect_project != project_id
+            || subject_type != "agent_run"
+            || subject_id != run_id
+            || tx
+                .query_row::<String, _, _>(
+                    "SELECT logical_key FROM effects WHERE operation_id=?1",
+                    [&operation_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?
+                != format!("start-agent:{run_id}")
+            || kind != "start_agent"
+            || crate::store::canonical_json(&payload).as_deref() != Ok(request_json.as_str())
+            || crate::store::content_digest(&request_json) != request_digest
+            || payload.agent_run_id.as_str() != run_id
+            || payload.launch_reservation_digest.as_str() != digest
+        {
+            continue;
+        }
+        if payload.validate().is_err() {
+            continue;
+        }
+        let Some(receipt_json) = receipt_json else {
+            continue;
+        };
+        let Ok(receipt) =
+            crate::protocol::parse_unique::<RejectedStartReceipt>(receipt_json.as_bytes())
+        else {
+            continue;
+        };
+        if receipt.schema_version != 1
+            || receipt.outcome != "rejected"
+            || receipt.reason != "ticket_run_stale_before_rex_create"
+            || receipt.agent_run_id != run_id
+            || receipt.operation_id != operation_id
+            || receipt.reservation_digest != digest
+            || receipt.ticket_run_id.as_deref()
+                != reservation.ticket_run_id.as_ref().map(|id| id.as_str())
+            || receipt.ticket_revision != reservation.ticket_revision.map(|revision| revision.0)
+            || receipt_json != expected_receipt
+        {
+            continue;
+        }
+        let run: Option<RejectedAgentRunRow> = tx
+            .query_row(
+                "SELECT project_id,role,config_revision,config_digest,role_session_id,launch_operation_id,state,controller_generation FROM agent_runs WHERE agent_run_id=?1",
+                [&run_id],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let role_json =
+            serde_json::to_value(reservation.role).map_err(|error| error.to_string())?;
+        let Some((
+            run_project,
+            run_role,
+            run_config_revision,
+            run_config_digest,
+            role_session,
+            run_operation,
+            run_state,
+            run_generation,
+        )) = run
+        else {
+            continue;
+        };
+        if run_project != project_id
+            || run_role != role_json.as_str().unwrap_or_default()
+            || run_config_revision != reservation.config_revision.0
+            || run_config_digest != reservation.config_digest.as_str()
+            || role_session != reservation.role_session_id
+            || run_operation != operation_id
+            || run_state != "unknown"
+            || run_generation != owner_generation
+        {
+            continue;
+        }
+        let slot: Option<RejectedAgentSlotRow> = tx
+            .query_row(
+                "SELECT pool,slot_index,project_id,owner_kind,owner_id,ticket_run_id,reservation_epoch,controller_generation,process_identity_json,disposition FROM execution_slots WHERE pool=?1 AND slot_index=?2",
+                params![reservation.pool,reservation.slot_index],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if !matches!(slot, Some((ref pool,index,Some(ref project),ref owner_kind,ref owner_id,ref ticket,epoch,generation,None,ref disposition))
+            if pool == &reservation.pool && index == reservation.slot_index
+                && project == &project_id && owner_kind == "agent_run" && owner_id == &run_id
+                && ticket.as_deref() == reservation.ticket_run_id.as_ref().map(|id| id.as_str())
+                && epoch == reservation.project_epoch && generation == original_generation
+                && disposition == "unknown")
+        {
+            continue;
+        }
+        let view: Option<(String,String,String,String,String,String)> = tx
+            .query_row(
+                "SELECT project_id,view_kind,rex_server_identity,rex_session_id,rex_window_id,lifecycle FROM rex_views WHERE view_id=?1",
+                [reservation.rex_view_id.as_str()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((view_project, view_kind, server, session, window, view_lifecycle)) = view else {
+            continue;
+        };
+        let expected_view_kind = if reservation.role == crate::domain::types::Role::Supervisor {
+            "supervisor"
+        } else {
+            "ticket"
+        };
+        if view_project != project_id || view_kind != expected_view_kind || view_lifecycle != "active"
+            || !inventory.matches_view(&server, &session, &window)
+            || tx.query_row::<u64, _, _>(
+                "SELECT COUNT(*) FROM rex_views WHERE rex_server_identity=?1 AND rex_session_id=?2 AND rex_window_id=?3 AND lifecycle IN ('active','close_pending','unknown')",
+                params![server,session,window],
+                |row| row.get(0),
+            ).map_err(|error| error.to_string())? != 1
+            || inventory.contains_block_label(&crate::adapters::rex::owned_agent_block_label(&run_id).map_err(|e| e.to_string())?)
+        {
+            continue;
+        }
+        let prohibited: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_launch_authority WHERE agent_run_id=?1) OR EXISTS(SELECT 1 FROM agent_launch_state WHERE agent_run_id=?1) OR EXISTS(SELECT 1 FROM rex_view_blocks WHERE agent_run_id=?1)",
+            [&run_id], |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if prohibited {
+            continue;
+        }
+        let wakes = {
+            let mut statement = tx.prepare("SELECT wake_input_id,project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,consuming_agent_run_id FROM role_wake_inputs WHERE consuming_agent_run_id=?1 ORDER BY wake_input_id").map_err(|e| e.to_string())?;
+            let rows = statement
+                .query_map([&run_id], |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, u64>(5)?,
+                        row.get::<_, i32>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        if wakes.len() != reservation.wake_snapshot.inputs.len() {
+            continue;
+        }
+        let mut wakes_match = true;
+        for (row, item) in wakes.iter().zip(&reservation.wake_snapshot.inputs) {
+            let payload = crate::store::canonical_json(&item.payload_json)?;
+            if row.0 != item.wake_input_id
+                || row.1 != project_id
+                || row.2 != reservation.role_session_id
+                || row.3 != item.source_type
+                || row.4 != item.source_id
+                || row.5 != item.source_revision
+                || row.6 != item.priority
+                || row.7 != payload
+                || row.8 != "assigned"
+                || row.9.as_deref() != Some(run_id.as_str())
+            {
+                wakes_match = false;
+                break;
+            }
+        }
+        if !wakes_match {
+            continue;
+        }
+
+        let changed = tx.execute(
+            "UPDATE agent_runs SET state='cancelled',finished_at_unix=COALESCE(finished_at_unix,?3) WHERE agent_run_id=?1 AND project_id=?2 AND state='unknown' AND controller_generation=?4",
+            params![run_id,project_id,now_unix,owner_generation],
+        ).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            continue;
+        }
+        let changed = tx.execute(
+            "UPDATE agent_launch_reservations SET lifecycle='cancelled',updated_at_unix=?3 WHERE agent_run_id=?1 AND project_id=?2 AND reservation_digest=?4 AND lifecycle='reserved' AND launch_phase='precreate_rejected'",
+            params![run_id,project_id,now_unix,digest],
+        ).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("rejected launch reservation changed during finalization".into());
+        }
+        let changed = tx.execute(
+            "UPDATE execution_slots SET disposition='released' WHERE pool=?1 AND slot_index=?2 AND project_id=?3 AND ticket_run_id IS ?4 AND owner_kind='agent_run' AND owner_id=?5 AND reservation_epoch=?6 AND controller_generation=?7 AND disposition='unknown'",
+            params![reservation.pool,reservation.slot_index,project_id,reservation.ticket_run_id.as_ref().map(|id| id.as_str()),run_id,reservation.project_epoch,original_generation],
+        ).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("rejected launch slot changed during finalization".into());
+        }
+        for item in &reservation.wake_snapshot.inputs {
+            let changed = tx.execute(
+                "UPDATE role_wake_inputs SET lifecycle='superseded' WHERE wake_input_id=?1 AND project_id=?2 AND role_session_id=?3 AND consuming_agent_run_id=?4 AND lifecycle='assigned'",
+                params![item.wake_input_id,project_id,reservation.role_session_id,run_id],
+            ).map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err("assigned wake changed during rejected launch finalization".into());
+            }
+        }
+        finalized += 1;
+    }
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(finalized)
+}
+
 type LaunchSlotRow = (
     String,
     u32,

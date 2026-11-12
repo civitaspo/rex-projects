@@ -743,6 +743,48 @@ impl RuntimeServices {
     }
 
     #[cfg(test)]
+    pub(crate) fn dispatch_start_agent_for_test(
+        &self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+    ) -> Result<crate::effects::DispatchTick, String> {
+        let handler = self
+            .handlers
+            .iter()
+            .find(|handler| handler.kind() == crate::engine::reducer::EffectKind::StartAgent)
+            .ok_or("RuntimeServices has no StartAgent effect handler")?;
+        crate::effects::EffectDispatcher::tick(
+            store,
+            owner_generation,
+            now_unix,
+            &[handler.as_ref()],
+            crate::effects::EffectLimits {
+                max_attempts: 3,
+                max_age: Duration::from_secs(3600),
+                retry_base: Duration::from_secs(1),
+                retry_max: Duration::from_secs(10),
+            },
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_complete_rex_for_test(
+        &self,
+    ) -> Result<crate::adapters::rex::CompleteRexSessionInventory, String> {
+        self.rex
+            .observe_complete_session()
+            .map_err(|error| format!("complete Rex observation failed: {error}"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn require_inventory_reconciliation_for_test(&mut self) {
+        self.rex_inventory_required = true;
+        self.rex_inventory_last_checked = None;
+    }
+
+    #[cfg(test)]
     pub(crate) fn ensure_parked_wrapper_for_test(
         &self,
         store: &mut ConfigStore,
@@ -4144,7 +4186,12 @@ impl crate::engine::factory_runtime::FactoryRuntimeObservationServices for Runti
         {
             // This pinned inventory is only a wake/reconciliation input. The recovery
             // runtime still verifies each persisted AgentRun and its process identities.
-            if self.rex.list_owned_windows_and_blocks().is_ok() {
+            if let Ok(inventory) = self.rex.observe_complete_session() {
+                store.finalize_rejected_unstarted_agent_runs(
+                    owner_generation,
+                    &inventory,
+                    now_unix,
+                )?;
                 self.rex_inventory_required = false;
                 self.rex_inventory_last_checked = Some(now);
             } else {
