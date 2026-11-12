@@ -10,7 +10,7 @@ use crate::dashboard::{
     AgentRow, DashboardSnapshot, FocusTarget, HumanInboxRow, ProjectRow, TicketRow, WaitRow,
 };
 use crate::domain::ids::{AgentRunId, Digest, TicketRunId};
-use crate::launch::{AgentLaunchAuthority, RexFocusTarget};
+use crate::launch::{AgentLaunchAuthority, RexFocusTarget, StartAgentEffectPayload};
 use crate::store::ConfigStore;
 
 /// Build one schema-versioned snapshot without acquiring the machine-owner
@@ -140,29 +140,47 @@ pub fn read_projection(state_root: &Path) -> Result<DashboardSnapshot, String> {
         .collect::<Result<Vec<_>, String>>()?
     };
 
-    let mut waits = {
-        let mut statement = db.prepare("SELECT project_id,subject_type,subject_id,kind,status,last_error FROM effects WHERE status IN ('pending','claimed','uncertain','failed') ORDER BY created_at_unix").map_err(|error| error.to_string())?;
+    let effect_waits = {
+        let mut statement = db.prepare("SELECT operation_id,project_id,subject_type,subject_id,kind,status,last_error FROM effects WHERE status IN ('pending','claimed','uncertain','failed') ORDER BY created_at_unix").map_err(|error| error.to_string())?;
         statement
             .query_map([], |row| {
-                let ticket = match (row.get::<_, String>(1)?.as_str(), row.get::<_, String>(2)?) {
+                let ticket = match (row.get::<_, String>(2)?.as_str(), row.get::<_, String>(3)?) {
                     ("ticket_run", id) => TicketRunId::parse(id).ok(),
                     _ => None,
                 };
-                Ok(WaitRow {
-                    project_id: row.get(0)?,
-                    ticket_run_id: ticket,
-                    kind: row.get(3)?,
-                    detail: format!(
-                        "{} {}",
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?.unwrap_or_default()
-                    ),
-                })
+                Ok((
+                    row.get::<_, String>(0)?,
+                    WaitRow {
+                        project_id: row.get(1)?,
+                        ticket_run_id: ticket,
+                        kind: row.get(4)?,
+                        detail: format!(
+                            "{} {}",
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Option<String>>(6)?.unwrap_or_default()
+                        ),
+                    },
+                ))
             })
             .map_err(|error| error.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?
     };
+    let handoff_waits = if version >= 18 {
+        read_ambiguous_launch_waits(&db)?
+    } else {
+        Vec::new()
+    };
+    let handoff_operations = handoff_waits
+        .iter()
+        .map(|(operation, _)| operation.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut waits = effect_waits
+        .into_iter()
+        .filter_map(|(operation, wait)| {
+            (!handoff_operations.contains(operation.as_str())).then_some(wait)
+        })
+        .collect::<Vec<_>>();
     if version >= 15 {
         let mut statement = db.prepare(
             "SELECT d.project_id,d.ticket_run_id,d.state,d.failure_code,d.attempt_count,d.next_attempt_at_unix FROM merge_observation_deferrals d JOIN agent_result_evidence e ON e.evidence_id=d.source_evidence_id LEFT JOIN agent_result_reducer_ack a ON a.evidence_id=d.source_evidence_id WHERE a.evidence_id IS NULL ORDER BY d.created_at_unix,d.source_evidence_id",
@@ -198,6 +216,7 @@ pub fn read_projection(state_root: &Path) -> Result<DashboardSnapshot, String> {
             });
         }
     }
+    waits.extend(handoff_waits.into_iter().map(|(_, wait)| wait));
 
     let human_requests = ConfigStore::list_human_requests(state_root, None)?
         .into_iter()
@@ -238,6 +257,159 @@ pub fn read_projection(state_root: &Path) -> Result<DashboardSnapshot, String> {
         waits,
         human_requests,
     })
+}
+
+fn read_ambiguous_launch_waits(db: &Connection) -> Result<Vec<(String, WaitRow)>, String> {
+    let mut statement = db
+        .prepare(
+            "SELECT a.agent_run_id,a.project_id,a.operation_id,a.reservation_digest,a.reservation_json,a.launch_phase,r.state,r.launch_operation_id,s.project_id,s.ticket_run_id,s.owner_kind,s.owner_id,s.disposition,e.project_id,e.subject_type,e.subject_id,e.kind,e.request_json,e.request_digest,e.status
+             FROM agent_launch_reservations a
+             JOIN agent_runs r ON r.agent_run_id=a.agent_run_id AND r.project_id=a.project_id
+             JOIN execution_slots s ON s.owner_kind='agent_run' AND s.owner_id=a.agent_run_id AND s.project_id=a.project_id
+             LEFT JOIN effects e ON e.operation_id=a.operation_id
+             WHERE a.lifecycle='reserved' AND a.launch_phase IN ('ambiguous','create_attempted','legacy_unknown')
+               AND r.state IN ('launch_pending','unknown') AND r.launch_operation_id=a.operation_id
+               AND s.disposition IN ('launch_pending','unknown')
+             ORDER BY a.created_at_unix,a.agent_run_id",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, String>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, Option<String>>(14)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, Option<String>>(16)?,
+                row.get::<_, Option<String>>(17)?,
+                row.get::<_, Option<String>>(18)?,
+                row.get::<_, Option<String>>(19)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut waits = Vec::new();
+    for row in rows {
+        let (
+            run_id,
+            project_id,
+            operation_id,
+            reservation_digest,
+            reservation_json,
+            phase,
+            run_state,
+            run_operation,
+            slot_project,
+            slot_ticket,
+            owner_kind,
+            owner_id,
+            disposition,
+            effect_project,
+            subject_type,
+            subject_id,
+            effect_kind,
+            request_json,
+            request_digest,
+            effect_status,
+        ) = row.map_err(|error| error.to_string())?;
+        let Ok(run_id) = AgentRunId::parse(run_id) else {
+            continue;
+        };
+        let Ok(reservation) =
+            crate::protocol::parse_unique::<serde_json::Value>(reservation_json.as_bytes())
+        else {
+            continue;
+        };
+        if crate::store::content_digest(&reservation_json) != reservation_digest
+            || reservation["schema_version"] != 1
+            || reservation["agent_run_id"].as_str() != Some(run_id.as_str())
+            || reservation["project_id"].as_str() != Some(project_id.as_str())
+            || reservation["operation_id"].as_str() != Some(operation_id.as_str())
+            || reservation.get("ticket_run_id").is_none()
+            || run_operation != operation_id
+            || slot_project != project_id
+            || owner_kind != "agent_run"
+            || owner_id != run_id.as_str()
+            || !matches!(run_state.as_str(), "launch_pending" | "unknown")
+            || !matches!(disposition.as_str(), "launch_pending" | "unknown")
+            || reservation["ticket_run_id"].as_str() != slot_ticket.as_deref()
+        {
+            continue;
+        }
+        let effect = match (
+            effect_project,
+            subject_type,
+            subject_id,
+            effect_kind,
+            request_json,
+            request_digest,
+            effect_status,
+        ) {
+            (
+                Some(effect_project),
+                Some(subject_type),
+                Some(subject_id),
+                Some(effect_kind),
+                Some(request_json),
+                Some(request_digest),
+                Some(status),
+            ) if effect_project == project_id
+                && subject_type == "agent_run"
+                && subject_id == run_id.as_str()
+                && effect_kind == "start_agent" =>
+            {
+                let Ok(payload) = crate::protocol::parse_unique::<StartAgentEffectPayload>(
+                    request_json.as_bytes(),
+                ) else {
+                    continue;
+                };
+                if payload.validate().is_err()
+                    || payload.agent_run_id != run_id
+                    || payload.launch_reservation_digest.as_str() != reservation_digest
+                    || crate::store::content_digest(&request_json) != request_digest
+                {
+                    continue;
+                }
+                Some(status)
+            }
+            _ => None,
+        };
+        if effect.is_none()
+            || (phase != "ambiguous"
+                && !effect
+                    .as_deref()
+                    .is_some_and(|status| matches!(status, "uncertain" | "failed")))
+        {
+            continue;
+        }
+        let ticket_run_id = reservation["ticket_run_id"].as_str().map(str::to_owned);
+        let detail = format!(
+            "AgentRun {} has an unresolved {} launch; a process may still exist. Inspect this AgentRun's Rex session and any recorded PID/start identity; missing identity remains unresolved. Keep its execution slot and worktree reserved until exit is verified.",
+            run_id, phase
+        );
+        let ticket_run_id = ticket_run_id.map(TicketRunId::parse).transpose()?;
+        waits.push((
+            operation_id,
+            WaitRow {
+                project_id,
+                ticket_run_id,
+                kind: "agent_launch_handoff".into(),
+                detail,
+            },
+        ));
+    }
+    Ok(waits)
 }
 
 /// Resolve a focus request through immutable Agent launch authority and the
