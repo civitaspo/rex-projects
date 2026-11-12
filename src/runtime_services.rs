@@ -8142,3 +8142,282 @@ mod provider_qualification_requested_reconcile_tests {
         );
     }
 }
+
+#[cfg(all(test, unix))]
+mod rex_event_reconnect_tests {
+    use super::*;
+    use crate::domain::ids::Digest;
+    use crate::engine::factory_runtime::FactoryRuntimeObservationServices;
+    use crate::store::{ExpectedRevision, OwnerMetadata};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn startup_and_event_reader_reconnect_each_observe_authoritative_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("state");
+        fs::create_dir_all(&state_root).unwrap();
+        let state_root = fs::canonicalize(state_root).unwrap();
+        let rex = temp.path().join("rex fixture");
+        let calls = temp.path().join("rex calls.log");
+        let event_subscriptions = temp.path().join("event subscriptions.log");
+        let inventory_subscriptions = temp.path().join("inventory subscriptions.log");
+        let first_event_pid = temp.path().join("first event pid");
+        let replacement_event_pid = temp.path().join("replacement event pid");
+        let release_first_event = temp.path().join("release first event");
+        let expect_reconnect_inventory = temp.path().join("expect reconnect inventory");
+        let applied_config_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml");
+        let mut applied = crate::config::load(&applied_config_path).unwrap();
+        applied.config.runtime.rex_binary = rex.display().to_string();
+        applied.config.runtime.environment.source = crate::config::EnvironmentSource::Inherit;
+        applied.config.adapters.tickets.command =
+            vec![std::env::current_exe().unwrap().display().to_string()];
+        applied
+            .config
+            .repositories
+            .get_mut(&crate::domain::ids::RepositoryId::parse("example").unwrap())
+            .unwrap()
+            .clone_url = "https://github.com/example/example.git".into();
+
+        let endpoint = "unix:///tmp/rex-event-reconnect-fixture.sock";
+        let instance = "rex-event-reconnect-fixture";
+        let session = "event-reconnect-session";
+        let mut store = ConfigStore::open_test(&state_root).unwrap();
+        store
+            .apply_snapshot("fixture", &applied, ExpectedRevision::Bootstrap)
+            .unwrap();
+        let owner_generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "rex-event-reconnect-fixture-owner".into(),
+                state_root: state_root.display().to_string(),
+                config_source: applied_config_path.display().to_string(),
+                process_start_identity: crate::cli::observed_process_start_identity(
+                    std::process::id(),
+                )
+                .expect("test process has a start identity"),
+                executable_path: std::env::current_exe().unwrap().display().to_string(),
+                executable_digest: "c".repeat(64),
+                rex_endpoint: Some(endpoint.into()),
+                rex_server_identity: Some(instance.into()),
+                rex_session_id: Some(session.into()),
+                rex_block_id: Some("fixture-controller-block".into()),
+            })
+            .unwrap();
+
+        let whoami = serde_json::json!({
+            "endpoint": endpoint,
+            "instance_id": instance,
+            "host_id": "fixture-host",
+            "rex_version": "1.0"
+        });
+        let api = serde_json::json!({
+            "methods": {
+                "session.view": {},
+                "session.new_window": {},
+                "session.new_split": {},
+                "session.focus_block": {},
+                "session.zoom_block": {},
+                "block.close": {}
+            }
+        });
+        let inventory = serde_json::json!({
+            "session_id": session,
+            "windows": []
+        });
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  *'whoami --json'*) printf '%s\\n' '{}' ;;\n  *'api list --json'*) printf '%s\\n' '{}' ;;\n  *'session ls --json'*) printf '%s\\n' '{{\"sessions\":[{{\"session_id\":\"{}\",\"label\":\"fixture controller\"}}]}}' ;;\n  *'api call session.view'*) n=0; [ ! -f '{}' ] || n=$(cat '{}'); if [ -f '{}' ]; then i=0; while [ \"$n\" -lt 2 ] && [ \"$i\" -lt 200 ]; do /bin/sleep 0.01; n=0; [ ! -f '{}' ] || n=$(cat '{}'); i=$((i + 1)); done; [ \"$n\" -ge 2 ] || exit 65; fi; printf '%s\\n' \"$n\" >> '{}'; printf '%s\\n' '{}' ;;\n  *'events -s {} --json'*) n=0; [ ! -f '{}' ] || n=$(cat '{}'); n=$((n + 1)); printf '%s\\n' \"$n\" > '{}.tmp'; mv '{}.tmp' '{}'; printf '%s\\n' \"$n\" >> '{}'; if [ \"$n\" -eq 1 ]; then printf '%s\\n' \"$$\" > '{}'; while [ ! -f '{}' ]; do /bin/sleep 0.01; done; exit 0; fi; printf '%s\\n' \"$$\" > '{}'; exec /bin/sleep 30 ;;\n  *) exit 64 ;;\nesac\n",
+            calls.display(),
+            whoami,
+            api,
+            session,
+            temp.path().join("event-count").display(),
+            temp.path().join("event-count").display(),
+            expect_reconnect_inventory.display(),
+            temp.path().join("event-count").display(),
+            temp.path().join("event-count").display(),
+            inventory_subscriptions.display(),
+            inventory,
+            session,
+            temp.path().join("event-count").display(),
+            temp.path().join("event-count").display(),
+            temp.path().join("event-count.tmp").display(),
+            temp.path().join("event-count.tmp").display(),
+            temp.path().join("event-count").display(),
+            event_subscriptions.display(),
+            first_event_pid.display(),
+            release_first_event.display(),
+            replacement_event_pid.display()
+        );
+        fs::write(&rex, script).unwrap();
+        fs::set_permissions(&rex, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let environment = crate::environment::capture(&applied.config.runtime.environment).unwrap();
+        let runtime_binary = std::env::current_exe().unwrap();
+        let mut services = RuntimeServices::new(
+            &applied,
+            &environment,
+            &applied_config_path,
+            &state_root,
+            owner_generation,
+            &RexIdentity {
+                endpoint: endpoint.into(),
+                instance_id: instance.into(),
+                session_id: session.into(),
+                block_id: Some("fixture-controller-block".into()),
+            },
+            RuntimeExecutable {
+                path: &runtime_binary,
+                digest: &Digest::parse("f".repeat(64)).unwrap(),
+            },
+        )
+        .unwrap();
+
+        let first_pid_deadline = Instant::now() + Duration::from_secs(2);
+        let first_pid = loop {
+            if let Ok(pid) = fs::read_to_string(&first_event_pid)
+                && let Ok(pid) = pid.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < first_pid_deadline,
+                "first Rex events child did not start"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let first_identity = crate::process::process_identity_for_pid(first_pid)
+            .unwrap()
+            .expect("first Rex events child is still alive before the startup observation");
+
+        let first = FactoryRuntimeObservationServices::recover_agents(
+            &mut services,
+            &mut store,
+            owner_generation,
+            1_800_000_000,
+        )
+        .unwrap();
+        assert_eq!(first.examined, 0);
+        let calls_after_startup = fs::read_to_string(&calls).unwrap();
+        assert!(calls_after_startup.contains("api call session.view"));
+        assert_eq!(
+            fs::read_to_string(&event_subscriptions).unwrap().trim(),
+            "1"
+        );
+        let current_identity = crate::process::process_identity_for_pid(first_pid)
+            .unwrap()
+            .expect("events child remains alive through startup inventory");
+        assert_eq!(
+            current_identity.start_identity,
+            first_identity.start_identity
+        );
+
+        fs::write(&release_first_event, b"exit").unwrap();
+        let disconnect_deadline = Instant::now() + Duration::from_secs(2);
+        let mut disconnect_inventory_observed = false;
+        while Instant::now() < disconnect_deadline {
+            FactoryRuntimeObservationServices::recover_agents(
+                &mut services,
+                &mut store,
+                owner_generation,
+                1_800_000_001,
+            )
+            .unwrap();
+            if fs::read_to_string(&inventory_subscriptions)
+                .is_ok_and(|contents| contents.lines().count() >= 2)
+            {
+                disconnect_inventory_observed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            disconnect_inventory_observed,
+            "dead events reader must trigger inventory before reconnect"
+        );
+        let old_identity = crate::process::process_identity_for_pid(first_pid).unwrap();
+        assert!(
+            old_identity
+                .is_none_or(|current| current.start_identity != first_identity.start_identity),
+            "production recovery must reap the exited events child"
+        );
+        assert_eq!(
+            fs::read_to_string(&inventory_subscriptions)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["1", "1"],
+            "startup and dead-reader inventories must precede reconnect"
+        );
+        assert_eq!(
+            fs::read_to_string(&event_subscriptions)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "dead-reader inventory must occur before the retry interval reconnect"
+        );
+        fs::write(&expect_reconnect_inventory, b"wait for new subscription").unwrap();
+
+        let reconnect_deadline = Instant::now() + Duration::from_secs(8);
+        let mut reconnect_observed = false;
+        while Instant::now() < reconnect_deadline {
+            FactoryRuntimeObservationServices::recover_agents(
+                &mut services,
+                &mut store,
+                owner_generation,
+                1_800_000_001,
+            )
+            .unwrap();
+            if fs::read_to_string(&event_subscriptions)
+                .is_ok_and(|contents| contents.lines().count() >= 2)
+                && fs::read_to_string(&inventory_subscriptions)
+                    .is_ok_and(|contents| contents.lines().any(|line| line == "2"))
+                && fs::read_to_string(&replacement_event_pid)
+                    .is_ok_and(|contents| contents.trim().parse::<u32>().is_ok())
+            {
+                reconnect_observed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            reconnect_observed,
+            "replacement Rex events process did not start"
+        );
+        let total_calls = fs::read_to_string(&calls).unwrap();
+        assert!(
+            total_calls.matches("api call session.view").count() >= 3,
+            "the actual fake Rex CLI must receive each inventory call"
+        );
+        assert!(
+            fs::read_to_string(&inventory_subscriptions)
+                .unwrap()
+                .lines()
+                .any(|line| line == "2"),
+            "reconnect must request a fresh inventory after the replacement events process starts"
+        );
+        let replacement_pid = fs::read_to_string(&replacement_event_pid)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        assert!(
+            crate::process::process_identity_for_pid(replacement_pid)
+                .unwrap()
+                .is_some(),
+            "replacement Rex events process must remain alive"
+        );
+        assert_eq!(
+            store
+                .test_connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_block_lifecycle_facts",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0,
+            "the no-Agent fixture must not synthesize block lifecycle facts"
+        );
+    }
+}
