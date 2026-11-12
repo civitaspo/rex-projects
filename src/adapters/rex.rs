@@ -2704,7 +2704,13 @@ esac
             "session-a".into(),
             BTreeMap::<OsString, OsString>::new(),
         )
-        .unwrap();
+        .unwrap_or_else(|error| {
+            eprintln!(
+                "fixture writer observation: {}",
+                fixture_writer_observation(&script)
+            );
+            panic!("{error}");
+        });
         let stream = transport.subscribe_events().unwrap();
         let pid = stream.child.id();
         drop(stream);
@@ -2714,6 +2720,68 @@ esac
                 .iter()
                 .any(|process| process.pid == pid)
         );
+    }
+
+    #[cfg(unix)]
+    fn fixture_writer_observation(path: &Path) -> Value {
+        use std::os::unix::fs::MetadataExt;
+
+        if !cfg!(target_os = "linux") {
+            return json!({"sample": "not Linux; no process inspection"});
+        }
+        let Ok(target) = std::fs::metadata(path) else {
+            return json!({"error": "fixture metadata unavailable"});
+        };
+        let deadline = std::time::Instant::now() + Duration::from_millis(150);
+        let mut matches = Vec::new();
+        for process in std::fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .take(512)
+        {
+            let Ok(pid) = process.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            for fd in std::fs::read_dir(process.path().join("fd"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .take(256)
+            {
+                if std::time::Instant::now() >= deadline || matches.len() == 8 {
+                    return json!({"sample": "capped; no absence proof", "matches": matches});
+                }
+                let Ok(actual) = std::fs::metadata(fd.path()) else {
+                    continue;
+                };
+                if (actual.dev(), actual.ino()) != (target.dev(), target.ino()) {
+                    continue;
+                }
+                let Ok(info) =
+                    std::fs::read_to_string(process.path().join("fdinfo").join(fd.file_name()))
+                else {
+                    continue;
+                };
+                let Some(flags) = info
+                    .lines()
+                    .find_map(|line| line.strip_prefix("flags:\t"))
+                    .and_then(|value| u32::from_str_radix(value, 8).ok())
+                else {
+                    continue;
+                };
+                if !matches!(flags & 3, 1 | 2) {
+                    continue;
+                }
+                matches.push(json!({
+                    "pid": pid,
+                    "fd": fd.file_name().to_string_lossy(),
+                    "flags": flags,
+                    "stat": std::fs::read_to_string(process.path().join("stat")).ok()
+                }));
+            }
+        }
+        json!({"sample": "bounded; no absence proof", "device": target.dev(), "inode": target.ino(), "matches": matches})
     }
 
     #[cfg(unix)]
