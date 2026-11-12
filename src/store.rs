@@ -6833,7 +6833,14 @@ pub(crate) mod tests {
 
     #[test]
     fn single_publication_drives_host_merge_assessment_and_public_inbox() {
-        published_publication_fixture(true, None, false, false, false, false, false);
+        // This end-to-end fixture exercises the supported Direct executor. Generic
+        // literal-comment Request is now intentionally blocked before approval.
+        published_publication_fixture(true, None, false, false, true, false, false);
+    }
+
+    #[test]
+    fn generic_request_executor_is_blocked_before_assessment_persistence() {
+        published_publication_fixture_inner(true, None, false, false, false, false, false, true);
     }
 
     #[test]
@@ -6843,7 +6850,7 @@ pub(crate) mod tests {
 
     #[test]
     fn publication_and_review_results_wake_current_coordinator_child_requests() {
-        published_publication_fixture(true, None, false, true, false, false, false);
+        published_publication_fixture(true, None, false, true, true, false, false);
     }
 
     #[test]
@@ -6853,7 +6860,7 @@ pub(crate) mod tests {
             Some(MergeClaimRecoveryFixture::Resume),
             false,
             false,
-            false,
+            true,
             false,
             false,
         );
@@ -6866,7 +6873,7 @@ pub(crate) mod tests {
             Some(MergeClaimRecoveryFixture::AssessmentLaunch),
             false,
             false,
-            false,
+            true,
             false,
             false,
         );
@@ -6879,7 +6886,7 @@ pub(crate) mod tests {
             Some(MergeClaimRecoveryFixture::StaleStartFence),
             false,
             false,
-            false,
+            true,
             false,
             false,
         );
@@ -6892,7 +6899,7 @@ pub(crate) mod tests {
             Some(MergeClaimRecoveryFixture::RejectedLaunchFinalizer),
             false,
             false,
-            false,
+            true,
             false,
             false,
         );
@@ -6905,7 +6912,7 @@ pub(crate) mod tests {
             Some(MergeClaimRecoveryFixture::StaleAfterCreateAttempt),
             false,
             false,
-            false,
+            true,
             false,
             false,
         );
@@ -6918,7 +6925,7 @@ pub(crate) mod tests {
             Some(MergeClaimRecoveryFixture::StaleAtCreateCas),
             false,
             false,
-            false,
+            true,
             false,
             false,
         );
@@ -6931,7 +6938,7 @@ pub(crate) mod tests {
             Some(MergeClaimRecoveryFixture::OldOwnerPrecreateCas),
             false,
             false,
-            false,
+            true,
             false,
             false,
         );
@@ -6944,7 +6951,7 @@ pub(crate) mod tests {
             Some(MergeClaimRecoveryFixture::ContradictoryObservedBlock),
             false,
             false,
-            false,
+            true,
             false,
             false,
         );
@@ -6957,7 +6964,7 @@ pub(crate) mod tests {
             Some(MergeClaimRecoveryFixture::DuplicateObservedBlocks),
             false,
             false,
-            false,
+            true,
             false,
             false,
         );
@@ -6970,7 +6977,7 @@ pub(crate) mod tests {
             Some(MergeClaimRecoveryFixture::MismatchedObservedBlockMetadata),
             false,
             false,
-            false,
+            true,
             false,
             false,
         );
@@ -6983,7 +6990,7 @@ pub(crate) mod tests {
             Some(MergeClaimRecoveryFixture::FirstStartAckFence),
             false,
             false,
-            false,
+            true,
             false,
             false,
         );
@@ -6996,7 +7003,7 @@ pub(crate) mod tests {
             Some(MergeClaimRecoveryFixture::IntentLaunch),
             false,
             false,
-            false,
+            true,
             false,
             false,
         );
@@ -7009,7 +7016,7 @@ pub(crate) mod tests {
             Some(MergeClaimRecoveryFixture::StaleCoordinatorConfig),
             false,
             false,
-            false,
+            true,
             false,
             false,
         );
@@ -7022,7 +7029,7 @@ pub(crate) mod tests {
             Some(MergeClaimRecoveryFixture::StaleMergeDecisionConfig),
             false,
             false,
-            false,
+            true,
             false,
             false,
         );
@@ -7035,7 +7042,7 @@ pub(crate) mod tests {
             Some(MergeClaimRecoveryFixture::FailedMergeDecision),
             false,
             false,
-            false,
+            true,
             false,
             false,
         );
@@ -7048,7 +7055,7 @@ pub(crate) mod tests {
             Some(MergeClaimRecoveryFixture::FailedCoordinator),
             false,
             false,
-            false,
+            true,
             false,
             false,
         );
@@ -7061,7 +7068,7 @@ pub(crate) mod tests {
             Some(MergeClaimRecoveryFixture::InvalidRecoveryCoordinator),
             false,
             false,
-            false,
+            true,
             false,
             false,
         );
@@ -7074,7 +7081,7 @@ pub(crate) mod tests {
             Some(MergeClaimRecoveryFixture::InvalidRecoveryMergeDecision),
             false,
             false,
-            false,
+            true,
             false,
             false,
         );
@@ -7087,7 +7094,7 @@ pub(crate) mod tests {
             Some(MergeClaimRecoveryFixture::FailedMergeIntentBeforePersist),
             false,
             false,
-            false,
+            true,
             false,
             false,
         );
@@ -7100,7 +7107,7 @@ pub(crate) mod tests {
             Some(MergeClaimRecoveryFixture::FailedMergeIntentAfterPersist),
             false,
             false,
-            false,
+            true,
             false,
             false,
         );
@@ -7519,6 +7526,32 @@ pub(crate) mod tests {
         direct_merge_intent: bool,
         obsolete_deferred_assessment: bool,
         terminal_deferral_crash_gap: bool,
+    ) {
+        published_publication_fixture_inner(
+            single_publication,
+            recovery_case,
+            base_refresh,
+            verify_coordinator_handoff,
+            direct_merge_intent,
+            obsolete_deferred_assessment,
+            terminal_deferral_crash_gap,
+            false,
+        );
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "This integration fixture binds a complete publication scenario and one admission assertion"
+    )]
+    fn published_publication_fixture_inner(
+        single_publication: bool,
+        recovery_case: Option<MergeClaimRecoveryFixture>,
+        base_refresh: bool,
+        verify_coordinator_handoff: bool,
+        direct_merge_intent: bool,
+        obsolete_deferred_assessment: bool,
+        terminal_deferral_crash_gap: bool,
+        request_admission_check: bool,
     ) {
         let reject_twice = recovery_case.is_some();
         let exercise_runtime_launch = matches!(
@@ -8690,7 +8723,7 @@ pub(crate) mod tests {
                 serde_json::json!({"name":"main","protected":true}),
                 serde_json::json!({"required_status_checks":{"strict":true,"contexts":[]},"required_pull_request_reviews":null,"enforce_admins":{"enabled":true},"allow_force_pushes":{"enabled":false},"allow_deletions":{"enabled":false}}),
             ];
-            if single_publication && !reject_twice && !base_refresh {
+            if single_publication && !reject_twice && !base_refresh && !request_admission_check {
                 let (prepared_observation, prepared_body_proposal) =
                     crate::runtime_services::merge::tests::observe_and_prepare_for_store_test(
                         applied.clone(),
@@ -9263,6 +9296,178 @@ pub(crate) mod tests {
                 )
                 .unwrap()
             );
+            if request_admission_check {
+                let blocked = store
+                    .active_ticket_runs(owner_generation, 10)
+                    .unwrap()
+                    .into_iter()
+                    .find(|run| run.ticket_run_id == ticket_run_id)
+                    .unwrap();
+                assert_eq!(blocked.phase, Phase::Assessing);
+                assert_eq!(blocked.activity, crate::engine::reducer::Activity::Blocked);
+                assert_eq!(
+                    blocked.external_status,
+                    crate::domain::types::TicketStatus::InProgress
+                );
+                assert!(
+                    store
+                        .trusted_merge_assessment(
+                            &project_id,
+                            &ticket_run_id,
+                            Revision(assessing.revision),
+                        )
+                        .unwrap()
+                        .is_none(),
+                    "unsupported Request must not persist a reviewable host assessment"
+                );
+                assert_eq!(
+                    store
+                        .connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM merge_work_items WHERE ticket_run_id=?1",
+                            [ticket_run_id.as_str()],
+                            |row| row.get::<_, u64>(0),
+                        )
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(
+                    store
+                        .connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM effects WHERE subject_id=?1 AND kind='request_human_review'",
+                            [ticket_run_id.as_str()],
+                            |row| row.get::<_, u64>(0),
+                        )
+                        .unwrap(),
+                    0,
+                    "unsupported Request must not reach human approval"
+                );
+                assert_eq!(
+                    crate::store::agent_results::host_validation_fixture::result_ack(
+                        &store,
+                        merge_result.ingested.receipt.evidence_id(),
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .1,
+                    "applied"
+                );
+                let supervisor_wakes = store
+                    .pending_role_wake_inputs(
+                        &project_id,
+                        &format!("project:{project_id}:supervisor"),
+                        32,
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .filter(|wake| {
+                        wake.payload_json["target"] == "supervisor"
+                            && wake.payload_json["ticket_run_id"] == ticket_run_id.as_str()
+                    })
+                    .count();
+                assert_eq!(supervisor_wakes, 1);
+                let merge_decision_session = format!("ticket_run:{ticket_run_id}:merge_decision");
+                assert!(
+                    store
+                        .pending_role_wake_inputs(&project_id, &merge_decision_session, 16)
+                        .unwrap()
+                        .iter()
+                        .all(|wake| wake.source_type != "host_merge_assessment"),
+                    "unsupported Request must not schedule the second MergeDecision turn"
+                );
+                // Recreate the durable boundary after the block commits but before
+                // its reducer ACK is stored, then use the real due-result reader.
+                let artifacts =
+                    crate::artifacts::ArtifactStore::open(&temp.path().join("artifacts")).unwrap();
+                for pending in store
+                    .pending_validated_agent_results(&artifacts, owner_generation, 32)
+                    .unwrap()
+                {
+                    if pending.validated.message_id == "coordinator-plan-result" {
+                        store
+                            .acknowledge_validated_agent_result(
+                                owner_generation,
+                                pending.receipt.evidence_id(),
+                                pending.validated.binding.ticket_revision.unwrap().0,
+                                crate::store::agent_results::ResultDisposition::Applied,
+                            )
+                            .unwrap();
+                    }
+                }
+                store
+                    .connection
+                    .execute(
+                        "DELETE FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                        [merge_result.ingested.receipt.evidence_id()],
+                    )
+                    .unwrap();
+                let state_root = temp.path().to_path_buf();
+                drop(store);
+                let mut store = ConfigStore::open_test(&state_root).unwrap();
+                let replay = crate::engine::factory_runtime::tests::tick_with_merge_observation_replies_for_test(
+                    &mut store,
+                    owner_generation,
+                    12,
+                    &config,
+                    config_digest.clone(),
+                    crate::artifacts::ArtifactStore::open(&state_root.join("artifacts")).unwrap(),
+                    applied.clone(),
+                    Vec::new(),
+                    None,
+                ).unwrap();
+                assert!(
+                    replay.ingested_agent_result,
+                    "the blocked result must remain selectable until ACK"
+                );
+                let after_replay = store
+                    .active_ticket_runs(owner_generation, 10)
+                    .unwrap()
+                    .into_iter()
+                    .find(|run| run.ticket_run_id == ticket_run_id)
+                    .unwrap();
+                assert_eq!(after_replay.phase, blocked.phase);
+                assert_eq!(after_replay.activity, blocked.activity);
+                assert_eq!(after_replay.revision, blocked.revision);
+                assert_eq!(
+                    crate::store::agent_results::host_validation_fixture::result_ack(
+                        &store,
+                        merge_result.ingested.receipt.evidence_id(),
+                    )
+                    .unwrap(),
+                    Some((blocked.revision, "applied".into()))
+                );
+                assert!(
+                    store
+                        .runnable_validated_agent_results(
+                            &crate::artifacts::ArtifactStore::open(&state_root.join("artifacts"))
+                                .unwrap(),
+                            owner_generation,
+                            13,
+                            32,
+                        )
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(
+                    store
+                        .pending_role_wake_inputs(
+                            &project_id,
+                            &format!("project:{project_id}:supervisor"),
+                            32,
+                        )
+                        .unwrap()
+                        .into_iter()
+                        .filter(|wake| {
+                            wake.payload_json["target"] == "supervisor"
+                                && wake.payload_json["ticket_run_id"] == ticket_run_id.as_str()
+                        })
+                        .count(),
+                    1,
+                    "replay must not create another blocked transition wake"
+                );
+                return;
+            }
             let correction_wakes = store
                 .pending_role_wake_inputs(
                     &project_id,
@@ -11671,20 +11876,41 @@ pub(crate) mod tests {
                     );
                     return;
                 }
-                let typed_intent = serde_json::json!({
-                    "assessment_id": resumed_trusted.assessment_id.as_str(),
-                    "pr_identities": [resumed_trusted.pull_request_reference],
-                    "policy_digest": resumed_trusted.policy_digest.as_str(),
-                    "prepared_body_digest": resumed_trusted.prepared_body_proposal.as_ref().unwrap().target_body_digest.as_str(),
-                    "steps": [
-                        {"kind":"update_pull_request_body","instruction_reference":"repository:repo-a:merge#prepare-body","rationale":"apply the host-prepared PR body"},
-                        {"kind":"request_merge","instruction_reference":"repository:repo-a:merge#request-merge","rationale":"request the repository-configured merge"},
-                        {"kind":"verify_merge_commit","instruction_reference":"repository:repo-a:merge#verify-merge","rationale":"verify the resulting commit"}
-                    ],
-                    "post_merge_verification": [
-                        {"kind":"merge_commit_recorded","instruction_reference":"repository:repo-a:merge#verify-merge","rationale":"confirm the remote merge commit"}
-                    ]
-                });
+                let typed_intent = if direct_merge_intent {
+                    let template = include_str!("../xtask/src/fixtures/merge_intent.json")
+                        .replace("{repository_id}", repository_id.as_str());
+                    let mut payload: serde_json::Value = serde_json::from_str(&template).unwrap();
+                    payload["assessment_id"] =
+                        serde_json::json!(resumed_trusted.assessment_id.as_str());
+                    payload["pr_identities"] =
+                        serde_json::json!([resumed_trusted.pull_request_reference]);
+                    payload["policy_digest"] =
+                        serde_json::json!(resumed_trusted.policy_digest.as_str());
+                    payload["prepared_body_digest"] = serde_json::json!(
+                        resumed_trusted
+                            .prepared_body_proposal
+                            .as_ref()
+                            .unwrap()
+                            .target_body_digest
+                            .as_str()
+                    );
+                    payload
+                } else {
+                    serde_json::json!({
+                        "assessment_id": resumed_trusted.assessment_id.as_str(),
+                        "pr_identities": [resumed_trusted.pull_request_reference],
+                        "policy_digest": resumed_trusted.policy_digest.as_str(),
+                        "prepared_body_digest": resumed_trusted.prepared_body_proposal.as_ref().unwrap().target_body_digest.as_str(),
+                        "steps": [
+                            {"kind":"update_pull_request_body","instruction_reference":"repository:repo-a:merge#prepare-body","rationale":"apply the host-prepared PR body"},
+                            {"kind":"request_merge","instruction_reference":"repository:repo-a:merge#request-merge","rationale":"request the repository-configured merge"},
+                            {"kind":"verify_merge_commit","instruction_reference":"repository:repo-a:merge#verify-merge","rationale":"verify the resulting commit"}
+                        ],
+                        "post_merge_verification": [
+                            {"kind":"merge_commit_recorded","instruction_reference":"repository:repo-a:merge#verify-merge","rationale":"confirm the remote merge commit"}
+                        ]
+                    })
+                };
                 let merge_intent_message = crate::roles::RoleResultMessage {
                     schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
                     message_id: "recovery-resumed-merge-intent".into(),

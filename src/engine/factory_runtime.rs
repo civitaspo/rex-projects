@@ -2082,6 +2082,70 @@ fn block_merge_observation_for_human(
     Ok(())
 }
 
+fn acknowledge_unsupported_request_block_replay(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    run: &crate::store::scheduler::ActiveTicketRun,
+    result: &crate::store::agent_results::IngestedAgentResult,
+    source_revision: u64,
+) -> Result<bool, String> {
+    if run.phase != Phase::Assessing || run.activity != Activity::Blocked {
+        return Ok(false);
+    }
+    let already_blocked = store
+        .ticket_run_transition_evidence(
+            owner_generation,
+            &run.project_id,
+            &run.ticket_run_id,
+            source_revision,
+            32,
+        )?
+        .into_iter()
+        .any(|(_, evidence)| {
+            evidence["kind"] == "merge_observation_blocked"
+                && evidence["state"] == "request_executor_unsupported"
+                && evidence["source_evidence_id"].as_str() == Some(result.receipt.evidence_id())
+                && evidence["source_result_digest"].as_str()
+                    == Some(result.validated.result_digest.as_str())
+        });
+    if !already_blocked {
+        return Ok(false);
+    }
+    store.acknowledge_validated_agent_result(
+        owner_generation,
+        result.receipt.evidence_id(),
+        run.revision,
+        crate::store::agent_results::ResultDisposition::Applied,
+    )?;
+    Ok(true)
+}
+
+fn block_unsupported_request_merge_assessment(
+    store: &mut ConfigStore,
+    owner_generation: u64,
+    run: &crate::store::scheduler::ActiveTicketRun,
+    result: &crate::store::agent_results::IngestedAgentResult,
+    now_unix: i64,
+) -> Result<(), String> {
+    block_merge_observation_for_human(
+        store,
+        owner_generation,
+        run,
+        result,
+        now_unix,
+        "request_executor_unsupported",
+    )?;
+    store.acknowledge_validated_agent_result(
+        owner_generation,
+        result.receipt.evidence_id(),
+        run.revision
+            .checked_add(1)
+            .ok_or("TicketRun revision overflow while blocking Request executor")?,
+        crate::store::agent_results::ResultDisposition::Applied,
+    )?;
+    Ok(())
+}
+
 fn apply_merge_assessment(
     store: &mut ConfigStore,
     owner_generation: u64,
@@ -2124,6 +2188,15 @@ fn apply_merge_assessment(
         }
         return Err("MergeAssessment result references no active TicketRun".into());
     };
+    if acknowledge_unsupported_request_block_replay(
+        store,
+        owner_generation,
+        &run,
+        result,
+        source_revision.0,
+    )? {
+        return Ok(true);
+    }
     if binding.role != Role::MergeDecision
         || run.project_id != binding.project_id
         || run.revision != source_revision.0
@@ -2439,6 +2512,28 @@ fn apply_merge_assessment(
             return Err(error);
         }
     };
+    if observation.policy.executor == crate::domain::types::MergeExecutor::Request
+        && trusted.assessment.disposition == crate::merge_policy::MergeDisposition::Blocked
+    {
+        if let Some(recovery) = &recovery {
+            store.fail_resumed_merge_claim_recovery(
+                owner_generation,
+                recovery,
+                result,
+                "configured Request executor has no verifiable execution contract",
+                now_unix,
+            )?;
+            return Ok(true);
+        }
+        block_unsupported_request_merge_assessment(
+            store,
+            owner_generation,
+            &run,
+            result,
+            now_unix,
+        )?;
+        return Ok(true);
+    }
     let assessment_id = crate::merge_runtime::assessment_id(
         &run.project_id,
         ticket_run_id,
@@ -2505,6 +2600,15 @@ fn apply_merge_intent(
         .into_iter()
         .find(|run| run.ticket_run_id == *ticket_run_id)
         .ok_or("MergeIntent result references no active TicketRun")?;
+    if acknowledge_unsupported_request_block_replay(
+        store,
+        owner_generation,
+        &run,
+        result,
+        revision.0,
+    )? {
+        return Ok(true);
+    }
     if binding.role == Role::MergeDecision
         && run.phase == Phase::WaitingHuman
         && run.activity == Activity::Blocked
@@ -2561,6 +2665,35 @@ fn apply_merge_intent(
         || binding.config_revision != project_record.config_revision
     {
         return Err("MergeIntent result belongs to a stale Project configuration".into());
+    }
+    if trusted.policy.executor == crate::domain::types::MergeExecutor::Request {
+        if let Some(recovery) = store.recovery_authorization_for_merge_failure(result)? {
+            store.fail_resumed_merge_claim_recovery(
+                owner_generation,
+                &recovery,
+                result,
+                "legacy Request MergeIntent has no verifiable execution contract",
+                now_unix,
+            )?;
+            return Ok(true);
+        }
+        block_merge_observation_for_human(
+            store,
+            owner_generation,
+            &run,
+            result,
+            now_unix,
+            "request_executor_unsupported",
+        )?;
+        store.acknowledge_validated_agent_result(
+            owner_generation,
+            result.receipt.evidence_id(),
+            run.revision
+                .checked_add(1)
+                .ok_or("TicketRun revision overflow while blocking legacy Request MergeIntent")?,
+            crate::store::agent_results::ResultDisposition::Applied,
+        )?;
+        return Ok(true);
     }
     let project = config
         .projects
