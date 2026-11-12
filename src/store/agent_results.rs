@@ -230,6 +230,18 @@ impl VerifiedAgentTerminal {
         &self.agent_run_id
     }
 
+    pub(crate) fn project_id(&self) -> &ProjectId {
+        &self.project_id
+    }
+
+    pub(crate) fn controller_generation(&self) -> u64 {
+        self.controller_generation
+    }
+
+    pub(crate) fn authority_digest(&self) -> &Digest {
+        &self.authority_digest
+    }
+
     pub fn terminal_digest(&self) -> &Digest {
         &self.terminal_digest
     }

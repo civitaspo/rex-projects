@@ -3878,7 +3878,7 @@ impl FactoryRuntimeServices for RuntimeServices {
             wake_inputs,
             None,
         )?;
-        let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {
+        let wake_snapshot = crate::agent_api::AgentWakeSnapshot {
             schema_version: 1,
             project_id: candidate.project_id.clone(),
             role_session_id: candidate.role_session_id.clone(),
@@ -3888,30 +3888,6 @@ impl FactoryRuntimeServices for RuntimeServices {
 
             worker_correction_context: None,
         };
-        wake_snapshot = fit_wake_snapshot_to_inbox(wake_snapshot)?;
-        if wake_snapshot.inputs.is_empty() {
-            return Ok(false);
-        }
-        let seed = serde_json::to_vec(&(
-            "rex-projects-agent-run-v1",
-            &candidate.project_id,
-            &candidate.role_session_id,
-            wake_snapshot
-                .inputs
-                .iter()
-                .map(|input| input.wake_input_id)
-                .collect::<Vec<_>>(),
-        ))
-        .map_err(|error| error.to_string())?;
-        let seed_digest = digest_bytes(&seed)?;
-        let short = &seed_digest.as_str()[..32];
-        let run_id = crate::domain::ids::AgentRunId::parse(format!("agent-{short}"))?;
-        let operation_id = crate::domain::ids::OperationId::parse(format!("start-{short}"))?;
-        wake_snapshot.agent_run_id = run_id.as_str().to_owned();
-        wake_snapshot.serialized_bytes()?;
-        let run_root = self.state_root.join("agents").join(run_id.as_str());
-        let control_dir = run_root.join("control");
-        create_private_dir(&control_dir)?;
         let rendered = crate::roles::render_role_prompt(
             &self.applied_config,
             &crate::roles::PromptContext {
@@ -3959,53 +3935,79 @@ impl FactoryRuntimeServices for RuntimeServices {
         .map_err(|_| "Agent mailbox expiration is negative")?;
         let mailbox_max_request_bytes = 1_048_576_u64;
         let mailbox_max_pending_requests = 32_u32;
-        let mailbox_capability_digest = mailbox_capability_digest(
-            &run_id,
-            mailbox_expires_at_unix,
-            mailbox_max_request_bytes,
-            mailbox_max_pending_requests,
-        )?;
-        let reservation = crate::launch::AgentLaunchReservation {
-            schema_version: crate::launch::LAUNCH_SCHEMA_VERSION,
-            agent_run_id: run_id,
-            project_id: candidate.project_id.clone(),
-            role: Role::Supervisor,
-            role_session_id: candidate.role_session_id.clone(),
-            parent_run_id: None,
-            parent_role: None,
-            ticket_run_id: None,
-            ticket_revision: None,
-            config_revision: runnable.record.config_revision,
-            config_digest: runnable.record.config_digest,
-            attempt: 1,
-            run_epoch: 1,
-            controller_generation: owner_generation,
-            project_epoch: runnable.project_epoch,
-            operation_id,
-            operation_recipe_id: None,
-            worker_assignment: None,
-            rex_view_id: view.view_id.clone(),
-            runtime_binary_digest: self.runtime_binary_digest.clone(),
-            environment_snapshot_id: self.environment.metadata().id.clone(),
-            profile_id: profile_id.clone(),
-            profile_digest,
-            instruction_digest: rendered.instruction_digest,
-            result_schema_digest,
-            wake_snapshot,
-            qualification_receipt_digest: qualification_digest,
-            descriptor_path: run_root.join("run-step.package.json"),
-            workspace_path: workspace,
-            control_dir: control_dir.clone(),
-            mailbox_directory: control_dir,
-            mailbox_capability_digest,
-            mailbox_expires_at_unix,
-            mailbox_max_request_bytes,
-            mailbox_max_pending_requests,
-            pool: "agent".into(),
-            slot_index,
-            global_capacity: capacity,
-            project_capacity: capacity,
+        let Some(reservation) = fit_wake_snapshot_to_reservation(wake_snapshot, |mut snapshot| {
+            let seed = serde_json::to_vec(&(
+                "rex-projects-agent-run-v1",
+                &candidate.project_id,
+                &candidate.role_session_id,
+                snapshot
+                    .inputs
+                    .iter()
+                    .map(|input| input.wake_input_id)
+                    .collect::<Vec<_>>(),
+            ))
+            .map_err(|error| error.to_string())?;
+            let seed_digest = digest_bytes(&seed)?;
+            let short = &seed_digest.as_str()[..32];
+            let run_id = crate::domain::ids::AgentRunId::parse(format!("agent-{short}"))?;
+            let operation_id = crate::domain::ids::OperationId::parse(format!("start-{short}"))?;
+            snapshot.agent_run_id = run_id.as_str().to_owned();
+            snapshot.digest = snapshot.content_digest()?;
+            let run_root = self.state_root.join("agents").join(run_id.as_str());
+            let control_dir = run_root.join("control");
+            let mailbox_capability_digest = mailbox_capability_digest(
+                &run_id,
+                mailbox_expires_at_unix,
+                mailbox_max_request_bytes,
+                mailbox_max_pending_requests,
+            )?;
+            Ok(crate::launch::AgentLaunchReservation {
+                schema_version: crate::launch::LAUNCH_SCHEMA_VERSION,
+                agent_run_id: run_id,
+                project_id: candidate.project_id.clone(),
+                role: Role::Supervisor,
+                role_session_id: candidate.role_session_id.clone(),
+                parent_run_id: None,
+                parent_role: None,
+                ticket_run_id: None,
+                ticket_revision: None,
+                config_revision: runnable.record.config_revision,
+                config_digest: runnable.record.config_digest.clone(),
+                attempt: 1,
+                run_epoch: 1,
+                controller_generation: owner_generation,
+                project_epoch: runnable.project_epoch,
+                operation_id,
+                operation_recipe_id: None,
+                worker_assignment: None,
+                rex_view_id: view.view_id.clone(),
+                runtime_binary_digest: self.runtime_binary_digest.clone(),
+                environment_snapshot_id: self.environment.metadata().id.clone(),
+                profile_id: profile_id.clone(),
+                profile_digest: profile_digest.clone(),
+                instruction_digest: rendered.instruction_digest.clone(),
+                result_schema_digest: result_schema_digest.clone(),
+                wake_snapshot: snapshot,
+                qualification_receipt_digest: qualification_digest.clone(),
+                descriptor_path: run_root.join("run-step.package.json"),
+                workspace_path: workspace.clone(),
+                control_dir: control_dir.clone(),
+                mailbox_directory: control_dir,
+                mailbox_capability_digest,
+                mailbox_expires_at_unix,
+                mailbox_max_request_bytes,
+                mailbox_max_pending_requests,
+                pool: "agent".into(),
+                slot_index,
+                global_capacity: capacity,
+                project_capacity: capacity,
+            })
+        })?
+        else {
+            return Ok(false);
         };
+        let control_dir = reservation.control_dir.clone();
+        create_private_dir(&control_dir)?;
         match store.prepare_role_launch(&reservation)? {
             crate::store::agent_runtime::LaunchPreparationOutcome::Prepared { .. } => Ok(true),
             crate::store::agent_runtime::LaunchPreparationOutcome::CapacityUnavailable => Ok(false),
@@ -4019,7 +4021,8 @@ impl FactoryRuntimeServices for RuntimeServices {
     }
 }
 
-fn fit_wake_snapshot_to_inbox(
+#[cfg(test)]
+pub(crate) fn fit_wake_snapshot_to_inbox(
     mut snapshot: crate::agent_api::AgentWakeSnapshot,
 ) -> Result<crate::agent_api::AgentWakeSnapshot, String> {
     let mut ordered = std::mem::take(&mut snapshot.inputs);
@@ -4042,6 +4045,44 @@ fn fit_wake_snapshot_to_inbox(
     snapshot.digest = snapshot.content_digest()?;
     snapshot.validate()?;
     Ok(snapshot)
+}
+
+pub(crate) fn fit_wake_snapshot_to_reservation(
+    mut snapshot: crate::agent_api::AgentWakeSnapshot,
+    mut build_reservation: impl FnMut(
+        crate::agent_api::AgentWakeSnapshot,
+    ) -> Result<crate::launch::AgentLaunchReservation, String>,
+) -> Result<Option<crate::launch::AgentLaunchReservation>, String> {
+    let mut ordered = std::mem::take(&mut snapshot.inputs);
+    ordered.sort_by(|left, right| {
+        right
+            .priority
+            .cmp(&left.priority)
+            .then_with(|| left.wake_input_id.cmp(&right.wake_input_id))
+    });
+    let mut selected = None;
+    for input in ordered {
+        let mut candidate = snapshot.clone();
+        candidate.inputs.push(input);
+        candidate.inputs.sort_by_key(|item| item.wake_input_id);
+        let reservation = build_reservation(candidate)?;
+        let mut inbox_snapshot = reservation.wake_snapshot.clone();
+        let Some(inbox_bytes) = inbox_snapshot.serialized_bytes_for_selection()? else {
+            continue;
+        };
+        if inbox_bytes.len() > crate::agent_api::MAX_INBOX_BYTES
+            || inbox_snapshot != reservation.wake_snapshot
+        {
+            continue;
+        }
+        reservation.validate()?;
+        if crate::store::canonical_json(&reservation)?.len() > 1_048_576 {
+            continue;
+        }
+        snapshot = reservation.wake_snapshot.clone();
+        selected = Some(reservation);
+    }
+    Ok(selected)
 }
 
 #[cfg(test)]
@@ -5817,12 +5858,12 @@ mod provider_qualification_lookup_tests {
     }
 }
 
-fn digest_bytes(bytes: &[u8]) -> Result<Digest, String> {
+pub(crate) fn digest_bytes(bytes: &[u8]) -> Result<Digest, String> {
     use sha2::Digest as _;
     Digest::parse(format!("{:x}", sha2::Sha256::digest(bytes)))
 }
 
-fn mailbox_capability_digest(
+pub(crate) fn mailbox_capability_digest(
     agent_run_id: &crate::domain::ids::AgentRunId,
     expires_at_unix: u64,
     max_request_bytes: u64,

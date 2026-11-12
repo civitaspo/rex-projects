@@ -3762,6 +3762,183 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(slot_owner, "run-2");
+
+        reopened
+            .connection
+            .execute(
+                "UPDATE execution_slots SET disposition='released' WHERE owner_id='run-2'",
+                [],
+            )
+            .unwrap();
+        reopened
+            .connection
+            .execute(
+                "UPDATE agent_runs SET state='completed' WHERE agent_run_id='run-2'",
+                [],
+            )
+            .unwrap();
+        reopened.connection.execute(
+            "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,'project:project-a:supervisor','test','boundary-small',1,10,'{}','pending',3)",
+            [project.as_str()],
+        ).unwrap();
+        let small_id = u64::try_from(reopened.connection.last_insert_rowid()).unwrap();
+        reopened.connection.execute(
+            "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,'project:project-a:supervisor','test','boundary-large',1,1,'{}','pending',3)",
+            [project.as_str()],
+        ).unwrap();
+        let large_id = u64::try_from(reopened.connection.last_insert_rowid()).unwrap();
+        let mut boundary_snapshot = crate::agent_api::AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: project.clone(),
+            role_session_id: "project:project-a:supervisor".into(),
+            agent_run_id: "agent-00000000000000000000000000000000".into(),
+            digest: digest('0'),
+            inputs: vec![
+                crate::agent_api::AgentWakeItem {
+                    wake_input_id: small_id,
+                    source_type: "test".into(),
+                    source_id: "boundary-small".into(),
+                    source_revision: 1,
+                    priority: 10,
+                    payload_json: serde_json::json!({}),
+                    host_artifact_source_evidence_ids: Vec::new(),
+                    host_artifacts: Vec::new(),
+                    host_completion_context: None,
+                },
+                crate::agent_api::AgentWakeItem {
+                    wake_input_id: large_id,
+                    source_type: "test".into(),
+                    source_id: "boundary-large".into(),
+                    source_revision: 1,
+                    priority: 1,
+                    payload_json: serde_json::json!({"boundary":"x"}),
+                    host_artifact_source_evidence_ids: Vec::new(),
+                    host_artifacts: Vec::new(),
+                    host_completion_context: None,
+                },
+            ],
+            worker_correction_context: None,
+        };
+        let mut low = 0;
+        let mut high = crate::agent_api::MAX_INBOX_BYTES;
+        while low < high {
+            let size = low + (high - low).div_ceil(2);
+            let mut candidate = boundary_snapshot.clone();
+            candidate.inputs[1].payload_json = serde_json::json!({"boundary":"x".repeat(size)});
+            if candidate.serialized_bytes().unwrap().len() <= crate::agent_api::MAX_INBOX_BYTES {
+                low = size;
+            } else {
+                high = size - 1;
+            }
+        }
+        boundary_snapshot.inputs[1].payload_json = serde_json::json!({"boundary":"x".repeat(low)});
+        reopened
+            .connection
+            .execute(
+                "UPDATE role_wake_inputs SET payload_json=?2 WHERE wake_input_id=?1",
+                rusqlite::params![
+                    large_id,
+                    boundary_snapshot.inputs[1].payload_json.to_string()
+                ],
+            )
+            .unwrap();
+        let fitted_inbox =
+            crate::runtime_services::fit_wake_snapshot_to_inbox(boundary_snapshot.clone()).unwrap();
+        assert_eq!(fitted_inbox.inputs.len(), 2);
+        let build_reservation = |mut snapshot: crate::agent_api::AgentWakeSnapshot| {
+            let seed = serde_json::to_vec(&(
+                "rex-projects-agent-run-v1",
+                &project,
+                &snapshot.role_session_id,
+                snapshot
+                    .inputs
+                    .iter()
+                    .map(|input| input.wake_input_id)
+                    .collect::<Vec<_>>(),
+            ))
+            .unwrap();
+            let seed_digest = crate::runtime_services::digest_bytes(&seed)?;
+            let short = &seed_digest.as_str()[..32];
+            let run_id = AgentRunId::parse(format!("agent-{short}"))?;
+            let operation_id = OperationId::parse(format!("start-{short}"))?;
+            snapshot.agent_run_id = run_id.as_str().to_owned();
+            snapshot.digest = snapshot.content_digest()?;
+            let run_root = temp.path().join("agents").join(run_id.as_str());
+            let control_dir = run_root.join("control");
+            let mut reservation = next.clone();
+            reservation.agent_run_id = run_id.clone();
+            reservation.run_epoch = next.run_epoch + 1;
+            reservation.operation_id = operation_id;
+            reservation.wake_snapshot = snapshot;
+            reservation.descriptor_path = run_root.join("run-step.package.json");
+            reservation.control_dir = control_dir.clone();
+            reservation.mailbox_directory = control_dir;
+            reservation.mailbox_capability_digest =
+                crate::runtime_services::mailbox_capability_digest(
+                    &run_id,
+                    reservation.mailbox_expires_at_unix,
+                    reservation.mailbox_max_request_bytes,
+                    reservation.mailbox_max_pending_requests,
+                )?;
+            Ok(reservation)
+        };
+        let inbox_only_reservation = build_reservation(fitted_inbox).unwrap();
+        assert!(
+            crate::store::canonical_json(&inbox_only_reservation)
+                .unwrap()
+                .len()
+                > 1_048_576
+        );
+        std::fs::create_dir_all(&inbox_only_reservation.control_dir).unwrap();
+        assert_eq!(
+            reopened
+                .prepare_role_launch(&inbox_only_reservation)
+                .unwrap_err(),
+            "launch reservation exceeds 1 MiB"
+        );
+        let mut fitted = crate::runtime_services::fit_wake_snapshot_to_reservation(
+            boundary_snapshot,
+            build_reservation,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            fitted
+                .wake_snapshot
+                .inputs
+                .iter()
+                .map(|input| input.wake_input_id)
+                .collect::<Vec<_>>(),
+            [small_id]
+        );
+        assert!(
+            fitted.wake_snapshot.serialized_bytes().unwrap().len()
+                <= crate::agent_api::MAX_INBOX_BYTES
+        );
+        assert!(crate::store::canonical_json(&fitted).unwrap().len() <= 1_048_576);
+        std::fs::create_dir_all(&fitted.control_dir).unwrap();
+        assert!(matches!(
+            reopened.prepare_role_launch(&fitted).unwrap(),
+            LaunchPreparationOutcome::Prepared { .. }
+        ));
+        let assignments: Vec<(u64, String, Option<String>)> = reopened.connection.prepare(
+            "SELECT wake_input_id,lifecycle,consuming_agent_run_id FROM role_wake_inputs WHERE wake_input_id IN (?1,?2) ORDER BY wake_input_id",
+        ).unwrap().query_map(rusqlite::params![small_id, large_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(
+            assignments[0],
+            (
+                small_id,
+                "assigned".into(),
+                Some(fitted.agent_run_id.as_str().into())
+            )
+        );
+        assert_eq!(assignments[1], (large_id, "pending".into(), None));
+        assert!(
+            reopened
+                .agent_launch_reservation_for_run(&fitted.agent_run_id)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

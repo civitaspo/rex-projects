@@ -57,7 +57,7 @@ fn learning_finding_id(publication: &Digest, ordinal: u32, text: &str) -> Result
 fn validate_learning_run_owner(
     connection: &rusqlite::Connection,
     binding: &crate::engine::orchestration::RoleResultBinding,
-    owner_generation: u64,
+    terminal: &crate::store::agent_results::VerifiedAgentTerminal,
 ) -> Result<crate::launch::AgentLaunchAuthority, String> {
     let (authority_json, stored_digest): (String, String) = connection
         .query_row(
@@ -84,14 +84,15 @@ fn validate_learning_run_owner(
             "learning result binding differs from immutable Supervisor launch authority".into(),
         );
     }
-    crate::store::agent_recovery::validate_agent_run_current_owner(
-        connection,
-        &binding.agent_run_id,
-        authority.controller_generation,
-        owner_generation,
-        &authority_digest,
-        &authority.descriptor_digest,
-    )?;
+    if terminal.agent_run_id() != &binding.agent_run_id
+        || terminal.project_id() != &binding.project_id
+        || terminal.controller_generation() != authority.controller_generation
+        || terminal.authority_digest() != &authority_digest
+    {
+        return Err(
+            "verified learning terminal differs from immutable Supervisor launch authority".into(),
+        );
+    }
     Ok(authority)
 }
 
@@ -2537,12 +2538,17 @@ impl ConfigStore {
         if now_unix < 0 {
             return Err("learning decision belongs to another controller generation".into());
         }
+        let terminal = crate::store::agent_results::verify_agent_terminal(
+            self,
+            owner_generation,
+            &binding.agent_run_id,
+        )?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
-        let authority = validate_learning_run_owner(&tx, binding, owner_generation)?;
+        let authority = validate_learning_run_owner(&tx, binding, &terminal)?;
         let existing: Option<(String, String)> = tx
             .query_row(
                 "SELECT batch_id,result_digest FROM learning_decisions WHERE evidence_id=?1",
@@ -2786,21 +2792,25 @@ impl ConfigStore {
         if binding.role != crate::domain::types::Role::Supervisor {
             return Ok(());
         }
+        let has_assigned_batch: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM learning_batches b JOIN role_wake_inputs w ON w.wake_input_id=b.wake_input_id WHERE b.project_id=?1 AND b.status='issued' AND w.consuming_agent_run_id=?2 AND w.lifecycle IN ('assigned','consumed'))",
+            params![binding.project_id.as_str(), binding.agent_run_id.as_str()],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if !has_assigned_batch {
+            return Ok(());
+        }
+        let terminal = crate::store::agent_results::verify_agent_terminal(
+            self,
+            owner_generation,
+            &binding.agent_run_id,
+        )?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
-        let has_assigned_batch: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM learning_batches b JOIN role_wake_inputs w ON w.wake_input_id=b.wake_input_id WHERE b.project_id=?1 AND b.status='issued' AND w.consuming_agent_run_id=?2 AND w.lifecycle IN ('assigned','consumed'))",
-            params![binding.project_id.as_str(), binding.agent_run_id.as_str()],
-            |row| row.get(0),
-        ).map_err(|e|e.to_string())?;
-        if !has_assigned_batch {
-            tx.commit().map_err(|e| e.to_string())?;
-            return Ok(());
-        }
-        let authority = validate_learning_run_owner(&tx, binding, owner_generation)?;
+        let authority = validate_learning_run_owner(&tx, binding, &terminal)?;
         let reservation_json: Option<String> = tx
             .query_row(
                 "SELECT reservation_json FROM agent_launch_reservations WHERE agent_run_id=?1",
@@ -2839,12 +2849,6 @@ impl ConfigStore {
             tx.commit().map_err(|e| e.to_string())?;
             return Ok(());
         }
-        let terminal: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_terminal_receipts WHERE agent_run_id=?1 AND project_id=?2)",params![binding.agent_run_id.as_str(),binding.project_id.as_str()],|r|r.get(0)).map_err(|e|e.to_string())?;
-        if !terminal {
-            return Err(
-                "cannot reoffer a learning batch without completed host terminal evidence".into(),
-            );
-        }
         for wake in issued_wakes {
             let source_id = wake.source_id.clone();
             let row: Option<(String,String,String)>=tx.query_row("SELECT project_id,role_session_id,payload_json FROM role_wake_inputs WHERE wake_input_id=?1 AND consuming_agent_run_id=?2 AND lifecycle IN ('assigned','consumed')",params![wake.wake_input_id,binding.agent_run_id.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e|e.to_string())?;
@@ -2858,7 +2862,30 @@ impl ConfigStore {
                         "learning batch wake differs from its original launch snapshot".into(),
                     );
                 }
-                tx.execute("UPDATE role_wake_inputs SET lifecycle='pending',consuming_agent_run_id=NULL WHERE wake_input_id=?1 AND source_type='learning_batch' AND source_id=?2",params![wake.wake_input_id,source_id]).map_err(|e|e.to_string())?;
+                let max_revision: u64 = tx.query_row(
+                    "SELECT COALESCE(MAX(source_revision),0) FROM role_wake_inputs WHERE role_session_id=?1 AND source_type='learning_batch' AND source_id=?2",
+                    params![session, source_id],
+                    |row| row.get(0),
+                ).map_err(|error| error.to_string())?;
+                let next_revision = max_revision
+                    .checked_add(1)
+                    .ok_or("learning batch delivery revision overflow")?;
+                let next_revision_sql = i64::try_from(next_revision)
+                    .map_err(|_| "learning batch delivery revision exceeds SQLite range")?;
+                tx.execute(
+                    "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'learning_batch',?3,?4,1,?5,'pending',?6)",
+                    params![project, session, source_id, next_revision_sql, payload, super::now_unix()?],
+                ).map_err(|error| error.to_string())?;
+                let new_wake_id = tx.last_insert_rowid();
+                let changed = tx.execute(
+                    "UPDATE learning_batches SET wake_input_id=?2 WHERE batch_id=?1 AND wake_input_id=?3 AND status='issued'",
+                    params![source_id, new_wake_id, i64::try_from(wake.wake_input_id).map_err(|_| "learning wake ID overflow")?],
+                ).map_err(|error| error.to_string())?;
+                if changed != 1 {
+                    return Err(
+                        "issued learning batch delivery pointer changed during reoffer".into(),
+                    );
+                }
             }
         }
         tx.commit().map_err(|e| e.to_string())?;
@@ -4039,10 +4066,16 @@ mod tests {
     }
 
     fn running_store() -> (TempDir, ConfigStore, ProjectId, u64, TicketRunId) {
+        running_store_with_snapshot(&test_snapshot())
+    }
+
+    fn running_store_with_snapshot(
+        snapshot: &AppliedConfig,
+    ) -> (TempDir, ConfigStore, ProjectId, u64, TicketRunId) {
         let temp = tempfile::tempdir().unwrap();
         let mut store = ConfigStore::open_test(temp.path()).unwrap();
         let applied = store
-            .apply_snapshot("factory", &test_snapshot(), ExpectedRevision::Bootstrap)
+            .apply_snapshot("factory", snapshot, ExpectedRevision::Bootstrap)
             .unwrap();
         let project_id = ProjectId::parse("sample").unwrap();
         store
@@ -4747,7 +4780,36 @@ mod tests {
         maximum_finding: bool,
         claim_override: Option<(bool, bool)>,
     ) -> LearningDispatchFixture {
-        let (temp, mut store, project, generation, run) = running_store();
+        let mut config = test_snapshot();
+        let profile_id = ProfileId::parse("fixture-profile").unwrap();
+        config.config.projects.insert(
+            ProjectId::parse("sample").unwrap(),
+            serde_json::from_value(serde_json::json!({
+                "mode": "goal",
+                "ticket_adapter": "tickets",
+                "roles": {"supervisor": "fixture-profile"}
+            }))
+            .unwrap(),
+        );
+        config.profiles.insert(
+            profile_id,
+            serde_json::from_value(serde_json::json!({
+                "adapter": "codex",
+                "command": ["/bin/codex"],
+                "model": "fixture",
+                "commit_mode": "native",
+                "turn_timeout_seconds": 60
+            }))
+            .unwrap(),
+        );
+        let (temp, mut store, project, generation, run) = running_store_with_snapshot(&config);
+        store
+            .connection
+            .execute(
+                "UPDATE projects SET desired_lifecycle='running' WHERE project_id=?1",
+                [project.as_str()],
+            )
+            .unwrap();
         store.connection.execute(
             "UPDATE project_runtimes SET observed_lifecycle='running',controller_generation=?2 WHERE project_id=?1",
             rusqlite::params![project.as_str(), generation],
@@ -4885,7 +4947,6 @@ mod tests {
             "UPDATE role_wake_inputs SET lifecycle='consumed' WHERE consuming_agent_run_id=?1 AND source_type='learning_batch'",
             [result.validated.binding.agent_run_id.as_str()],
         ).unwrap();
-        let config = test_snapshot().config;
         let config_digest = store.project(&project).unwrap().unwrap().config_digest;
         LearningDispatchFixture {
             _temp: temp,
@@ -4894,7 +4955,7 @@ mod tests {
             generation,
             batch_id,
             result,
-            config,
+            config: config.config,
             config_digest,
             checkpoint,
         }
@@ -5080,6 +5141,393 @@ mod tests {
             serde_json::from_str::<BTreeMap<String, String>>(&checkpoint_json).unwrap(),
             checkpoint
         );
+    }
+
+    #[test]
+    fn completed_learning_result_dispatches_after_controller_restart() {
+        let LearningDispatchFixture {
+            _temp,
+            mut store,
+            project: _,
+            generation,
+            batch_id,
+            result,
+            config,
+            config_digest,
+            ..
+        } = learning_dispatch_fixture(
+            crate::engine::orchestration::AgentAssertion::Succeeded,
+            false,
+            false,
+            None,
+        );
+        let run_id = &result.validated.binding.agent_run_id;
+        let old_run_generation: u64 = store
+            .connection
+            .query_row(
+                "SELECT controller_generation FROM agent_runs WHERE agent_run_id=?1",
+                [run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_run_generation, generation);
+        assert!(store.connection.query_row::<bool,_,_>(
+            "SELECT EXISTS(SELECT 1 FROM agent_result_evidence WHERE evidence_id=?1 AND outcome='completed')",
+            [result.receipt.evidence_id()],
+            |row| row.get(0),
+        ).unwrap());
+
+        store.stop_owner(generation).unwrap();
+        let new_generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "learning-result-owner-restarted".into(),
+                state_root: _temp.path().display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "learning-result-owner-restarted-start".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        assert_ne!(new_generation, old_run_generation);
+        assert_eq!(store.activate_starting_projects(new_generation).unwrap(), 1);
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                &mut store,
+                generation,
+                104,
+                &config,
+                config_digest.clone(),
+                &result,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                    [result.receipt.evidence_id()],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                &mut store,
+                new_generation,
+                105,
+                &config,
+                config_digest.clone(),
+                &result,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM learning_decisions WHERE batch_id=?1",
+                    [&batch_id],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<String, _, _>(
+                    "SELECT disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                    [result.receipt.evidence_id()],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            "applied"
+        );
+
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                &mut store,
+                new_generation,
+                106,
+                &config,
+                config_digest,
+                &result,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM learning_decisions WHERE batch_id=?1",
+                    [&batch_id],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn historical_learning_dispatch_rejects_missing_terminal_proof() {
+        let LearningDispatchFixture {
+            _temp,
+            mut store,
+            generation,
+            result,
+            config,
+            config_digest,
+            ..
+        } = learning_dispatch_fixture(
+            crate::engine::orchestration::AgentAssertion::Succeeded,
+            false,
+            false,
+            None,
+        );
+        store.stop_owner(generation).unwrap();
+        let new_generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "learning-result-invalid-terminal-owner".into(),
+                state_root: _temp.path().display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "learning-result-invalid-terminal-start".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        store.activate_starting_projects(new_generation).unwrap();
+        store
+            .connection
+            .execute_batch("DROP TRIGGER agent_terminal_receipts_immutable_delete")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "DELETE FROM agent_terminal_receipts WHERE agent_run_id=?1",
+                [result.validated.binding.agent_run_id.as_str()],
+            )
+            .unwrap();
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                &mut store,
+                new_generation,
+                107,
+                &config,
+                config_digest,
+                &result,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                    [result.receipt.evidence_id()],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn historical_learning_batch_reoffer_accepts_verified_terminal_after_restart() {
+        let LearningDispatchFixture {
+            _temp,
+            mut store,
+            project,
+            generation,
+            batch_id,
+            result,
+            ..
+        } = learning_dispatch_fixture(
+            crate::engine::orchestration::AgentAssertion::Succeeded,
+            false,
+            false,
+            None,
+        );
+        store.stop_owner(generation).unwrap();
+        let new_generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "learning-reoffer-owner-restarted".into(),
+                state_root: _temp.path().display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "learning-reoffer-owner-restarted-start".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        store.activate_starting_projects(new_generation).unwrap();
+        let original_wake_id: i64 = store
+            .connection
+            .query_row(
+                "SELECT wake_input_id FROM learning_batches WHERE batch_id=?1",
+                [&batch_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let original_batch: (String, String) = store
+            .connection
+            .query_row(
+                "SELECT snapshot_json,findings_json FROM learning_batches WHERE batch_id=?1",
+                [&batch_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        store
+            .reoffer_unhandled_learning_batch(new_generation, &result)
+            .unwrap();
+        store
+            .reoffer_unhandled_learning_batch(new_generation, &result)
+            .unwrap();
+        let deliveries: Vec<(i64, u64, String, Option<String>)> = store.connection.prepare(
+            "SELECT wake_input_id,source_revision,lifecycle,consuming_agent_run_id FROM role_wake_inputs WHERE role_session_id=?1 AND source_type='learning_batch' AND source_id=?2 ORDER BY wake_input_id",
+        ).unwrap().query_map(
+            rusqlite::params![result.validated.binding.role_session_id.as_str(), batch_id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        ).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(
+            deliveries.len(),
+            2,
+            "one reoffer creates exactly one new delivery"
+        );
+        assert_eq!(deliveries[0].0, original_wake_id);
+        assert_eq!(deliveries[0].2, "consumed");
+        assert_eq!(
+            deliveries[0].3.as_deref(),
+            Some(result.validated.binding.agent_run_id.as_str())
+        );
+        assert_ne!(deliveries[0].1, deliveries[1].1);
+        assert_eq!(deliveries[1].2, "pending");
+        assert_eq!(deliveries[1].3, None);
+        let current_wake_id: i64 = store
+            .connection
+            .query_row(
+                "SELECT wake_input_id FROM learning_batches WHERE batch_id=?1 AND status='issued'",
+                [&batch_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(current_wake_id, deliveries[1].0);
+        let current_batch: (String, String) = store
+            .connection
+            .query_row(
+                "SELECT snapshot_json,findings_json FROM learning_batches WHERE batch_id=?1",
+                [&batch_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(current_batch, original_batch);
+        assert_eq!(store.connection.query_row::<i64,_,_>(
+            "SELECT count(*) FROM learning_findings WHERE project_id=?1 AND consumed_batch_id IS NULL",
+            [project.as_str()],
+            |row| row.get(0),
+        ).unwrap(), 1);
+
+        let base = store
+            .agent_launch_reservation_for_run(&result.validated.binding.agent_run_id)
+            .unwrap()
+            .unwrap();
+        let pending = store
+            .pending_role_wake_inputs(&project, &base.role_session_id, 256)
+            .unwrap();
+        let wake = pending
+            .into_iter()
+            .find(|wake| wake.wake_input_id == u64::try_from(current_wake_id).unwrap())
+            .unwrap();
+        let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: project.clone(),
+            role_session_id: base.role_session_id.clone(),
+            agent_run_id: base.agent_run_id.as_str().into(),
+            digest: Digest::parse("0".repeat(64)).unwrap(),
+            inputs: vec![crate::agent_api::AgentWakeItem {
+                wake_input_id: wake.wake_input_id,
+                source_type: wake.source_type,
+                source_id: wake.source_id,
+                source_revision: wake.source_revision,
+                priority: wake.priority,
+                payload_json: wake.payload_json,
+                host_artifact_source_evidence_ids: Vec::new(),
+                host_artifacts: Vec::new(),
+                host_completion_context: None,
+            }],
+            worker_correction_context: None,
+        };
+        let seed = serde_json::to_vec(&(
+            "rex-projects-agent-run-v1",
+            &project,
+            &base.role_session_id,
+            vec![current_wake_id as u64],
+        ))
+        .unwrap();
+        let seed_digest = crate::runtime_services::digest_bytes(&seed).unwrap();
+        let short = &seed_digest.as_str()[..32];
+        let next_run_id = crate::domain::ids::AgentRunId::parse(format!("agent-{short}")).unwrap();
+        let next_operation_id = OperationId::parse(format!("start-{short}")).unwrap();
+        wake_snapshot.agent_run_id = next_run_id.as_str().into();
+        wake_snapshot.digest = wake_snapshot.content_digest().unwrap();
+        let run_root = _temp.path().join("agents").join(next_run_id.as_str());
+        let control_dir = run_root.join("control");
+        let mut next = base.clone();
+        next.agent_run_id = next_run_id.clone();
+        next.run_epoch = base.run_epoch + 1;
+        next.controller_generation = new_generation;
+        next.operation_id = next_operation_id.clone();
+        next.wake_snapshot = wake_snapshot;
+        next.descriptor_path = run_root.join("run-step.package.json");
+        next.control_dir = control_dir.clone();
+        next.mailbox_directory = control_dir.clone();
+        next.mailbox_expires_at_unix = base.mailbox_expires_at_unix + 3600;
+        next.mailbox_capability_digest = crate::runtime_services::mailbox_capability_digest(
+            &next_run_id,
+            next.mailbox_expires_at_unix,
+            next.mailbox_max_request_bytes,
+            next.mailbox_max_pending_requests,
+        )
+        .unwrap();
+        std::fs::create_dir_all(&control_dir).unwrap();
+        std::fs::create_dir_all(&next.mailbox_directory).unwrap();
+        assert!(matches!(
+            store.prepare_role_launch(&next).unwrap(),
+            crate::store::agent_runtime::LaunchPreparationOutcome::Prepared { .. }
+        ));
+        assert_ne!(next_run_id, result.validated.binding.agent_run_id);
+        assert_ne!(next_operation_id, base.operation_id);
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM effects WHERE operation_id=?1 AND kind='start_agent'",
+                    [next_operation_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            1
+        );
+        let reoffered: (String, Option<String>) = store.connection.query_row(
+            "SELECT lifecycle,consuming_agent_run_id FROM role_wake_inputs WHERE wake_input_id=?1",
+            [current_wake_id],
+            |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(reoffered.0, "assigned");
+        assert_eq!(reoffered.1.as_deref(), Some(next_run_id.as_str()));
     }
 
     fn assert_learning_result_is_held(fixture: LearningDispatchFixture) {
