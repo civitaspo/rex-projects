@@ -394,9 +394,13 @@ fn read_ambiguous_launch_waits(db: &Connection) -> Result<Vec<(String, WaitRow)>
             continue;
         }
         let ticket_run_id = reservation["ticket_run_id"].as_str().map(str::to_owned);
+        let ticket_scope = ticket_run_id
+            .as_deref()
+            .map(|id| format!(" for TicketRun {id}"))
+            .unwrap_or_default();
         let detail = format!(
-            "AgentRun {} has an unresolved {} launch; a process may still exist. Inspect this AgentRun's Rex session and any recorded PID/start identity; missing identity remains unresolved. Keep its execution slot and worktree reserved until exit is verified.",
-            run_id, phase
+            "AgentRun {}{} has an unresolved {} launch; a process may still exist. Inspect this AgentRun's Rex session and any recorded PID/start identity; missing identity remains unresolved. Keep its execution slot and worktree reserved until exit is verified.",
+            run_id, ticket_scope, phase
         );
         let ticket_run_id = ticket_run_id.map(TicketRunId::parse).transpose()?;
         waits.push((

@@ -371,6 +371,12 @@ fn dashboard_json_surfaces_ambiguous_launch_without_changing_ownership() {
             wait["detail"]
                 .as_str()
                 .unwrap()
+                .contains("TicketRun ticketrun1")
+        );
+        assert!(
+            wait["detail"]
+                .as_str()
+                .unwrap()
                 .contains("Keep its execution slot and worktree reserved")
         );
         assert!(!wait["detail"].as_str().unwrap().contains("retry"));
