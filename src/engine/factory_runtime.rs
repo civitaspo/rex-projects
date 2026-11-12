@@ -481,6 +481,7 @@ impl FactoryRuntime {
             &configured_projects,
             now_unix,
             learning_interval,
+            services.topic_publication_root(),
         )?;
         let (keys, mut external_errors) = build_scan_keys(config, &runnable, services);
         if let Some(key) = next_pending_candidate_key(store, &runnable, config, &keys)?

@@ -49,6 +49,9 @@ impl TopicEffectHandler {
         if let Some(receipt) = store.supervisor_topic_receipt(&operation_id)? {
             return Ok(receipt);
         }
+        if let Some(reason) = store.supervisor_topic_conflict_reason(&operation_id)? {
+            return Err(crate::topic::TopicPublicationError::Conflict(reason));
+        }
         if !self.root.is_absolute() || intent.destination_root != self.root {
             return Err(crate::topic::TopicPublicationError::Conflict(
                 "configured Topic destination changed while a publication was pending".into(),

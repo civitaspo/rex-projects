@@ -184,6 +184,7 @@ fn supervisor_learning_snapshot_in_transaction(
     project: &ProjectId,
     now_utc: &str,
     knowledge_limit: usize,
+    topic_destination_root: Option<&std::path::Path>,
 ) -> Result<ProjectSupervisorMaintenance, String> {
     let mut ledger = CandidateLedger::default();
     let mut revisions_stmt = tx.prepare("SELECT revision_json FROM learning_candidates WHERE project_id=?1 ORDER BY created_at_unix,candidate_id,digest").map_err(|e|e.to_string())?;
@@ -256,24 +257,32 @@ fn supervisor_learning_snapshot_in_transaction(
         });
     }
     drop(knowledge_stmt);
+    if topic_destination_root.is_some_and(|root| !root.is_absolute()) {
+        return Err("Supervisor Topic destination root must be absolute".into());
+    }
+    let topic_destination_root =
+        topic_destination_root.map(|root| root.to_string_lossy().into_owned());
     let total_published_topics: usize = tx.query_row(
-        "SELECT COUNT(*) FROM supervisor_topic_publications WHERE project_id=?1 AND state='published'",
-        [project.as_str()],
+        "SELECT COUNT(*) FROM supervisor_topic_publications WHERE project_id=?1 AND state='published' AND destination_root=?2",
+        params![project.as_str(), topic_destination_root.as_deref()],
         |row| row.get(0),
     ).map_err(|error| error.to_string())?;
     let mut topic_stmt = tx.prepare(
-        "SELECT topic_key,intent_json,intent_digest,receipt_json,receipt_digest FROM supervisor_topic_publications WHERE project_id=?1 AND state='published' ORDER BY published_at_unix DESC,operation_id DESC LIMIT 5",
+        "SELECT topic_key,intent_json,intent_digest,receipt_json,receipt_digest FROM supervisor_topic_publications WHERE project_id=?1 AND state='published' AND destination_root=?2 ORDER BY published_at_unix DESC,operation_id DESC LIMIT 5",
     ).map_err(|error| error.to_string())?;
     let topic_rows = topic_stmt
-        .query_map([project.as_str()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })
+        .query_map(
+            params![project.as_str(), topic_destination_root.as_deref()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
@@ -289,6 +298,9 @@ fn supervisor_learning_snapshot_in_transaction(
         if intent.project_id != *project
             || intent.key.as_str() != topic_key
             || !intent.destination_root.is_absolute()
+            || topic_destination_root
+                .as_deref()
+                .is_none_or(|root| intent.destination_root.to_string_lossy() != root)
             || intent.content_digest != crate::topic::content_digest(&intent.content)
             || receipt.manifest.project_id != *project
             || receipt.manifest.topic_key.as_str() != topic_key
@@ -2302,6 +2314,39 @@ impl ConfigStore {
         Ok(Some(intent))
     }
 
+    pub(crate) fn supervisor_topic_conflict_reason(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<String>, String> {
+        let conflict_json: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT conflict_json FROM supervisor_topic_publications WHERE operation_id=?1 AND state='conflict'",
+                [operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some(conflict_json) = conflict_json else {
+            return Ok(None);
+        };
+        let conflict: serde_json::Value = crate::protocol::parse_unique(conflict_json.as_bytes())?;
+        let reason = conflict
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .filter(|reason| !reason.trim().is_empty())
+            .ok_or("stored Topic conflict has no reason")?;
+        if conflict
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(operation_id.as_str())
+            || conflict.get("state").and_then(serde_json::Value::as_str) != Some("conflict")
+        {
+            return Err("stored Topic conflict does not match its operation".into());
+        }
+        Ok(Some(reason.to_owned()))
+    }
+
     pub(crate) fn supervisor_topic_intent_digest(
         &self,
         operation_id: &OperationId,
@@ -2762,6 +2807,7 @@ impl ConfigStore {
         project: &ProjectId,
         now_utc: &str,
         knowledge_limit: usize,
+        topic_destination_root: Option<&std::path::Path>,
     ) -> Result<ProjectSupervisorMaintenance, String> {
         if knowledge_limit == 0 || knowledge_limit > MAX_SUPERVISOR_KNOWLEDGE_ITEMS {
             return Err("Supervisor knowledge batch size is outside the configured bound".into());
@@ -2781,8 +2827,13 @@ impl ConfigStore {
         if !project_exists {
             return Err("Supervisor learning tick references an unknown project".into());
         }
-        let snapshot =
-            supervisor_learning_snapshot_in_transaction(&tx, project, now_utc, knowledge_limit)?;
+        let snapshot = supervisor_learning_snapshot_in_transaction(
+            &tx,
+            project,
+            now_utc,
+            knowledge_limit,
+            topic_destination_root,
+        )?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(snapshot)
     }
@@ -2796,6 +2847,7 @@ impl ConfigStore {
         configured_projects: &[ProjectId],
         now_unix: i64,
         interval_seconds: u64,
+        topic_destination_root: Option<&std::path::Path>,
     ) -> Result<Option<ProjectId>, String> {
         if now_unix < 0 || interval_seconds == 0 {
             return Err("Supervisor learning schedule requires positive bounded timing".into());
@@ -2886,8 +2938,13 @@ impl ConfigStore {
                 .collect::<Result<Vec<_>, String>>()?;
             drop(stmt);
             let checkpoint = latest_supervisor_checkpoint(&tx, &project_raw)?;
-            let maintenance =
-                supervisor_learning_snapshot_in_transaction(&tx, &project, &now_utc, 0)?;
+            let maintenance = supervisor_learning_snapshot_in_transaction(
+                &tx,
+                &project,
+                &now_utc,
+                0,
+                topic_destination_root,
+            )?;
             let mut findings = findings;
             let (base_snapshot, base_snapshot_json) = loop {
                 let snapshot = serde_json::json!({"type":"supervisor_learning_batch","project_id":project.as_str(),"config_revision":config_revision,"config_digest":config_digest,"issued_at_unix":now_unix,"prior_checkpoint":&checkpoint,"maintenance":&maintenance,"findings":&findings});
@@ -3113,7 +3170,9 @@ impl ConfigStore {
         let mut topic_intents = Vec::new();
         let mut rendered_topic_bytes = 0usize;
         if let Some(payload) = payload {
-            if crate::topic::validate_changes(&payload.topic_changes).is_err()
+            let topic_changes_valid =
+                crate::topic::validate_changes(&payload.topic_changes).is_ok();
+            if !topic_changes_valid
                 || !payload.improvements.is_empty()
                 || payload.candidate_change.is_some()
                 || payload.observations.is_empty()
@@ -3132,7 +3191,7 @@ impl ConfigStore {
                     "Supervisor learning decision is unsupported or exceeds host bounds".into()
                 });
             }
-            if !payload.topic_changes.is_empty() {
+            if !payload.topic_changes.is_empty() && topic_changes_valid {
                 match topic_destination_root {
                     Some(root) if root.is_absolute() => {
                         for change in &payload.topic_changes {
@@ -4921,7 +4980,13 @@ mod tests {
             .unwrap();
         assert_eq!(count, 5);
         let supervisor = store
-            .maintain_project_supervisor_learning(generation, &project, "2026-11-08T00:00:00Z", 12)
+            .maintain_project_supervisor_learning(
+                generation,
+                &project,
+                "2026-11-08T00:00:00Z",
+                12,
+                None,
+            )
             .unwrap();
         assert_eq!(supervisor.project_id, project);
         assert_eq!(supervisor.expired_candidates, 0);
@@ -4965,7 +5030,8 @@ mod tests {
                     generation,
                     &[project.clone(), second_project.clone()],
                     100,
-                    3600
+                    3600,
+                    None
                 )
                 .unwrap(),
             Some(project.clone())
@@ -4976,7 +5042,8 @@ mod tests {
                     generation,
                     &[project.clone(), second_project.clone()],
                     101,
-                    3600
+                    3600,
+                    None
                 )
                 .unwrap(),
             Some(second_project.clone())
@@ -5065,7 +5132,8 @@ mod tests {
                     generation,
                     &[project.clone(), second_project.clone()],
                     3700,
-                    3600
+                    3600,
+                    None
                 )
                 .unwrap(),
             None
@@ -5098,6 +5166,7 @@ mod tests {
                     &[project.clone(), second_project.clone()],
                     3701,
                     3600,
+                    None
                 )
                 .unwrap(),
             None
@@ -5117,7 +5186,8 @@ mod tests {
                     generation,
                     std::slice::from_ref(&project),
                     100,
-                    3600
+                    3600,
+                    None
                 )
                 .unwrap(),
             Some(project.clone())
@@ -5185,7 +5255,8 @@ mod tests {
                     generation,
                     std::slice::from_ref(&project),
                     101,
-                    3600
+                    3600,
+                    None
                 )
                 .unwrap(),
             Some(project.clone())
@@ -5239,7 +5310,8 @@ mod tests {
                     generation,
                     std::slice::from_ref(&project),
                     100,
-                    3600
+                    3600,
+                    None
                 )
                 .unwrap(),
             None
@@ -5256,7 +5328,8 @@ mod tests {
                     generation,
                     std::slice::from_ref(&project),
                     101,
-                    3600
+                    3600,
+                    None
                 )
                 .unwrap(),
             Some(project.clone())
@@ -5272,7 +5345,8 @@ mod tests {
                     generation,
                     std::slice::from_ref(&project),
                     102,
-                    3600
+                    3600,
+                    None
                 )
                 .unwrap(),
             None
@@ -5427,7 +5501,7 @@ mod tests {
         } else {
             temp.path().join("learning-flow-knowledge")
         };
-        KnowledgeEffectHandler::new(knowledge_root)
+        KnowledgeEffectHandler::new(knowledge_root.clone())
             .execute(&mut store, generation, &effect)
             .unwrap();
         assert_eq!(
@@ -5437,6 +5511,11 @@ mod tests {
                     std::slice::from_ref(&project),
                     100,
                     3600,
+                    if create_topic {
+                        Some(knowledge_root.as_path())
+                    } else {
+                        None
+                    }
                 )
                 .unwrap(),
             Some(project.clone())
@@ -5960,7 +6039,8 @@ mod tests {
                     generation,
                     std::slice::from_ref(&project),
                     4000,
-                    3600
+                    3600,
+                    Some(root.as_path())
                 )
                 .unwrap(),
             Some(project.clone())
@@ -5982,6 +6062,46 @@ mod tests {
         assert_eq!(topics.len(), 1);
         assert_eq!(topics[0]["content"], intent.content);
         assert_eq!(topics[0]["content_digest"], intent.content_digest.as_str());
+        let changed_root = _temp.path().join("changed-knowledge-root");
+        let changed_destination = store
+            .maintain_project_supervisor_learning(
+                generation,
+                &project,
+                "2026-11-08T00:00:00Z",
+                12,
+                Some(&changed_root),
+            )
+            .unwrap();
+        assert!(
+            changed_destination.topics.is_empty(),
+            "a snapshot for a new knowledge root must exclude Topics published under the old root"
+        );
+        assert_eq!(changed_destination.omitted_topics, 0);
+        store
+            .connection
+            .execute(
+                "UPDATE supervisor_topic_publications SET destination_root=?2 WHERE project_id=?1",
+                params![project.as_str(), changed_root.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        assert!(
+            store
+                .maintain_project_supervisor_learning(
+                    generation,
+                    &project,
+                    "2026-11-08T00:00:00Z",
+                    12,
+                    Some(&changed_root),
+                )
+                .is_err()
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE supervisor_topic_publications SET destination_root=?2 WHERE project_id=?1",
+                params![project.as_str(), root.to_string_lossy().as_ref()],
+            )
+            .unwrap();
 
         drop(store);
         let reopened = ConfigStore::open_test(_temp.path()).unwrap();
@@ -6053,6 +6173,7 @@ mod tests {
                     std::slice::from_ref(&project),
                     4000,
                     3600,
+                    None
                 )
                 .unwrap(),
             Some(project.clone())
@@ -6348,6 +6469,98 @@ mod tests {
     }
 
     #[test]
+    fn invalid_topic_changes_skip_source_resolution() {
+        let fixture = learning_dispatch_fixture_with_topic(
+            crate::engine::orchestration::AgentAssertion::Succeeded,
+            false,
+            false,
+            None,
+            true,
+            None,
+        );
+        let LearningDispatchFixture {
+            _temp: _,
+            mut store,
+            project,
+            generation,
+            mut result,
+            config,
+            config_digest,
+            batch_id,
+            checkpoint: _,
+        } = fixture;
+        let root = std::path::PathBuf::from(&config.knowledge.as_ref().unwrap().root);
+        let mut decision: crate::engine::orchestration::LearningDecisionPayload =
+            serde_json::from_value(result.validated.structured_result.clone()).unwrap();
+        let source_id = decision.topic_changes[0].source_finding_ids[0].clone();
+        let ticket_run_id: String = store
+            .connection
+            .query_row(
+                "SELECT ticket_run_id FROM learning_findings WHERE project_id=?1 AND finding_id=?2",
+                params![project.as_str(), source_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE knowledge_publications SET request_digest=?3 WHERE project_id=?1 AND ticket_run_id=?2",
+                params![project.as_str(), ticket_run_id, "0".repeat(64)],
+            )
+            .unwrap();
+
+        decision
+            .topic_changes
+            .push(decision.topic_changes[0].clone());
+        result.validated.structured_result = serde_json::to_value(&decision).unwrap();
+        result.validated.typed_payload =
+            crate::engine::orchestration::RoleResultPayload::LearningDecision(decision);
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_with_topic_root_for_test(
+                &mut store,
+                generation,
+                101,
+                &config,
+                config_digest,
+                &result,
+                Some(root),
+            )
+            .unwrap()
+        );
+        let disposition: String = store
+            .connection
+            .query_row(
+                "SELECT disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                [result.receipt.evidence_id()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(disposition, "rejected_by_host");
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM supervisor_topic_publications WHERE project_id=?1",
+                    [project.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM learning_decisions WHERE batch_id=?1",
+                    [&batch_id],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn failed_topic_ack_rolls_back_decision_finding_consumption_intent_and_outbox() {
         let fixture = learning_dispatch_fixture_with_topic(
             crate::engine::orchestration::AgentAssertion::Succeeded,
@@ -6597,7 +6810,7 @@ mod tests {
             None,
         );
         let LearningDispatchFixture {
-            _temp: _,
+            _temp: temp,
             mut store,
             project,
             generation,
@@ -6632,6 +6845,85 @@ mod tests {
                 panic!("Topic intent must be accepted before its effect is dispatched")
             });
         let handler = crate::topic_effect::TopicEffectHandler::new(root.clone());
+        let effect = store
+            .next_due_effect(generation, i64::MAX)
+            .unwrap()
+            .unwrap();
+        let request = crate::effects::EffectRequest {
+            intent: effect,
+            attempt_count: 1,
+            created_at_unix: 101,
+        };
+        let first_observation = {
+            let mut context = crate::effects::EffectContext {
+                store: &mut store,
+                owner_generation: generation,
+                now_unix: 102,
+            };
+            crate::effects::EffectHandler::handle(
+                &handler,
+                crate::effects::EffectMode::Submit,
+                &request,
+                &mut context,
+            )
+            .unwrap()
+        };
+        let crate::effects::EffectObservation::Rejected {
+            receipt: first_receipt,
+        } = first_observation
+        else {
+            panic!("conflicting Topic must be durably rejected");
+        };
+        let state: String = store
+            .connection
+            .query_row(
+                "SELECT state FROM supervisor_topic_publications WHERE operation_id=?1",
+                [&operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "conflict");
+        drop(store);
+        fs::remove_file(&target).unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let generation = store
+            .start_owner(&crate::store::OwnerMetadata {
+                owner_nonce: "topic-conflict-replay".into(),
+                state_root: temp.path().display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "test-restart".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let replayed_observation = {
+            let mut context = crate::effects::EffectContext {
+                store: &mut store,
+                owner_generation: generation,
+                now_unix: 103,
+            };
+            crate::effects::EffectHandler::handle(
+                &handler,
+                crate::effects::EffectMode::Submit,
+                &request,
+                &mut context,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            replayed_observation,
+            crate::effects::EffectObservation::Rejected {
+                receipt: first_receipt
+            }
+        );
+        assert!(
+            !target.exists(),
+            "a saved conflict must not republish after the conflicting file is removed"
+        );
         let limits = crate::effects::EffectLimits {
             max_attempts: 3,
             max_age: std::time::Duration::from_secs(3600),
@@ -6641,7 +6933,7 @@ mod tests {
         let tick = crate::effects::EffectDispatcher::tick(
             &mut store,
             generation,
-            102,
+            103,
             &[&handler],
             limits,
         )
@@ -6650,7 +6942,10 @@ mod tests {
             tick,
             crate::effects::DispatchTick::Completed { .. }
         ));
-        assert_eq!(fs::read(&target).unwrap(), b"human-owned contents");
+        assert!(
+            !target.exists(),
+            "dispatcher replay must terminally reject without republishing"
+        );
         let state: String = store
             .connection
             .query_row(
@@ -7152,6 +7447,7 @@ mod tests {
                     &[project.clone(), second_project.clone()],
                     201,
                     3600,
+                    None
                 )
                 .unwrap(),
             Some(second_project)

@@ -6,7 +6,7 @@
 
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write as IoWrite};
+use std::io::{self, Read as IoRead, Write as IoWrite};
 use std::path::{Component, Path, PathBuf};
 
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -336,7 +336,7 @@ pub fn publish_create_only(intent: &TopicIntent) -> Result<TopicReceipt, TopicPu
         Ok(_) => {
             reconcile_existing(&target, bytes)?;
             if staging.exists() {
-                remove_matching_stage(&staging, bytes)?;
+                remove_matching_stage(&staging, bytes, true)?;
             }
             return Ok(TopicReceipt {
                 manifest,
@@ -348,7 +348,7 @@ pub fn publish_create_only(intent: &TopicIntent) -> Result<TopicReceipt, TopicPu
         Err(error) => return Err(format!("inspect Topic target: {error}").into()),
     }
     if staging.exists() {
-        remove_matching_stage(&staging, bytes)?;
+        remove_matching_stage(&staging, bytes, true)?;
     }
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -369,13 +369,11 @@ pub fn publish_create_only(intent: &TopicIntent) -> Result<TopicReceipt, TopicPu
     drop(staged);
     match fs::hard_link(&staging, &target) {
         Ok(()) => {
-            File::open(&topics_dir)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|e| format!("sync Topic directory: {e}"))?;
             fs::remove_file(&staging).map_err(|e| format!("remove Topic staging file: {e}"))?;
+            sync_file_and_parent(&target)?;
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            remove_matching_stage(&staging, bytes)?;
+            remove_matching_stage(&staging, bytes, false)?;
             reconcile_existing(&target, bytes)?;
         }
         Err(error) => {
@@ -395,6 +393,11 @@ fn canonical_root(root: &Path) -> Result<PathBuf, String> {
     let canonical = fs::canonicalize(root).map_err(|e| format!("resolve Topic root: {e}"))?;
     if !canonical.is_absolute() {
         return Err("Topic root did not resolve to an absolute path".into());
+    }
+    let mut directory = canonical.as_path();
+    while let Some(parent) = directory.parent() {
+        sync_directory(parent).map_err(|e| format!("sync Topic root ancestor: {e}"))?;
+        directory = parent;
     }
     Ok(canonical)
 }
@@ -425,6 +428,8 @@ fn ensure_child_dir(parent: &Path, name: &str) -> Result<PathBuf, TopicPublicati
             "Topic path contains a symlink or non-directory".into(),
         ));
     }
+    sync_directory(parent)
+        .map_err(|e| TopicPublicationError::Failure(format!("sync Topic directory parent: {e}")))?;
     Ok(path)
 }
 
@@ -436,25 +441,67 @@ fn reconcile_existing(path: &Path, expected: &[u8]) -> Result<(), TopicPublicati
             "Topic target is not a regular file".into(),
         ));
     }
-    let bytes = fs::read(path).map_err(|e| format!("read existing Topic: {e}"))?;
-    if bytes != expected {
+    if read_bounded(path, expected.len())
+        .map_err(|e| TopicPublicationError::Failure(format!("read existing Topic: {e}")))?
+        .as_deref()
+        != Some(expected)
+    {
         return Err(TopicPublicationError::Conflict(
             "Topic target exists with different bytes".into(),
         ));
     }
+    sync_file_and_parent(path).map_err(TopicPublicationError::Failure)?;
     Ok(())
 }
 
-fn remove_matching_stage(path: &Path, expected: &[u8]) -> Result<(), String> {
+fn remove_matching_stage(path: &Path, expected: &[u8], allow_partial: bool) -> Result<(), String> {
     let metadata =
         fs::symlink_metadata(path).map_err(|e| format!("inspect Topic staging file: {e}"))?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || fs::read(path).map_err(|e| e.to_string())? != expected
-    {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err("Topic staging path contains unexpected data".into());
     }
+    let Some(bytes) = read_bounded(path, expected.len()).map_err(|e| e.to_string())? else {
+        return Err("Topic staging path contains unexpected data".into());
+    };
+    let partial = allow_partial && bytes.len() < expected.len() && expected.starts_with(&bytes);
+    if bytes != expected && !partial {
+        return Err("Topic staging path contains unexpected data".into());
+    }
+    #[cfg(unix)]
+    if partial {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err("Topic staging path contains unexpected data".into());
+        }
+    }
     fs::remove_file(path).map_err(|e| format!("remove Topic staging file: {e}"))
+}
+
+fn read_bounded(path: &Path, maximum: usize) -> io::Result<Option<Vec<u8>>> {
+    if fs::symlink_metadata(path)?.len() > maximum as u64 {
+        return Ok(None);
+    }
+    let mut bytes = Vec::with_capacity(maximum.min(4096));
+    File::open(path)?
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > maximum {
+        Ok(None)
+    } else {
+        Ok(Some(bytes))
+    }
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+fn sync_file_and_parent(path: &Path) -> Result<(), String> {
+    File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| format!("sync Topic file: {e}"))?;
+    let parent = path.parent().ok_or("Topic file has no parent directory")?;
+    sync_directory(parent).map_err(|e| format!("sync Topic directory: {e}"))
 }
 
 fn yaml_string(value: &str) -> String {
@@ -605,14 +652,52 @@ mod tests {
             content,
             sources: vec![source],
         };
-        let receipt = publish_create_only(&intent).unwrap();
+        let staging = root
+            .path()
+            .join("projects/sample/topics/.safe-replay.topic-create-test.tmp");
+        std::fs::create_dir_all(staging.parent().unwrap()).unwrap();
         let target = root.path().join("projects/sample/topics/safe-replay.md");
+        std::fs::write(&staging, b"unexpected").unwrap();
+        assert!(publish_create_only(&intent).is_err());
+        assert_eq!(std::fs::read(&staging).unwrap(), b"unexpected");
+        std::fs::write(&staging, &intent.content.as_bytes()[..7]).unwrap();
+        let partial_alias = staging.with_extension("alias");
+        std::fs::hard_link(&staging, &partial_alias).unwrap();
+        assert!(publish_create_only(&intent).is_err());
+        assert_eq!(
+            std::fs::read(&staging).unwrap(),
+            &intent.content.as_bytes()[..7]
+        );
+        assert!(partial_alias.exists());
+        std::fs::remove_file(&partial_alias).unwrap();
+        std::fs::remove_file(&staging).unwrap();
+
+        std::fs::write(&staging, &intent.content).unwrap();
+        std::fs::hard_link(&staging, &target).unwrap();
+        publish_create_only(&intent).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), intent.content.as_bytes());
+        assert!(!staging.exists());
+        std::fs::remove_file(&target).unwrap();
+        for partial_len in [0, 7] {
+            if target.exists() {
+                std::fs::remove_file(&target).unwrap();
+            }
+            std::fs::write(&staging, &intent.content.as_bytes()[..partial_len]).unwrap();
+            publish_create_only(&intent).unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), intent.content.as_bytes());
+            assert!(!staging.exists());
+        }
+        let receipt = publish_create_only(&intent).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), intent.content.as_bytes());
         assert_eq!(receipt.manifest.content_sha256, intent.content_digest);
         assert!(publish_create_only(&intent).unwrap().manifest == receipt.manifest);
         std::fs::write(&target, "human edit").unwrap();
         assert!(publish_create_only(&intent).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"human edit");
+        let unexpected = vec![b'x'; super::MAX_TOPIC_DOCUMENT_BYTES * 16];
+        std::fs::write(&target, &unexpected).unwrap();
+        assert!(publish_create_only(&intent).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), unexpected);
         std::fs::remove_file(&target).unwrap();
         std::os::unix::fs::symlink(root.path().join("missing"), &target).unwrap();
         assert!(matches!(
