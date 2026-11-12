@@ -764,7 +764,7 @@ impl RuntimeServices {
             tickets: self.tickets.clone(),
             delivery_effects: self.delivery.shared_effects(),
         };
-        <RuntimeAgentMaterializer as crate::start_agent::StartAgentMaterializer>::ensure_parked_wrapper(
+        match <RuntimeAgentMaterializer as crate::start_agent::StartAgentMaterializer>::ensure_parked_wrapper(
             &materializer,
             store,
             self.owner_generation,
@@ -772,6 +772,39 @@ impl RuntimeServices {
             reservation,
             &reservation.descriptor_path,
             environment_handoff,
+        )? {
+            crate::start_agent::EnsureParkedWrapperOutcome::Ready(block) => Ok(block),
+            crate::start_agent::EnsureParkedWrapperOutcome::Rejected { receipt } => Err(receipt),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn environment_handoff_path_for_test(
+        &self,
+        store: &mut ConfigStore,
+        now_unix: i64,
+        reservation: &crate::launch::AgentLaunchReservation,
+    ) -> Result<PathBuf, String> {
+        let materializer = RuntimeAgentMaterializer {
+            applied_config: self.applied_config.clone(),
+            environment: self.environment.clone(),
+            state_root: self.state_root.clone(),
+            owner_generation: self.owner_generation,
+            runtime_binary: self.runtime_binary.clone(),
+            runtime_binary_digest: self.runtime_binary_digest.clone(),
+            rex_cli_path: self.rex_cli_path.clone(),
+            rex_search_path: self.rex_search_path.clone(),
+            rex_identity: self.rex_identity.clone(),
+            rex: self.rex.clone(),
+            tickets: self.tickets.clone(),
+            delivery_effects: self.delivery.shared_effects(),
+        };
+        <RuntimeAgentMaterializer as crate::start_agent::StartAgentMaterializer>::environment_handoff_path(
+            &materializer,
+            store,
+            self.owner_generation,
+            now_unix,
+            reservation,
         )
     }
 
@@ -2163,6 +2196,26 @@ struct RuntimeAgentMaterializer {
 }
 
 impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
+    fn cleanup_precreate_rejected_handoff(
+        &self,
+        store: &ConfigStore,
+        reservation: &crate::launch::AgentLaunchReservation,
+    ) -> Result<(), String> {
+        if store.agent_launch_phase(reservation)?
+            != crate::store::agent_launch_phase::Phase::PrecreateRejected
+        {
+            return Err(
+                "environment handoff cleanup requires durable precreate_rejected phase".into(),
+            );
+        }
+        self.environment
+            .discard_unclaimed_operation_handoff(
+                &self.state_root,
+                reservation.operation_id.as_str(),
+            )
+            .map_err(|error| error.to_string())
+    }
+
     fn environment_handoff_path(
         &self,
         store: &mut ConfigStore,
@@ -2171,14 +2224,24 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
         reservation: &crate::launch::AgentLaunchReservation,
     ) -> Result<PathBuf, String> {
         self.validate_reservation(store, owner_generation, reservation)?;
-        let handoff = self
-            .environment
-            .create_handoff_for_operation(&self.state_root, reservation.operation_id.as_str())
-            .map_err(|error| error.to_string())?;
-        if handoff.snapshot_id() != &reservation.environment_snapshot_id {
+        let handoff_path = match store.agent_launch_phase(reservation)? {
+            crate::store::agent_launch_phase::Phase::NotStarted => self
+                .environment
+                .create_handoff_for_operation(&self.state_root, reservation.operation_id.as_str())
+                .map_err(|error| error.to_string())?
+                .path()
+                .to_owned(),
+            crate::store::agent_launch_phase::Phase::CreateAttempted
+            | crate::store::agent_launch_phase::Phase::LegacyUnknown => self
+                .environment
+                .operation_handoff_path(&self.state_root, reservation.operation_id.as_str())
+                .map_err(|error| error.to_string())?,
+            _ => return Err("launch phase does not permit environment handoff".into()),
+        };
+        if reservation.environment_snapshot_id != self.environment.metadata().id {
             return Err("launch environment snapshot changed after reservation".into());
         }
-        Ok(handoff.path().to_owned())
+        Ok(handoff_path)
     }
 
     fn ensure_parked_wrapper(
@@ -2189,7 +2252,7 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
         reservation: &crate::launch::AgentLaunchReservation,
         package_path: &Path,
         environment_handoff: &Path,
-    ) -> Result<RexContextBlock, String> {
+    ) -> Result<crate::start_agent::EnsureParkedWrapperOutcome, String> {
         self.validate_reservation(store, owner_generation, reservation)?;
         if package_path != reservation.descriptor_path
             || !environment_handoff.is_absolute()
@@ -2257,10 +2320,36 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
                 .rex
                 .validate_context_block(&block.block_id)
                 .map_err(|error| error.to_string())?;
-            if observed.window_id != window.window_id || observed.label != expected_label {
+            if observed.server_instance_id != window.server_instance_id
+                || observed.session_id != window.session_id
+                || observed.window_id != window.window_id
+                || observed.label != expected_label
+            {
                 return Err("existing Rex block does not match the AgentRun reservation".into());
             }
-            return Ok(observed);
+            match store.agent_launch_phase(reservation)? {
+                crate::store::agent_launch_phase::Phase::NotStarted => {
+                    store.mark_agent_launch_ambiguous(owner_generation, reservation)?;
+                    return Err(
+                        "Rex block exists while durable launch phase says not_started".into(),
+                    );
+                }
+                crate::store::agent_launch_phase::Phase::CreateAttempted
+                | crate::store::agent_launch_phase::Phase::LegacyUnknown => {
+                    return Ok(crate::start_agent::EnsureParkedWrapperOutcome::Ready(
+                        observed,
+                    ));
+                }
+                crate::store::agent_launch_phase::Phase::PrecreateRejected
+                | crate::store::agent_launch_phase::Phase::Ambiguous => {
+                    return Err("Rex block cannot be adopted in the durable launch phase".into());
+                }
+            }
+        }
+        if store.agent_launch_phase(reservation)?
+            != crate::store::agent_launch_phase::Phase::NotStarted
+        {
+            return Err("Rex create cannot be retried after the durable create boundary".into());
         }
         let recorded = store.rex_view_blocks(&reservation.rex_view_id)?;
         if !crate::rex_view_lifecycle::has_block_capacity(
@@ -2298,7 +2387,12 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
             cwd: reservation.workspace_path.clone(),
             path_prepend: self.rex_search_path.clone(),
         };
-        store.validate_start_agent_ticket_run(owner_generation, reservation)?;
+        match store.mark_agent_launch_create_attempted(owner_generation, reservation)? {
+            crate::store::agent_launch_phase::Admission::Proceed => {}
+            crate::store::agent_launch_phase::Admission::Rejected { receipt } => {
+                return Ok(crate::start_agent::EnsureParkedWrapperOutcome::Rejected { receipt });
+            }
+        }
         let block_id = self
             .rex
             .create_agent_block(&window, &anchor.block_id, &spec)
@@ -2307,10 +2401,16 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
             .rex
             .validate_context_block(&block_id)
             .map_err(|error| error.to_string())?;
-        if observed.window_id != window.window_id || observed.label != expected_label {
+        if observed.server_instance_id != window.server_instance_id
+            || observed.session_id != window.session_id
+            || observed.window_id != window.window_id
+            || observed.label != expected_label
+        {
             return Err("new Rex block does not match the AgentRun reservation".into());
         }
-        Ok(observed)
+        Ok(crate::start_agent::EnsureParkedWrapperOutcome::Ready(
+            observed,
+        ))
     }
 
     fn build_package(

@@ -349,14 +349,6 @@ pub(crate) fn validate_start_agent_ticket_run(
 }
 
 impl ConfigStore {
-    pub(crate) fn validate_start_agent_ticket_run(
-        &self,
-        owner_generation: u64,
-        reservation: &AgentLaunchReservation,
-    ) -> Result<(), String> {
-        validate_start_agent_ticket_run(&self.connection, owner_generation, reservation)
-    }
-
     pub fn agent_launch_project_epoch(
         &self,
         agent_run_id: &crate::domain::ids::AgentRunId,
@@ -1332,7 +1324,7 @@ impl ConfigStore {
             params![reservation.agent_run_id.as_str(),mailbox_dir.to_string_lossy(),reservation.mailbox_capability_digest.as_str(),reservation.mailbox_expires_at_unix,reservation.mailbox_max_request_bytes,reservation.mailbox_max_pending_requests],
         ).map_err(|error| error.to_string())?;
         tx.execute(
-            "INSERT INTO agent_launch_reservations(agent_run_id,project_id,operation_id,controller_generation,project_epoch,reservation_digest,reservation_json,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,'reserved',?8,?8)",
+            "INSERT INTO agent_launch_reservations(agent_run_id,project_id,operation_id,controller_generation,project_epoch,reservation_digest,reservation_json,lifecycle,created_at_unix,updated_at_unix,launch_phase) VALUES (?1,?2,?3,?4,?5,?6,?7,'reserved',?8,?8,'not_started')",
             params![reservation.agent_run_id.as_str(),reservation.project_id.as_str(),reservation.operation_id.as_str(),reservation.controller_generation,reservation.project_epoch,reservation_digest.as_str(),reservation_json,now_unix()?],
         ).map_err(|error| error.to_string())?;
         for wake in &reservation.wake_snapshot.inputs {

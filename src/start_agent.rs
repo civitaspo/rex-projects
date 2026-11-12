@@ -24,6 +24,14 @@ pub trait StartAgentMaterializer: Send + Sync {
         reservation: &AgentLaunchReservation,
     ) -> Result<std::path::PathBuf, String>;
 
+    /// Remove an exact operation-scoped handoff only after durable pre-create rejection.
+    /// Implementations must be idempotent and must not recreate or release anything else.
+    fn cleanup_precreate_rejected_handoff(
+        &self,
+        store: &crate::store::ConfigStore,
+        reservation: &AgentLaunchReservation,
+    ) -> Result<(), String>;
+
     /// Create or reconcile the exact parked Rex wrapper for this reservation. On retry this must
     /// locate the existing run-owned block before attempting any create operation.
     fn ensure_parked_wrapper(
@@ -34,7 +42,7 @@ pub trait StartAgentMaterializer: Send + Sync {
         reservation: &AgentLaunchReservation,
         package_path: &std::path::Path,
         environment_handoff: &std::path::Path,
-    ) -> Result<RexContextBlock, String>;
+    ) -> Result<EnsureParkedWrapperOutcome, String>;
 
     /// Build the immutable package from the applied config, effective role prompt, qualified
     /// profile, captured environment, and the observed real Rex block.
@@ -50,6 +58,11 @@ pub trait StartAgentMaterializer: Send + Sync {
 
     /// Rex transport pinned to the controller's startup endpoint, instance, and session.
     fn rex_transport(&self) -> &RexCliTransport;
+}
+
+pub enum EnsureParkedWrapperOutcome {
+    Ready(RexContextBlock),
+    Rejected { receipt: String },
 }
 
 pub struct StartAgentEffectHandler {
@@ -128,9 +141,17 @@ impl EffectHandler for StartAgentEffectHandler {
             });
         }
 
-        context
+        match context
             .store
-            .validate_start_agent_ticket_run(context.owner_generation, &reservation)?;
+            .pre_handoff_agent_launch_admission(context.owner_generation, &reservation)?
+        {
+            crate::store::agent_launch_phase::Admission::Proceed => {}
+            crate::store::agent_launch_phase::Admission::Rejected { receipt } => {
+                self.materializer
+                    .cleanup_precreate_rejected_handoff(context.store, &reservation)?;
+                return Ok(EffectObservation::Rejected { receipt });
+            }
+        }
         let environment_handoff = self.materializer.environment_handoff_path(
             context.store,
             context.owner_generation,
@@ -140,14 +161,21 @@ impl EffectHandler for StartAgentEffectHandler {
         if !environment_handoff.is_absolute() {
             return Err("environment handoff path must be absolute".into());
         }
-        let observed_block = self.materializer.ensure_parked_wrapper(
+        let observed_block = match self.materializer.ensure_parked_wrapper(
             context.store,
             context.owner_generation,
             context.now_unix,
             &reservation,
             &reservation.descriptor_path,
             &environment_handoff,
-        )?;
+        )? {
+            EnsureParkedWrapperOutcome::Ready(block) => block,
+            EnsureParkedWrapperOutcome::Rejected { receipt } => {
+                self.materializer
+                    .cleanup_precreate_rejected_handoff(context.store, &reservation)?;
+                return Ok(EffectObservation::Rejected { receipt });
+            }
+        };
         let package = self.materializer.build_package(
             context.store,
             context.owner_generation,
