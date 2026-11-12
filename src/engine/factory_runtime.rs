@@ -2125,16 +2125,8 @@ fn block_unsupported_request_merge_assessment(
     owner_generation: u64,
     run: &crate::store::scheduler::ActiveTicketRun,
     result: &crate::store::agent_results::IngestedAgentResult,
-    publication_set_digest: &crate::domain::ids::Digest,
     now_unix: i64,
 ) -> Result<(), String> {
-    store.record_merge_observation_failure(
-        owner_generation,
-        result,
-        publication_set_digest,
-        now_unix,
-        crate::store::agent_results::MergeObservationFailureCode::PermanentlyInvalid,
-    )?;
     block_merge_observation_for_human(
         store,
         owner_generation,
@@ -2538,7 +2530,6 @@ fn apply_merge_assessment(
             owner_generation,
             &run,
             result,
-            &publication_set_digest,
             now_unix,
         )?;
         return Ok(true);

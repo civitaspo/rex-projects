@@ -9376,6 +9376,96 @@ pub(crate) mod tests {
                         .all(|wake| wake.source_type != "host_merge_assessment"),
                     "unsupported Request must not schedule the second MergeDecision turn"
                 );
+                // Recreate the durable boundary after the block commits but before
+                // its reducer ACK is stored, then use the real due-result reader.
+                let artifacts =
+                    crate::artifacts::ArtifactStore::open(&temp.path().join("artifacts")).unwrap();
+                for pending in store
+                    .pending_validated_agent_results(&artifacts, owner_generation, 32)
+                    .unwrap()
+                {
+                    if pending.validated.message_id == "coordinator-plan-result" {
+                        store
+                            .acknowledge_validated_agent_result(
+                                owner_generation,
+                                pending.receipt.evidence_id(),
+                                pending.validated.binding.ticket_revision.unwrap().0,
+                                crate::store::agent_results::ResultDisposition::Applied,
+                            )
+                            .unwrap();
+                    }
+                }
+                store
+                    .connection
+                    .execute(
+                        "DELETE FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                        [merge_result.ingested.receipt.evidence_id()],
+                    )
+                    .unwrap();
+                let state_root = temp.path().to_path_buf();
+                drop(store);
+                let mut store = ConfigStore::open_test(&state_root).unwrap();
+                let replay = crate::engine::factory_runtime::tests::tick_with_merge_observation_replies_for_test(
+                    &mut store,
+                    owner_generation,
+                    12,
+                    &config,
+                    config_digest.clone(),
+                    crate::artifacts::ArtifactStore::open(&state_root.join("artifacts")).unwrap(),
+                    applied.clone(),
+                    Vec::new(),
+                    None,
+                ).unwrap();
+                assert!(
+                    replay.ingested_agent_result,
+                    "the blocked result must remain selectable until ACK"
+                );
+                let after_replay = store
+                    .active_ticket_runs(owner_generation, 10)
+                    .unwrap()
+                    .into_iter()
+                    .find(|run| run.ticket_run_id == ticket_run_id)
+                    .unwrap();
+                assert_eq!(after_replay.phase, blocked.phase);
+                assert_eq!(after_replay.activity, blocked.activity);
+                assert_eq!(after_replay.revision, blocked.revision);
+                assert_eq!(
+                    crate::store::agent_results::host_validation_fixture::result_ack(
+                        &store,
+                        merge_result.ingested.receipt.evidence_id(),
+                    )
+                    .unwrap(),
+                    Some((blocked.revision, "applied".into()))
+                );
+                assert!(
+                    store
+                        .runnable_validated_agent_results(
+                            &crate::artifacts::ArtifactStore::open(&state_root.join("artifacts"))
+                                .unwrap(),
+                            owner_generation,
+                            13,
+                            32,
+                        )
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(
+                    store
+                        .pending_role_wake_inputs(
+                            &project_id,
+                            &format!("project:{project_id}:supervisor"),
+                            32,
+                        )
+                        .unwrap()
+                        .into_iter()
+                        .filter(|wake| {
+                            wake.payload_json["target"] == "supervisor"
+                                && wake.payload_json["ticket_run_id"] == ticket_run_id.as_str()
+                        })
+                        .count(),
+                    1,
+                    "replay must not create another blocked transition wake"
+                );
                 return;
             }
             let correction_wakes = store
