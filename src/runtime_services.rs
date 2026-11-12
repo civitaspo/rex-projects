@@ -8372,6 +8372,8 @@ mod rex_event_reconnect_tests {
                 .is_ok_and(|contents| contents.lines().count() >= 2)
                 && fs::read_to_string(&inventory_subscriptions)
                     .is_ok_and(|contents| contents.lines().any(|line| line == "2"))
+                && fs::read_to_string(&replacement_event_pid)
+                    .is_ok_and(|contents| contents.trim().parse::<u32>().is_ok())
             {
                 reconnect_observed = true;
                 break;
