@@ -18,7 +18,7 @@ use crate::engine::orchestration::{
     ReviewReadyPayload, RoleArtifactKind, RoleArtifactReference, WorkerRecoveryAuthorization,
 };
 
-const MAX_INBOX_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_INBOX_BYTES: usize = 1024 * 1024;
 const MAX_WAKE_ITEMS: usize = 256;
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -230,6 +230,29 @@ fn is_lower_hex_64(value: &str) -> bool {
 }
 
 impl AgentWakeSnapshot {
+    /// Compute the exact bytes written to and read from the inbox, including the content digest.
+    pub fn serialized_bytes(&mut self) -> Result<Vec<u8>, String> {
+        self.digest = self.content_digest()?;
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|error| error.to_string())
+    }
+
+    /// Validate an inbox candidate before selection. `Ok(false)` means each item is valid, but
+    /// the aggregate artifact quota makes the whole candidate unsuitable for this snapshot.
+    pub(crate) fn validate_for_selection(&self) -> Result<bool, String> {
+        self.validate_with_artifact_budget(false)
+    }
+
+    pub(crate) fn serialized_bytes_for_selection(&mut self) -> Result<Option<Vec<u8>>, String> {
+        self.digest = self.content_digest()?;
+        if !self.validate_for_selection()? {
+            return Ok(None);
+        }
+        serde_json::to_vec(self)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
     pub fn worker_recovery_authorization(
         &self,
     ) -> Result<Option<WorkerRecoveryAuthorization>, String> {
@@ -267,6 +290,13 @@ impl AgentWakeSnapshot {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_with_artifact_budget(true).map(|_| ())
+    }
+
+    fn validate_with_artifact_budget(
+        &self,
+        enforce_aggregate_artifact_budget: bool,
+    ) -> Result<bool, String> {
         if self.schema_version != 1
             || self.role_session_id.trim().is_empty()
             || self.agent_run_id.trim().is_empty()
@@ -439,13 +469,15 @@ impl AgentWakeSnapshot {
                 );
             }
         }
-        if artifact_count > 256 || artifact_bytes > 64 * 1024 * 1024 {
+        let within_aggregate_artifact_budget =
+            artifact_count <= 256 && artifact_bytes <= 64 * 1024 * 1024;
+        if enforce_aggregate_artifact_budget && !within_aggregate_artifact_budget {
             return Err("Agent inbox artifacts exceed their 256 reference or 64 MiB limit".into());
         }
         if self.digest != self.content_digest()? {
             return Err("Agent inbox digest does not match its content".into());
         }
-        Ok(())
+        Ok(within_aggregate_artifact_budget)
     }
 
     pub fn content_digest(&self) -> Result<Digest, String> {
@@ -809,9 +841,7 @@ pub fn publish_wake_snapshot(
 ) -> Result<(), String> {
     let directory = control_dir.join("inbox");
     ensure_real_directory(&directory)?;
-    snapshot.digest = snapshot.content_digest()?;
-    snapshot.validate()?;
-    let bytes = serde_json::to_vec(&snapshot).map_err(|error| error.to_string())?;
+    let bytes = snapshot.serialized_bytes()?;
     if bytes.len() > MAX_INBOX_BYTES {
         return Err("Agent inbox snapshot exceeds 1 MiB".into());
     }

@@ -10,7 +10,7 @@ use crate::launch::{AgentLaunchReservation, StartAgentEffectPayload, WorkerLaunc
 use crate::store::{EffectIntent, insert_effect, now_unix, validate_active_generation};
 
 const MAX_WAKE_SNAPSHOT_ITEMS: usize = 256;
-const MAX_WAKE_SNAPSHOT_JSON_BYTES: usize = 1_048_576;
+const MAX_WAKE_SNAPSHOT_JSON_BYTES: usize = crate::agent_api::MAX_INBOX_BYTES;
 const MAX_WAKE_CONTEXT_MIGRATION_ROWS: usize = 65_536;
 const MAX_WAKE_CONTEXT_MIGRATION_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PROFILE_QUALIFICATION_CANDIDATES: usize = 32;
@@ -972,6 +972,10 @@ impl ConfigStore {
         prepared_worker: Option<&crate::store::accepted_plans::PreparedWorkerLaunch>,
     ) -> Result<LaunchPreparationOutcome, String> {
         reservation.validate()?;
+        let mut inbox_snapshot = reservation.wake_snapshot.clone();
+        if inbox_snapshot.serialized_bytes()?.len() > crate::agent_api::MAX_INBOX_BYTES {
+            return Err("Agent inbox snapshot exceeds 1 MiB".into());
+        }
         let reservation_digest = reservation.digest()?;
         let control_dir = std::fs::canonicalize(&reservation.control_dir)
             .map_err(|error| format!("canonicalize control directory: {error}"))?;
@@ -2165,6 +2169,42 @@ pub(crate) mod tests {
             global_capacity: 1,
             project_capacity: 1,
         };
+        let mut oversized_reservation = reservation.clone();
+        oversized_reservation
+            .wake_snapshot
+            .inputs
+            .push(crate::agent_api::AgentWakeItem {
+                wake_input_id: 1,
+                source_type: "learning_batch".into(),
+                source_id: "learning-oversized".into(),
+                source_revision: 1,
+                priority: 1,
+                payload_json: serde_json::json!({"batch": "x".repeat(1_048_576)}),
+                host_artifact_source_evidence_ids: Vec::new(),
+                host_artifacts: Vec::new(),
+                host_completion_context: None,
+            });
+        oversized_reservation.wake_snapshot.digest = oversized_reservation
+            .wake_snapshot
+            .content_digest()
+            .unwrap();
+        assert_eq!(
+            store
+                .prepare_role_launch(&oversized_reservation)
+                .unwrap_err(),
+            "Agent inbox snapshot exceeds 1 MiB"
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM agent_runs WHERE agent_run_id=?1",
+                    [reservation.agent_run_id.as_str()],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            0
+        );
         store.prepare_role_launch(&reservation).unwrap();
         let result_projection = schema_projection.clone();
         let package = crate::run_step_package::RunStepPackage {

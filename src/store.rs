@@ -4477,6 +4477,16 @@ fn sync_project_configuration(
             )
             .map_err(|error| error.to_string())?;
         }
+        tx.execute(
+            "UPDATE role_wake_inputs SET lifecycle='superseded' WHERE wake_input_id IN (SELECT wake_input_id FROM learning_batches WHERE project_id=?1 AND status='issued' AND (config_revision!=?2 OR config_digest!=?3)) AND lifecycle='pending'",
+            params![id.as_str(), revision.0, digest],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "UPDATE learning_batches SET status='superseded' WHERE project_id=?1 AND status='issued' AND (config_revision!=?2 OR config_digest!=?3)",
+            params![id.as_str(), revision.0, digest],
+        )
+        .map_err(|error| error.to_string())?;
     }
     Ok(())
 }

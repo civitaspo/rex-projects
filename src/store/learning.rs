@@ -220,6 +220,38 @@ fn supervisor_learning_snapshot_in_transaction(
     Ok(snapshot)
 }
 
+struct LearningBatchDbRow {
+    project: String,
+    digest: String,
+    config_revision: u64,
+    config_digest: String,
+    wake_id: i64,
+    findings_json: String,
+    snapshot_json: String,
+    status: String,
+}
+
+fn latest_supervisor_checkpoint(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    connection
+        .query_row(
+            "SELECT json_extract(decision_json,'$.checkpoint') FROM learning_decisions d JOIN learning_batches b USING(batch_id) WHERE b.project_id=?1 ORDER BY d.decision_sequence DESC LIMIT 1",
+            [project_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .flatten()
+        .map(|json| {
+            serde_json::from_str(&json)
+                .map_err(|error| format!("stored Supervisor checkpoint is invalid: {error}"))
+        })
+        .transpose()
+        .map(|checkpoint| checkpoint.unwrap_or_default())
+}
+
 pub(crate) fn migrate_v19_learning_batches(connection: &Connection) -> Result<(), String> {
     let tx = connection
         .unchecked_transaction()
@@ -256,13 +288,14 @@ pub(crate) fn migrate_v19_learning_batches(connection: &Connection) -> Result<()
             wake_input_id INTEGER NOT NULL UNIQUE REFERENCES role_wake_inputs(wake_input_id),
             findings_json TEXT NOT NULL,
             snapshot_json TEXT NOT NULL,
-            status TEXT NOT NULL CHECK(status IN ('issued','completed')),
+            status TEXT NOT NULL CHECK(status IN ('issued','completed','superseded')),
             created_at_unix INTEGER NOT NULL,
             completed_at_unix INTEGER
         );
         CREATE UNIQUE INDEX learning_batches_one_issued_per_project ON learning_batches(project_id) WHERE status='issued';
         CREATE TABLE learning_decisions(
-            batch_id TEXT PRIMARY KEY REFERENCES learning_batches(batch_id),
+            decision_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id TEXT NOT NULL UNIQUE REFERENCES learning_batches(batch_id),
             evidence_id TEXT NOT NULL UNIQUE REFERENCES agent_result_evidence(evidence_id),
             result_digest TEXT NOT NULL CHECK(length(result_digest)=64),
             decision_json TEXT NOT NULL,
@@ -351,7 +384,13 @@ pub(crate) fn validate_v19_learning_batches(connection: &Connection) -> Result<(
         ),
         (
             "learning_decisions",
-            vec!["batch_id", "evidence_id", "result_digest", "decision_json"],
+            vec![
+                "decision_sequence",
+                "batch_id",
+                "evidence_id",
+                "result_digest",
+                "decision_json",
+            ],
         ),
     ] {
         let mut stmt = connection
@@ -2441,7 +2480,7 @@ impl ConfigStore {
                 })
                 .collect::<Result<Vec<_>, String>>()?;
             drop(stmt);
-            let checkpoint: std::collections::BTreeMap<String,String> = tx.query_row("SELECT json_extract(decision_json,'$.checkpoint') FROM learning_decisions d JOIN learning_batches b USING(batch_id) WHERE b.project_id=?1 ORDER BY accepted_at_unix DESC,b.batch_id DESC LIMIT 1", [&project_raw], |r| r.get::<_,Option<String>>(0)).optional().map_err(|e|e.to_string())?.flatten().map(|json|serde_json::from_str(&json).map_err(|e|format!("stored Supervisor checkpoint is invalid: {e}"))).transpose()?.unwrap_or_default();
+            let checkpoint = latest_supervisor_checkpoint(&tx, &project_raw)?;
             let maintenance =
                 supervisor_learning_snapshot_in_transaction(&tx, &project, &now_utc, 0)?;
             let mut findings = findings;
@@ -2477,8 +2516,6 @@ impl ConfigStore {
         Ok(None)
     }
 
-    /// Commit an observations-only Supervisor decision, exact Finding consumption, and the
-    /// ordinary result acknowledgement under one active-owner transaction.
     pub fn consume_supervisor_learning_decision(
         &mut self,
         owner_generation: u64,
@@ -2487,36 +2524,15 @@ impl ConfigStore {
     ) -> Result<(), String> {
         use crate::engine::orchestration::{AgentAssertion, RoleOutputKind, RoleResultPayload};
         if result.validated.kind != RoleOutputKind::LearningDecision
-            || result.validated.assertion != AgentAssertion::Succeeded
             || result.validated.binding.role != crate::domain::types::Role::Supervisor
+            || result.validated.binding.ticket_run_id.is_some()
         {
             return Err("learning batch consumer received another result kind or authority".into());
         }
-        let RoleResultPayload::LearningDecision(payload) = &result.validated.typed_payload else {
-            return Err("validated Supervisor result has no typed learning decision".into());
+        let payload = match &result.validated.typed_payload {
+            RoleResultPayload::LearningDecision(payload) => Some(payload),
+            _ => None,
         };
-        if !payload.topic_changes.is_empty()
-            || !payload.improvements.is_empty()
-            || payload.candidate_change.is_some()
-        {
-            return Err("Supervisor learning decision contains unsupported proposal fields".into());
-        }
-        if payload.observations.is_empty()
-            || payload.observations.len() > 20
-            || payload
-                .observations
-                .iter()
-                .any(|v| v.trim().is_empty() || v.len() > 4096)
-            || payload.checkpoint.len() > 32
-            || payload
-                .checkpoint
-                .iter()
-                .any(|(k, v)| k.is_empty() || k.len() > 128 || v.len() > 1024)
-        {
-            return Err(
-                "Supervisor no_change decision is empty or exceeds supported bounds".into(),
-            );
-        }
         let binding = &result.validated.binding;
         if now_unix < 0 {
             return Err("learning decision belongs to another controller generation".into());
@@ -2536,7 +2552,9 @@ impl ConfigStore {
             .optional()
             .map_err(|e| e.to_string())?;
         if let Some((batch_id, digest)) = existing {
-            if batch_id != payload.batch_id || digest != result.validated.result_digest.as_str() {
+            if payload.is_none_or(|payload| batch_id != payload.batch_id)
+                || digest != result.validated.result_digest.as_str()
+            {
                 return Err("learning result evidence was replayed with changed content".into());
             }
             let ack: Option<(u64,String)>=tx.query_row("SELECT reducer_revision,disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",[result.receipt.evidence_id()],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
@@ -2549,8 +2567,49 @@ impl ConfigStore {
             tx.commit().map_err(|e| e.to_string())?;
             return Ok(());
         }
-        let batch: Option<(String,String,u64,String,i64,String,String)> = tx.query_row("SELECT project_id,batch_digest,config_revision,config_digest,wake_input_id,findings_json,snapshot_json FROM learning_batches WHERE batch_id=?1 AND status='issued'",[&payload.batch_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional().map_err(|e|e.to_string())?;
-        let Some((
+        let evidence: Option<(String,String,u64,String,String)>=tx.query_row("SELECT e.agent_run_id,e.project_id,e.run_epoch,e.role,e.result_digest FROM agent_result_evidence e WHERE e.evidence_id=?1 AND e.outcome='completed'",[result.receipt.evidence_id()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(|e|e.to_string())?;
+        if !matches!(evidence,Some((ref run,ref p,epoch,ref role,ref result_digest)) if run==binding.agent_run_id.as_str() && p==binding.project_id.as_str() && epoch==binding.run_epoch && role=="supervisor" && result_digest==result.validated.result_digest.as_str())
+        {
+            return Err("learning result evidence is outside its Supervisor run authority".into());
+        }
+        let reservation_json: String = tx
+            .query_row(
+                "SELECT reservation_json FROM agent_launch_reservations WHERE agent_run_id=?1",
+                [binding.agent_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let reservation: crate::launch::AgentLaunchReservation =
+            crate::protocol::parse_unique(reservation_json.as_bytes())?;
+        reservation.validate()?;
+        if reservation.project_id != binding.project_id
+            || reservation.role != crate::domain::types::Role::Supervisor
+            || reservation.config_revision != binding.config_revision
+            || reservation.config_digest != binding.config_digest
+            || reservation.run_epoch != binding.run_epoch
+            || reservation.controller_generation != authority.controller_generation
+            || reservation.wake_snapshot.content_digest()? != authority.wake_snapshot_digest
+        {
+            return Err(
+                "learning result launch reservation does not match its batch authority".into(),
+            );
+        }
+        let mut learning_wakes = reservation
+            .wake_snapshot
+            .inputs
+            .iter()
+            .filter(|wake| wake.source_type == "learning_batch");
+        let wake = learning_wakes
+            .next()
+            .ok_or("Supervisor launch has no learning batch wake")?;
+        if learning_wakes.next().is_some() {
+            return Err("Supervisor launch has multiple learning batch wakes".into());
+        }
+        let batch: Option<LearningBatchDbRow>=tx.query_row(
+            "SELECT project_id,batch_digest,config_revision,config_digest,wake_input_id,findings_json,snapshot_json,status FROM learning_batches WHERE batch_id=?1",
+            [&wake.source_id], |r| Ok(LearningBatchDbRow { project: r.get(0)?, digest: r.get(1)?, config_revision: r.get(2)?, config_digest: r.get(3)?, wake_id: r.get(4)?, findings_json: r.get(5)?, snapshot_json: r.get(6)?, status: r.get(7)? }),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some(LearningBatchDbRow {
             project,
             digest,
             config_revision,
@@ -2558,9 +2617,10 @@ impl ConfigStore {
             wake_id,
             findings_json,
             snapshot_json,
-        )) = batch
+            status,
+        }) = batch
         else {
-            return Err("learning decision does not match an outstanding issued batch".into());
+            return Err("immutable learning wake references a missing batch".into());
         };
         let snapshot_value: serde_json::Value =
             crate::protocol::parse_unique(snapshot_json.as_bytes())?;
@@ -2570,72 +2630,25 @@ impl ConfigStore {
             .ok_or("stored learning batch snapshot is not an object")?;
         let stored_batch_id = object
             .remove("batch_id")
-            .and_then(|v| v.as_str().map(str::to_owned));
+            .and_then(|value| value.as_str().map(str::to_owned));
         let stored_batch_digest = object
             .remove("batch_digest")
-            .and_then(|v| v.as_str().map(str::to_owned));
+            .and_then(|value| value.as_str().map(str::to_owned));
         let calculated_digest = Digest::parse(format!(
             "{:x}",
             Sha256::digest(super::canonical_json(&digest_input)?.as_bytes())
         ))?;
-        if stored_batch_id.as_deref() != Some(payload.batch_id.as_str())
+        if project != binding.project_id.as_str()
+            || wake_id
+                != i64::try_from(wake.wake_input_id).map_err(|_| "learning wake ID overflow")?
+            || wake.source_id != format!("learning-{digest}")
+            || stored_batch_id.as_deref() != Some(wake.source_id.as_str())
             || stored_batch_digest.as_deref() != Some(digest.as_str())
             || calculated_digest.as_str() != digest
-            || payload.batch_id != format!("learning-{digest}")
+            || wake.payload_json != snapshot_value
         {
-            return Err("stored learning batch snapshot digest or identity is invalid".into());
+            return Err("immutable learning wake or stored batch snapshot is invalid".into());
         }
-        if project != binding.project_id.as_str()
-            || digest != payload.batch_digest.as_str()
-            || config_revision != payload.config_revision.0
-            || config_revision != binding.config_revision.0
-            || config_digest != binding.config_digest.as_str()
-            || binding.ticket_run_id.is_some()
-        {
-            return Err("learning decision batch or configuration binding is stale".into());
-        }
-        let current: Option<(u64,String,String,String)>=tx.query_row("SELECT p.config_revision,p.config_digest,p.desired_lifecycle,r.observed_lifecycle FROM projects p JOIN project_runtimes r USING(project_id) WHERE p.project_id=?1",[&project],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|e|e.to_string())?;
-        if !matches!(current,Some((rev,ref config,ref desired,ref observed)) if rev==config_revision && config==&config_digest && desired=="running" && observed=="running")
-        {
-            return Err("learning decision Project configuration or lifecycle changed".into());
-        }
-        let evidence: Option<(String,String,u64,String,String)>=tx.query_row("SELECT e.agent_run_id,e.project_id,e.run_epoch,e.role,e.result_digest FROM agent_result_evidence e WHERE e.evidence_id=?1 AND e.outcome='completed'",[result.receipt.evidence_id()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(|e|e.to_string())?;
-        if !matches!(evidence,Some((ref run,ref p,epoch,ref role,ref result_digest)) if run==binding.agent_run_id.as_str() && p==&project && epoch==binding.run_epoch && role=="supervisor" && result_digest==result.validated.result_digest.as_str())
-        {
-            return Err("learning result evidence is outside its Supervisor run authority".into());
-        }
-        let reservation_json: String = tx
-            .query_row(
-                "SELECT reservation_json FROM agent_launch_reservations WHERE agent_run_id=?1",
-                [binding.agent_run_id.as_str()],
-                |r| r.get(0),
-            )
-            .map_err(|_| "learning result has no immutable launch reservation")?;
-        let reservation: crate::launch::AgentLaunchReservation =
-            crate::protocol::parse_unique(reservation_json.as_bytes())?;
-        if reservation.project_id.as_str() != project
-            || reservation.role != crate::domain::types::Role::Supervisor
-            || reservation.config_revision.0 != config_revision
-            || reservation.config_digest.as_str() != config_digest
-            || reservation.run_epoch != binding.run_epoch
-            || reservation.controller_generation != authority.controller_generation
-        {
-            return Err(
-                "learning result launch reservation does not match its batch authority".into(),
-            );
-        }
-        reservation.wake_snapshot.validate()?;
-        if reservation.wake_snapshot.content_digest()? != authority.wake_snapshot_digest {
-            return Err("learning launch wake snapshot differs from immutable authority".into());
-        }
-        let wake = reservation
-            .wake_snapshot
-            .inputs
-            .iter()
-            .find(|w| i64::try_from(w.wake_input_id).ok() == Some(wake_id))
-            .ok_or(
-                "issued learning batch was not in the producing Agent's immutable wake snapshot",
-            )?;
         let stored_wake: Option<(String,String,String,String,String)>=tx.query_row("SELECT project_id,role_session_id,source_type,source_id,payload_json FROM role_wake_inputs WHERE wake_input_id=?1 AND consuming_agent_run_id=?2 AND lifecycle IN ('assigned','consumed')",params![wake_id,binding.agent_run_id.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(|e|e.to_string())?;
         let Some((wake_project, session, source_type, source_id, wake_payload)) = stored_wake
         else {
@@ -2644,10 +2657,8 @@ impl ConfigStore {
         if wake_project != project
             || session != binding.role_session_id.as_str()
             || source_type != "learning_batch"
-            || source_id != payload.batch_id
+            || source_id != wake.source_id
             || wake_payload != snapshot_json
-            || wake.source_type != "learning_batch"
-            || wake.source_id != payload.batch_id
             || serde_json::to_string(&wake.payload_json).map_err(|e| e.to_string())? != wake_payload
         {
             return Err("learning batch wake differs from the exact issued snapshot".into());
@@ -2666,6 +2677,88 @@ impl ConfigStore {
                 "issued learning Finding ledger differs from the digest-bound snapshot".into(),
             );
         }
+        let current: Option<(u64,String,String,String)>=tx.query_row("SELECT p.config_revision,p.config_digest,p.desired_lifecycle,r.observed_lifecycle FROM projects p JOIN project_runtimes r USING(project_id) WHERE p.project_id=?1",[&project],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|e|e.to_string())?;
+        let mut rejection = match &result.validated.assertion {
+            AgentAssertion::Failed { reason } => Some(format!(
+                "Supervisor learning turn failed: {}",
+                reason.chars().take(1024).collect::<String>()
+            )),
+            AgentAssertion::Blocked { reason } => Some(format!(
+                "Supervisor learning turn was blocked: {}",
+                reason.chars().take(1024).collect::<String>()
+            )),
+            AgentAssertion::Cancelled { reason } => Some(format!(
+                "Supervisor learning turn was cancelled{}",
+                reason
+                    .as_deref()
+                    .map(|reason| format!(": {}", reason.chars().take(1024).collect::<String>()))
+                    .unwrap_or_default()
+            )),
+            AgentAssertion::Succeeded if payload.is_none() => {
+                Some("Supervisor learning result has no supported decision payload".into())
+            }
+            AgentAssertion::Succeeded => None,
+        };
+        if let Some(payload) = payload {
+            if !payload.topic_changes.is_empty()
+                || !payload.improvements.is_empty()
+                || payload.candidate_change.is_some()
+                || payload.observations.is_empty()
+                || payload.observations.len() > 20
+                || payload
+                    .observations
+                    .iter()
+                    .any(|value| value.trim().is_empty() || value.len() > 4096)
+                || payload.checkpoint.len() > 32
+                || payload
+                    .checkpoint
+                    .iter()
+                    .any(|(key, value)| key.is_empty() || key.len() > 128 || value.len() > 1024)
+            {
+                rejection.get_or_insert_with(|| {
+                    "Supervisor learning decision is unsupported or exceeds host bounds".into()
+                });
+            }
+            if payload.batch_id != wake.source_id
+                || payload.batch_digest.as_str() != digest
+                || payload.config_revision.0 != config_revision
+            {
+                rejection.get_or_insert_with(|| {
+                    "Supervisor learning decision does not match its issued batch".into()
+                });
+            }
+        }
+        if status != "issued"
+            || config_revision != binding.config_revision.0
+            || config_digest != binding.config_digest.as_str()
+            || !matches!(current, Some((revision, ref current_digest, ref desired, ref observed)) if revision == config_revision && current_digest == &config_digest && desired == "running" && observed == "running")
+        {
+            rejection.get_or_insert_with(|| {
+                "Supervisor learning result uses an obsolete Project configuration or batch".into()
+            });
+        }
+        if let Some(reason) = rejection {
+            let current_revision: u64 = tx
+                .query_row(
+                    "SELECT config_revision FROM projects WHERE project_id=?1",
+                    [&project],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            let ack: Option<(u64,String)> = tx.query_row("SELECT reducer_revision,disposition FROM agent_result_reducer_ack WHERE evidence_id=?1", [result.receipt.evidence_id()], |row| Ok((row.get(0)?,row.get(1)?))).optional().map_err(|error| error.to_string())?;
+            if let Some((revision, disposition)) = ack {
+                if revision != current_revision || disposition != "rejected_by_host" {
+                    return Err("learning result already has another reducer disposition".into());
+                }
+            } else {
+                tx.execute("INSERT INTO agent_result_reducer_ack(evidence_id,reducer_revision,disposition,acknowledged_at_unix) VALUES (?1,?2,'rejected_by_host',?3)",params![result.receipt.evidence_id(),current_revision,now_unix]).map_err(|error| error.to_string())?;
+            }
+            tx.execute("UPDATE project_runtimes SET last_error=COALESCE(last_error,?2) WHERE project_id=?1",params![project,reason]).map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+        let payload =
+            payload.ok_or("validated Supervisor result has no typed learning decision")?;
         let canonical = serde_json::to_string(payload).map_err(|e| e.to_string())?;
         tx.execute("INSERT INTO learning_decisions(batch_id,evidence_id,result_digest,decision_json,accepted_at_unix) VALUES (?1,?2,?3,?4,?5)",params![payload.batch_id,result.receipt.evidence_id(),result.validated.result_digest.as_str(),canonical,now_unix]).map_err(|e|e.to_string())?;
         tx.execute("UPDATE learning_batches SET status='completed',completed_at_unix=?2 WHERE batch_id=?1 AND status='issued'",params![payload.batch_id,now_unix]).map_err(|e|e.to_string())?;
@@ -4442,6 +4535,124 @@ mod tests {
     }
 
     #[test]
+    fn config_sync_supersedes_only_pending_old_batch_and_allows_new_revision_batch() {
+        let (_temp, mut store, project, generation, _) = running_store();
+        store.connection.execute(
+            "UPDATE project_runtimes SET observed_lifecycle='running',controller_generation=?2 WHERE project_id=?1",
+            rusqlite::params![project.as_str(), generation],
+        ).unwrap();
+        assert_eq!(
+            store
+                .queue_due_supervisor_learning(
+                    generation,
+                    std::slice::from_ref(&project),
+                    100,
+                    3600
+                )
+                .unwrap(),
+            Some(project.clone())
+        );
+        let old_wake: (String, i64) = store.connection.query_row(
+            "SELECT batch_id,wake_input_id FROM learning_batches WHERE project_id=?1 AND status='issued'",
+            [project.as_str()], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        let old_wake_lifecycle: String = store
+            .connection
+            .query_row(
+                "SELECT lifecycle FROM role_wake_inputs WHERE wake_input_id=?1",
+                [old_wake.1],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_wake_lifecycle, "pending");
+
+        let mut revised = test_snapshot();
+        revised.config.projects.insert(
+            project.clone(),
+            serde_json::from_value(
+                serde_json::json!({"mode":"operations","ticket_adapter":"tickets"}),
+            )
+            .unwrap(),
+        );
+        revised.digest = Digest::parse("b".repeat(64)).unwrap();
+        let applied = store
+            .apply_snapshot("factory", &revised, ExpectedRevision::Current(Revision(1)))
+            .unwrap();
+        assert_eq!(applied.revision, Revision(2));
+        assert_eq!(
+            store
+                .connection
+                .query_row::<String, _, _>(
+                    "SELECT status FROM learning_batches WHERE batch_id=?1",
+                    [&old_wake.0],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            "superseded"
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<String, _, _>(
+                    "SELECT lifecycle FROM role_wake_inputs WHERE wake_input_id=?1",
+                    [old_wake.1],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            "superseded"
+        );
+
+        store
+            .connection
+            .execute(
+                "UPDATE supervisor_learning_schedule SET next_due_at_unix=0 WHERE project_id=?1",
+                [project.as_str()],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .queue_due_supervisor_learning(
+                    generation,
+                    std::slice::from_ref(&project),
+                    101,
+                    3600
+                )
+                .unwrap(),
+            Some(project.clone())
+        );
+        let issued: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM learning_batches WHERE project_id=?1 AND status='issued'",
+                [project.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(issued, 1);
+    }
+
+    #[test]
+    fn latest_learning_checkpoint_uses_insertion_order_when_acceptance_seconds_tie() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE learning_batches(batch_id TEXT PRIMARY KEY,project_id TEXT NOT NULL);
+             CREATE TABLE learning_decisions(decision_sequence INTEGER PRIMARY KEY AUTOINCREMENT,batch_id TEXT NOT NULL UNIQUE,decision_json TEXT NOT NULL,accepted_at_unix INTEGER NOT NULL);
+             INSERT INTO learning_batches VALUES ('learning-z-older','sample'),('learning-a-newer','sample');
+             INSERT INTO learning_decisions(batch_id,decision_json,accepted_at_unix) VALUES ('learning-z-older','{\"checkpoint\":{\"step\":\"older\"}}',100);
+             INSERT INTO learning_decisions(batch_id,decision_json,accepted_at_unix) VALUES ('learning-a-newer','{\"checkpoint\":{\"step\":\"newer\"}}',100);",
+        ).unwrap();
+        assert_eq!(
+            super::latest_supervisor_checkpoint(&connection, "sample").unwrap(),
+            BTreeMap::from([("step".into(), "newer".into())]),
+        );
+        connection.execute_batch("VACUUM").unwrap();
+        assert_eq!(
+            super::latest_supervisor_checkpoint(&connection, "sample").unwrap(),
+            BTreeMap::from([("step".into(), "newer".into())]),
+        );
+    }
+
+    #[test]
     fn five_individual_findings_trigger_one_fifo_batch_capped_at_twenty() {
         let (_temp, mut store, project, generation, run) = running_store();
         store.connection.execute("UPDATE project_runtimes SET observed_lifecycle='running',controller_generation=?2 WHERE project_id=?1",rusqlite::params![project.as_str(),generation]).unwrap();
@@ -4534,6 +4745,7 @@ mod tests {
         assertion: crate::engine::orchestration::AgentAssertion,
         unsupported_proposal: bool,
         maximum_finding: bool,
+        claim_override: Option<(bool, bool)>,
     ) -> LearningDispatchFixture {
         let (temp, mut store, project, generation, run) = running_store();
         store.connection.execute(
@@ -4625,9 +4837,20 @@ mod tests {
             .collect();
         let config_revision = store.project(&project).unwrap().unwrap().config_revision;
         let checkpoint = BTreeMap::from([("last_batch".into(), batch_id.clone())]);
+        let (wrong_batch_id, wrong_digest) = claim_override.unwrap_or((false, false));
+        let claimed_batch_id = if wrong_batch_id {
+            "learning-typo".to_owned()
+        } else {
+            batch_id.clone()
+        };
+        let claimed_batch_digest = if wrong_digest {
+            Digest::parse("f".repeat(64)).unwrap()
+        } else {
+            batch_digest
+        };
         let decision_payload = crate::engine::orchestration::LearningDecisionPayload {
-            batch_id: batch_id.clone(),
-            batch_digest,
+            batch_id: claimed_batch_id,
+            batch_digest: claimed_batch_digest,
             config_revision,
             observations: vec!["The Finding is stable and reproducible.".into()],
             topic_changes: if unsupported_proposal {
@@ -4683,6 +4906,7 @@ mod tests {
             crate::engine::orchestration::AgentAssertion::Succeeded,
             false,
             true,
+            None,
         );
         let LearningDispatchFixture {
             _temp,
@@ -4879,18 +5103,27 @@ mod tests {
                 config_digest,
                 &result,
             )
-            .is_err()
+            .unwrap()
         );
         assert_eq!(
             store
                 .connection
-                .query_row::<i64, _, _>(
-                    "SELECT count(*) FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                .query_row::<String, _, _>(
+                    "SELECT disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
                     [result.receipt.evidence_id()],
                     |r| r.get(0)
                 )
                 .unwrap(),
-            0
+            "rejected_by_host"
+        );
+        let artifacts =
+            crate::artifacts::ArtifactStore::open(&_temp.path().join("artifacts")).unwrap();
+        assert!(
+            store
+                .pending_validated_agent_results(&artifacts, generation, 8)
+                .unwrap()
+                .iter()
+                .all(|pending| pending.receipt.evidence_id() != result.receipt.evidence_id())
         );
         assert_eq!(
             store
@@ -4907,6 +5140,46 @@ mod tests {
             "SELECT count(*) FROM learning_findings WHERE project_id=?1 AND consumed_batch_id IS NOT NULL",
             [project.as_str()], |r| r.get(0)
         ).unwrap(), 0);
+        assert!(
+            store
+                .connection
+                .query_row::<Option<String>, _, _>(
+                    "SELECT last_error FROM project_runtimes WHERE project_id=?1",
+                    [project.as_str()],
+                    |r| r.get(0)
+                )
+                .unwrap()
+                .is_some()
+        );
+        let second_project = ProjectId::parse("sample-after-learning-rejection").unwrap();
+        let first_record = store.project(&project).unwrap().unwrap();
+        store
+            .insert_project(&ProjectRecord {
+                id: second_project.clone(),
+                config_source: first_record.config_source,
+                config_revision: first_record.config_revision,
+                config_digest: first_record.config_digest,
+                mode: first_record.mode,
+                goal_revision: first_record.goal_revision,
+                desired_lifecycle: "running".into(),
+                state_revision: Revision(0),
+            })
+            .unwrap();
+        store.connection.execute(
+            "UPDATE project_runtimes SET observed_lifecycle='running',controller_generation=?2 WHERE project_id=?1",
+            rusqlite::params![second_project.as_str(), generation],
+        ).unwrap();
+        assert_eq!(
+            store
+                .queue_due_supervisor_learning(
+                    generation,
+                    &[project.clone(), second_project.clone()],
+                    201,
+                    3600,
+                )
+                .unwrap(),
+            Some(second_project)
+        );
         assert_eq!(
             store
                 .connection
@@ -4928,11 +5201,39 @@ mod tests {
             },
             false,
             false,
+            Some((true, false)),
         ));
         assert_learning_result_is_held(learning_dispatch_fixture(
             crate::engine::orchestration::AgentAssertion::Succeeded,
             true,
             false,
+            Some((true, false)),
+        ));
+        assert_learning_result_is_held(learning_dispatch_fixture(
+            crate::engine::orchestration::AgentAssertion::Succeeded,
+            false,
+            false,
+            Some((false, true)),
+        ));
+    }
+
+    #[test]
+    fn learning_dispatch_rejects_blocked_and_cancelled_assertions_without_consumption() {
+        assert_learning_result_is_held(learning_dispatch_fixture(
+            crate::engine::orchestration::AgentAssertion::Blocked {
+                reason: "provider blocked the learning turn".into(),
+            },
+            false,
+            false,
+            None,
+        ));
+        assert_learning_result_is_held(learning_dispatch_fixture(
+            crate::engine::orchestration::AgentAssertion::Cancelled {
+                reason: Some("provider cancelled the learning turn".into()),
+            },
+            false,
+            false,
+            None,
         ));
     }
 
