@@ -223,6 +223,346 @@ fn projection_fixture(
 }
 
 #[test]
+fn dashboard_json_surfaces_ambiguous_launch_without_changing_ownership() {
+    use sha2::Digest as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let (config, state, home) = projection_fixture(&temp);
+    let applied = command(&config, &state, &home)
+        .args(["config", "apply", "--bootstrap"])
+        .output()
+        .unwrap();
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+
+    let db = rusqlite::Connection::open(state.join("state.sqlite3")).unwrap();
+    db.execute_batch(
+        "PRAGMA foreign_keys=OFF;
+         INSERT INTO projects(project_id,config_source,config_revision,config_digest,mode,desired_lifecycle,created_at_unix) VALUES('project1','fixture',1,printf('%064d',0),'goal','running',1);
+         INSERT INTO project_runtimes(project_id,desired_lifecycle,observed_lifecycle,controller_generation,project_epoch,next_due_at_unix) VALUES('project1','running','running',1,1,1);
+         INSERT INTO ticket_runs(ticket_run_id,project_id,config_source,config_revision,config_digest,namespace,ticket_id,generation,internal_phase,activity,external_status,observed_status,revision) VALUES('ticketrun1','project1','fixture',1,printf('%064d',0),'fixture','ISSUE-1',1,'in_progress','active','In Progress','In Progress',1);
+         INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,finite_turn,launch_operation_id,state,controller_generation) VALUES('agentrun1','project1','fixture',1,printf('%064d',0),'ticket_run:ticketrun1:coordinator','coordinator',1,'operation1','unknown',1);
+         INSERT INTO execution_slots(pool,slot_index,project_id,ticket_run_id,owner_kind,owner_id,reservation_epoch,controller_generation,disposition) VALUES('agent',0,'project1','ticketrun1','agent_run','agentrun1',1,1,'unknown');",
+    )
+    .unwrap();
+
+    use rex_projects::domain::ids::{
+        AgentRunId, Digest, OperationId, ProfileId, ProjectId, Revision, TicketRunId,
+    };
+    use rex_projects::domain::types::Role;
+    use rex_projects::launch::AgentLaunchReservation;
+    use std::path::PathBuf;
+
+    let project_id = ProjectId::parse("project1").unwrap();
+    let agent_run_id = AgentRunId::parse("agentrun1").unwrap();
+    let ticket_run_id = TicketRunId::parse("ticketrun1").unwrap();
+    let role_session_id = "ticket_run:ticketrun1:coordinator".to_owned();
+    let mut wake_snapshot = rex_projects::agent_api::AgentWakeSnapshot {
+        schema_version: 1,
+        project_id: project_id.clone(),
+        role_session_id: role_session_id.clone(),
+        agent_run_id: agent_run_id.to_string(),
+        digest: Digest::parse("0".repeat(64)).unwrap(),
+        inputs: Vec::new(),
+        worker_correction_context: None,
+    };
+    wake_snapshot.digest = wake_snapshot.content_digest().unwrap();
+    let digest = || Digest::parse("0".repeat(64)).unwrap();
+    let reservation = AgentLaunchReservation {
+        schema_version: 1,
+        agent_run_id,
+        project_id,
+        role: Role::Coordinator,
+        role_session_id,
+        parent_run_id: None,
+        parent_role: None,
+        ticket_run_id: Some(ticket_run_id),
+        ticket_revision: Some(Revision(1)),
+        config_revision: Revision(1),
+        config_digest: digest(),
+        attempt: 1,
+        run_epoch: 1,
+        controller_generation: 1,
+        project_epoch: 1,
+        operation_id: OperationId::parse("operation1").unwrap(),
+        operation_recipe_id: None,
+        worker_assignment: None,
+        rex_view_id: digest(),
+        runtime_binary_digest: digest(),
+        environment_snapshot_id: digest(),
+        profile_id: ProfileId::parse("fixture").unwrap(),
+        profile_digest: digest(),
+        instruction_digest: digest(),
+        result_schema_digest: digest(),
+        wake_snapshot,
+        qualification_receipt_digest: digest(),
+        descriptor_path: PathBuf::from("/tmp/descriptor.json"),
+        workspace_path: PathBuf::from("/tmp/workspace"),
+        control_dir: PathBuf::from("/tmp/control"),
+        mailbox_directory: PathBuf::from("/tmp/mailbox"),
+        mailbox_capability_digest: digest(),
+        mailbox_expires_at_unix: 1000,
+        mailbox_max_request_bytes: 1024,
+        mailbox_max_pending_requests: 4,
+        pool: "agent".into(),
+        slot_index: 0,
+        global_capacity: 1,
+        project_capacity: 1,
+    };
+    reservation.validate().unwrap();
+    let reservation_json = serde_json::to_string(&reservation).unwrap();
+    let reservation_digest = reservation.digest().unwrap().to_string();
+    db.execute(
+        "INSERT INTO agent_launch_reservations(agent_run_id,project_id,operation_id,controller_generation,project_epoch,reservation_digest,reservation_json,lifecycle,created_at_unix,updated_at_unix,launch_phase) VALUES('agentrun1','project1','operation1',1,1,?1,?2,'reserved',1,1,'ambiguous')",
+        rusqlite::params![reservation_digest, reservation_json],
+    ).unwrap();
+    let request = serde_json::json!({
+        "schema_version": 1,
+        "agent_run_id": "agentrun1",
+        "launch_reservation_digest": reservation_digest
+    });
+    let request_json = serde_json::to_string(&request).unwrap();
+    let request_digest = format!("{:x}", sha2::Sha256::digest(request_json.as_bytes()));
+    db.execute(
+        "INSERT INTO effects(operation_id,project_id,subject_type,subject_id,logical_key,kind,request_json,request_digest,status,attempt_count,next_attempt_at_unix,created_at_unix) VALUES('operation1','project1','agent_run','agentrun1','start','start_agent',?1,?2,'uncertain',1,1,1)",
+        rusqlite::params![request_json, request_digest],
+    ).unwrap();
+
+    for _ in 0..2 {
+        let output = command(&config, &state, &home)
+            .args(["--json", "dashboard"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let snapshot: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let wait = snapshot["waits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|wait| wait["kind"] == "agent_launch_handoff")
+            .expect("ambiguous launch is shown in the dashboard");
+        assert_eq!(wait["project_id"], "project1");
+        assert_eq!(wait["ticket_run_id"], "ticketrun1");
+        assert_eq!(
+            snapshot["waits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["kind"] == "agent_launch_handoff")
+                .count(),
+            1
+        );
+        assert!(
+            !snapshot["waits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["kind"] == "start_agent")
+        );
+        assert!(wait["detail"].as_str().unwrap().contains("agentrun1"));
+        assert!(
+            wait["detail"]
+                .as_str()
+                .unwrap()
+                .contains("TicketRun ticketrun1")
+        );
+        assert!(
+            wait["detail"]
+                .as_str()
+                .unwrap()
+                .contains("Keep its execution slot and worktree reserved")
+        );
+        assert!(!wait["detail"].as_str().unwrap().contains("retry"));
+        let phase: String = db
+            .query_row(
+                "SELECT launch_phase FROM agent_launch_reservations WHERE agent_run_id='agentrun1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let slot: String = db
+            .query_row(
+                "SELECT disposition FROM execution_slots WHERE owner_id='agentrun1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let status: String = db
+            .query_row(
+                "SELECT status FROM effects WHERE operation_id='operation1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            (phase.as_str(), slot.as_str(), status.as_str()),
+            ("ambiguous", "unknown", "uncertain")
+        );
+    }
+
+    for (pool, slot_index) in [("rex_projects_hook", 0), ("agent", 1)] {
+        db.execute(
+            "UPDATE execution_slots SET pool=?1,slot_index=?2 WHERE owner_id='agentrun1'",
+            rusqlite::params![pool, slot_index],
+        )
+        .unwrap();
+        let output = command(&config, &state, &home)
+            .args(["--json", "dashboard"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let snapshot: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            !snapshot["waits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["kind"] == "agent_launch_handoff"),
+            "a different execution slot must not match the launch reservation"
+        );
+    }
+    db.execute_batch(
+        "UPDATE execution_slots SET pool='agent',slot_index=0 WHERE owner_id='agentrun1';",
+    )
+    .unwrap();
+
+    db.execute_batch(
+        "DROP TRIGGER agent_launch_phase_transitions;
+         UPDATE agent_launch_reservations SET launch_phase='create_attempted' WHERE agent_run_id='agentrun1';",
+    )
+    .unwrap();
+    for status in ["uncertain", "failed"] {
+        db.execute(
+            "UPDATE effects SET status=?1 WHERE operation_id='operation1'",
+            [status],
+        )
+        .unwrap();
+        let output = command(&config, &state, &home)
+            .args(["--json", "dashboard"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let snapshot: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            snapshot["waits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["kind"] == "agent_launch_handoff")
+        );
+    }
+    for status in ["pending", "claimed", "succeeded"] {
+        db.execute_batch("UPDATE agent_launch_reservations SET launch_phase='legacy_unknown' WHERE agent_run_id='agentrun1';").unwrap();
+        db.execute(
+            "UPDATE effects SET status=?1 WHERE operation_id='operation1'",
+            [status],
+        )
+        .unwrap();
+        let output = command(&config, &state, &home)
+            .args(["--json", "dashboard"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let snapshot: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            !snapshot["waits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["kind"] == "agent_launch_handoff")
+        );
+        if status == "pending" {
+            assert!(
+                snapshot["waits"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["kind"] == "start_agent")
+            );
+        }
+    }
+    db.execute(
+        "UPDATE effects SET status='uncertain' WHERE operation_id='operation1'",
+        [],
+    )
+    .unwrap();
+    let output = command(&config, &state, &home)
+        .args(["--json", "dashboard"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let snapshot: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        snapshot["waits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["kind"] == "agent_launch_handoff")
+    );
+
+    db.execute_batch("UPDATE effects SET status='failed',request_digest=printf('%064d',0) WHERE operation_id='operation1';").unwrap();
+    let output = command(&config, &state, &home)
+        .args(["--json", "dashboard"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let snapshot: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        !snapshot["waits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["kind"] == "agent_launch_handoff")
+    );
+}
+
+#[test]
+fn dashboard_json_reads_schema_17_without_launch_phase_column() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, state, home) = projection_fixture(&temp);
+    let applied = command(&config, &state, &home)
+        .args(["config", "apply", "--bootstrap"])
+        .output()
+        .unwrap();
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let db = rusqlite::Connection::open(state.join("state.sqlite3")).unwrap();
+    db.execute_batch("DROP TRIGGER IF EXISTS agent_launch_phase_transitions; ALTER TABLE agent_launch_reservations DROP COLUMN launch_phase; PRAGMA user_version=17;").unwrap();
+    drop(db);
+
+    let output = command(&config, &state, &home)
+        .args(["--json", "dashboard"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snapshot: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        snapshot["waits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|wait| wait["kind"] != "agent_launch_handoff")
+    );
+    let absent: i64 = rusqlite::Connection::open(state.join("state.sqlite3")).unwrap()
+        .query_row("SELECT COUNT(*) FROM pragma_table_info('agent_launch_reservations') WHERE name='launch_phase'", [], |row| row.get(0)).unwrap();
+    assert_eq!(absent, 0);
+}
+
+#[test]
 fn version_reports_the_cargo_package_version() {
     let output = Command::new(env!("CARGO_BIN_EXE_rex-projects"))
         .arg("--version")
