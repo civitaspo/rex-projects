@@ -49,6 +49,8 @@ pub mod runtime_services;
 pub mod start_agent;
 pub mod stop_owned_runs;
 pub mod store;
+pub mod topic;
+pub mod topic_effect;
 pub mod trial_step;
 pub(crate) mod worker_verification;
 pub mod worktrees;

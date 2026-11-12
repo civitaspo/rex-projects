@@ -216,6 +216,65 @@
       "pattern": "^[A-Za-z0-9._-]+(:[A-Za-z0-9._-]+)*$",
       "type": "string"
     },
+    "TopicChange": {
+      "additionalProperties": false,
+      "properties": {
+        "applicability": {
+          "type": "string"
+        },
+        "claims": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "counterexamples": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "expected_prior_digest": {
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[a-f0-9]{64}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "proposed_check": {
+          "type": "string"
+        },
+        "source_finding_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "topic_key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "topic_key",
+        "title",
+        "summary",
+        "claims",
+        "applicability",
+        "proposed_check",
+        "counterexamples",
+        "source_finding_ids",
+        "expected_prior_digest"
+      ],
+      "type": "object"
+    },
     "WorkNodeId": {
       "description": "Stable plan-local identity for a task in a TicketRun DAG.",
       "maxLength": 80,
@@ -608,7 +667,7 @@
                 },
                 "topic_changes": {
                   "items": {
-                    "type": "string"
+                    "$ref": "#/$defs/TopicChange"
                   },
                   "type": "array"
                 }

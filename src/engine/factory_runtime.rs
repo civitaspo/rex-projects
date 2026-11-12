@@ -173,6 +173,12 @@ pub trait FactoryRuntimeServices {
 
     fn configuration_digest(&self) -> &Digest;
 
+    /// Absolute knowledge destination resolved by the host from the active config file.
+    /// The durable Topic intent freezes this value; Agents never choose it.
+    fn topic_publication_root(&self) -> Option<&std::path::Path> {
+        None
+    }
+
     fn human_evidence_documents(
         &mut self,
         _store: &mut ConfigStore,
@@ -475,6 +481,7 @@ impl FactoryRuntime {
             &configured_projects,
             now_unix,
             learning_interval,
+            services.topic_publication_root(),
         )?;
         let (keys, mut external_errors) = build_scan_keys(config, &runnable, services);
         if let Some(key) = next_pending_candidate_key(store, &runnable, config, &keys)?
@@ -847,7 +854,13 @@ fn apply_agent_result(
     }
     if binding.role == Role::Supervisor && result.validated.kind == RoleOutputKind::LearningDecision
     {
-        store.consume_supervisor_learning_decision(owner_generation, result, now_unix)?;
+        let topic_root = services.topic_publication_root();
+        store.consume_supervisor_learning_decision(
+            owner_generation,
+            result,
+            now_unix,
+            topic_root,
+        )?;
         return Ok(true);
     }
     if binding.role == Role::Supervisor
@@ -4498,6 +4511,7 @@ pub(crate) mod tests {
 
     struct WorkerPublicationFixtureServices {
         configuration_digest: Digest,
+        topic_publication_root: Option<std::path::PathBuf>,
         published_effect: Option<crate::store::EffectIntent>,
         pending_artifacts: Option<crate::artifacts::ArtifactStore>,
         ticket_page: Option<super::ExternalTicketPage>,
@@ -4510,6 +4524,10 @@ pub(crate) mod tests {
     }
 
     impl super::FactoryRuntimeServices for WorkerPublicationFixtureServices {
+        fn topic_publication_root(&self) -> Option<&std::path::Path> {
+            self.topic_publication_root.as_deref()
+        }
+
         fn process_one_agent_request(
             &mut self,
             _: &mut crate::store::ConfigStore,
@@ -4817,8 +4835,29 @@ pub(crate) mod tests {
         configuration_digest: Digest,
         result: &crate::store::agent_results::IngestedAgentResult,
     ) -> Result<bool, String> {
+        apply_agent_result_with_topic_root_for_test(
+            store,
+            owner_generation,
+            now_unix,
+            config,
+            configuration_digest,
+            result,
+            None,
+        )
+    }
+
+    pub(crate) fn apply_agent_result_with_topic_root_for_test(
+        store: &mut crate::store::ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+        config: &Config,
+        configuration_digest: Digest,
+        result: &crate::store::agent_results::IngestedAgentResult,
+        topic_publication_root: Option<std::path::PathBuf>,
+    ) -> Result<bool, String> {
         let mut services = WorkerPublicationFixtureServices {
             configuration_digest,
+            topic_publication_root,
             published_effect: None,
             pending_artifacts: None,
             ticket_page: None,
@@ -4850,6 +4889,7 @@ pub(crate) mod tests {
     ) -> Result<bool, String> {
         let mut services = WorkerPublicationFixtureServices {
             configuration_digest,
+            topic_publication_root: None,
             published_effect: None,
             pending_artifacts: None,
             ticket_page: None,
@@ -4880,6 +4920,7 @@ pub(crate) mod tests {
     ) -> Result<bool, String> {
         let services = WorkerPublicationFixtureServices {
             configuration_digest,
+            topic_publication_root: None,
             published_effect: None,
             pending_artifacts: None,
             ticket_page: None,
@@ -4916,6 +4957,7 @@ pub(crate) mod tests {
     ) -> Result<bool, String> {
         let mut services = WorkerPublicationFixtureServices {
             configuration_digest,
+            topic_publication_root: None,
             published_effect: None,
             pending_artifacts: None,
             ticket_page: None,
@@ -4947,6 +4989,7 @@ pub(crate) mod tests {
     ) -> Result<super::FactoryTickReport, String> {
         let mut services = WorkerPublicationFixtureServices {
             configuration_digest,
+            topic_publication_root: None,
             published_effect: None,
             pending_artifacts: Some(artifacts),
             ticket_page: None,
@@ -4977,6 +5020,7 @@ pub(crate) mod tests {
     ) -> Result<super::FactoryTickReport, String> {
         let mut services = WorkerPublicationFixtureServices {
             configuration_digest,
+            topic_publication_root: None,
             published_effect: None,
             pending_artifacts: Some(artifacts),
             ticket_page: None,
@@ -5001,6 +5045,7 @@ pub(crate) mod tests {
     ) -> Result<bool, String> {
         let mut services = WorkerPublicationFixtureServices {
             configuration_digest,
+            topic_publication_root: None,
             published_effect: None,
             pending_artifacts: None,
             ticket_page: None,
@@ -5125,6 +5170,7 @@ pub(crate) mod tests {
                 .unwrap();
             let mut services = WorkerPublicationFixtureServices {
                 configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
+                topic_publication_root: None,
                 published_effect: None,
                 pending_artifacts: None,
                 ticket_page: None,
@@ -5229,6 +5275,7 @@ pub(crate) mod tests {
             toml::from_str(include_str!("../../examples/fixture/config.toml")).unwrap();
         let mut services = WorkerPublicationFixtureServices {
             configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
+            topic_publication_root: None,
             published_effect: None,
             pending_artifacts: Some(fixture.artifacts),
             ticket_page: None,
@@ -5497,6 +5544,7 @@ pub(crate) mod tests {
             .unwrap();
         let mut result_services = WorkerPublicationFixtureServices {
             configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
+            topic_publication_root: None,
             published_effect: None,
             pending_artifacts: None,
             ticket_page: None,
@@ -5567,6 +5615,7 @@ pub(crate) mod tests {
 
         let mut scan_services = WorkerPublicationFixtureServices {
             configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
+            topic_publication_root: None,
             published_effect: None,
             pending_artifacts: None,
             ticket_page: Some(super::ExternalTicketPage {
@@ -6225,6 +6274,7 @@ pub(crate) mod tests {
         let artifacts = fixture.artifacts.clone();
         let mut services = WorkerPublicationFixtureServices {
             configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
+            topic_publication_root: None,
             published_effect: None,
             pending_artifacts: Some(fixture.artifacts),
             ticket_page: None,
@@ -6350,6 +6400,7 @@ pub(crate) mod tests {
             toml::from_str(include_str!("../../examples/fixture/config.toml")).unwrap();
         let mut services = WorkerPublicationFixtureServices {
             configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
+            topic_publication_root: None,
             published_effect: None,
             pending_artifacts: None,
             ticket_page: None,
@@ -6482,6 +6533,7 @@ pub(crate) mod tests {
         let configuration_digest = Digest::parse("a".repeat(64)).unwrap();
         let mut services = WorkerPublicationFixtureServices {
             configuration_digest,
+            topic_publication_root: None,
             published_effect: None,
             pending_artifacts: None,
             ticket_page: None,
@@ -6580,6 +6632,7 @@ pub(crate) mod tests {
         .unwrap();
         let mut services = WorkerPublicationFixtureServices {
             configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
+            topic_publication_root: None,
             published_effect: None,
             pending_artifacts: None,
             ticket_page: None,
@@ -6927,6 +6980,7 @@ pub(crate) mod tests {
         .unwrap();
         let mut services = WorkerPublicationFixtureServices {
             configuration_digest: authority.config_digest.clone(),
+            topic_publication_root: None,
             published_effect: None,
             pending_artifacts: None,
             ticket_page: None,
@@ -7233,6 +7287,7 @@ pub(crate) mod tests {
         .unwrap();
         let mut services = WorkerPublicationFixtureServices {
             configuration_digest: authority.config_digest.clone(),
+            topic_publication_root: None,
             published_effect: None,
             pending_artifacts: None,
             ticket_page: None,
@@ -7405,6 +7460,7 @@ pub(crate) mod tests {
                 .unwrap();
             let mut services = WorkerPublicationFixtureServices {
                 configuration_digest: configuration_digest.clone(),
+                topic_publication_root: None,
                 published_effect: None,
                 pending_artifacts: None,
                 ticket_page: None,
@@ -7774,6 +7830,7 @@ esac
             .unwrap();
         let mut services = WorkerPublicationFixtureServices {
             configuration_digest: current_digest.clone(),
+            topic_publication_root: None,
             published_effect: None,
             pending_artifacts: Some(fixture.artifacts.clone()),
             ticket_page: None,
@@ -8315,6 +8372,7 @@ esac
             .unwrap();
         let mut services = WorkerPublicationFixtureServices {
             configuration_digest: current_digest.clone(),
+            topic_publication_root: None,
             published_effect: None,
             pending_artifacts: None,
             ticket_page: None,

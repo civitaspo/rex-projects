@@ -30,6 +30,89 @@ const MAX_SUPERVISOR_BATCH_BYTES: usize = 768 * 1024;
 const LEARNING_BATCH_TRIGGER_FINDINGS: usize = 5;
 const LEARNING_BATCH_MAX_FINDINGS: usize = 20;
 
+struct TopicSourceDbRow {
+    ticket_run_id: String,
+    publication_digest: String,
+    ordinal: u32,
+    finding_text: String,
+    request_digest: String,
+    request_json: String,
+    manifest_json: String,
+    manifest_digest: String,
+}
+
+struct SupervisorTopicPublicationDbRow {
+    project_id: String,
+    topic_key: String,
+    destination_root: String,
+    intent_json: String,
+    receipt_json: Option<String>,
+    receipt_digest: Option<String>,
+}
+
+fn sorted_source_ids(sources: &[crate::topic::TopicSourceProof]) -> Vec<Digest> {
+    let mut ids = sources
+        .iter()
+        .map(|source| source.finding_id.clone())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
+}
+
+fn resolve_topic_source(
+    tx: &rusqlite::Transaction<'_>,
+    project_id: &ProjectId,
+    finding_id: &Digest,
+) -> Result<Option<crate::topic::TopicSourceProof>, String> {
+    let row: Option<TopicSourceDbRow> = tx
+        .query_row(
+            "SELECT f.ticket_run_id,f.publication_digest,f.ordinal,f.finding_text,p.request_digest,p.request_json,p.manifest_json,p.manifest_digest FROM learning_findings f JOIN knowledge_publications p ON p.project_id=f.project_id AND p.ticket_run_id=f.ticket_run_id AND p.state='published' WHERE f.finding_id=?1 AND f.project_id=?2 AND p.manifest_digest=f.publication_digest",
+            params![finding_id.as_str(), project_id.as_str()],
+            |row| Ok(TopicSourceDbRow { ticket_run_id: row.get(0)?, publication_digest: row.get(1)?, ordinal: row.get(2)?, finding_text: row.get(3)?, request_digest: row.get(4)?, request_json: row.get(5)?, manifest_json: row.get(6)?, manifest_digest: row.get(7)? }),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    verify_digest(&row.request_json, &Digest::parse(row.request_digest)?)?;
+    let input: PostmortemInput = crate::protocol::parse_unique(row.request_json.as_bytes())?;
+    validate_postmortem_input(&input).map_err(|error| error.to_string())?;
+    let manifest: PublicationManifest =
+        crate::protocol::parse_unique(row.manifest_json.as_bytes())?;
+    let manifest_digest = Digest::parse(row.manifest_digest)?;
+    let calculated = Digest::parse(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&manifest).map_err(|error| error.to_string())?)
+    ))?;
+    let run_id = TicketRunId::parse(row.ticket_run_id.clone())?;
+    let publication_digest = Digest::parse(row.publication_digest)?;
+    let expected_path = format!(
+        "projects/{}/postmortems/{:x}.md",
+        project_id,
+        Sha256::digest(run_id.as_str().as_bytes())
+    );
+    if input.project_id != *project_id
+        || input.ticket_run_id != run_id
+        || manifest.project_id != *project_id
+        || manifest.ticket_run_id != run_id
+        || manifest.operation_id != input.operation_id
+        || manifest.relative_path != expected_path
+        || manifest_digest != publication_digest
+        || calculated != manifest_digest
+        || input.findings.get(row.ordinal as usize) != Some(&row.finding_text)
+        || learning_finding_id(&publication_digest, row.ordinal, &row.finding_text)? != *finding_id
+    {
+        return Err("published Supervisor Finding provenance is invalid".into());
+    }
+    Ok(Some(crate::topic::TopicSourceProof {
+        finding_id: finding_id.clone(),
+        publication_digest,
+        ordinal: row.ordinal,
+        ticket_run_id: row.ticket_run_id,
+    }))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LearningFinding {
     pub id: Digest,
@@ -101,6 +184,7 @@ fn supervisor_learning_snapshot_in_transaction(
     project: &ProjectId,
     now_utc: &str,
     knowledge_limit: usize,
+    topic_destination_root: Option<&std::path::Path>,
 ) -> Result<ProjectSupervisorMaintenance, String> {
     let mut ledger = CandidateLedger::default();
     let mut revisions_stmt = tx.prepare("SELECT revision_json FROM learning_candidates WHERE project_id=?1 ORDER BY created_at_unix,candidate_id,digest").map_err(|e|e.to_string())?;
@@ -173,6 +257,64 @@ fn supervisor_learning_snapshot_in_transaction(
         });
     }
     drop(knowledge_stmt);
+    if topic_destination_root.is_some_and(|root| !root.is_absolute()) {
+        return Err("Supervisor Topic destination root must be absolute".into());
+    }
+    let topic_destination_root =
+        topic_destination_root.map(|root| root.to_string_lossy().into_owned());
+    let total_published_topics: usize = tx.query_row(
+        "SELECT COUNT(*) FROM supervisor_topic_publications WHERE project_id=?1 AND state='published' AND destination_root=?2",
+        params![project.as_str(), topic_destination_root.as_deref()],
+        |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    let mut topic_stmt = tx.prepare(
+        "SELECT topic_key,intent_json,intent_digest,receipt_json,receipt_digest FROM supervisor_topic_publications WHERE project_id=?1 AND state='published' AND destination_root=?2 ORDER BY published_at_unix DESC,operation_id DESC LIMIT 5",
+    ).map_err(|error| error.to_string())?;
+    let topic_rows = topic_stmt
+        .query_map(
+            params![project.as_str(), topic_destination_root.as_deref()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(topic_stmt);
+    let mut topics = Vec::new();
+    for (topic_key, intent_json, intent_digest, receipt_json, receipt_digest) in topic_rows {
+        verify_digest(&intent_json, &Digest::parse(intent_digest)?)?;
+        verify_digest(&receipt_json, &Digest::parse(receipt_digest)?)?;
+        let intent: crate::topic::TopicIntent =
+            crate::protocol::parse_unique(intent_json.as_bytes())?;
+        let receipt: crate::topic::TopicReceipt =
+            crate::protocol::parse_unique(receipt_json.as_bytes())?;
+        if intent.project_id != *project
+            || intent.key.as_str() != topic_key
+            || !intent.destination_root.is_absolute()
+            || topic_destination_root
+                .as_deref()
+                .is_none_or(|root| intent.destination_root.to_string_lossy() != root)
+            || intent.content_digest != crate::topic::content_digest(&intent.content)
+            || receipt.manifest.project_id != *project
+            || receipt.manifest.topic_key.as_str() != topic_key
+            || receipt.manifest.content_sha256 != intent.content_digest
+        {
+            return Err("stored Supervisor Topic publication has invalid provenance".into());
+        }
+        topics.push(SupervisorTopicEntry {
+            topic_key: intent.key,
+            content: intent.content,
+            content_digest: receipt.manifest.content_sha256,
+        });
+    }
+    let omitted_topics = total_published_topics.saturating_sub(topics.len());
     let mut candidates_stmt=tx.prepare("SELECT revision_json,profile_id,package_manifest_digest,expected_pairs,evidence_json FROM learning_candidates WHERE project_id=?1 AND status IN ('proposed','trialing','awaiting_approval') ORDER BY created_at_unix,candidate_id,digest LIMIT ?2").map_err(|e|e.to_string())?;
     let candidate_rows = candidates_stmt
         .query_map(
@@ -205,20 +347,44 @@ fn supervisor_learning_snapshot_in_transaction(
         });
     }
     drop(candidates_stmt);
-    let snapshot = ProjectSupervisorMaintenance {
+    let mut snapshot = ProjectSupervisorMaintenance {
         project_id: project.clone(),
         expired_candidates,
         knowledge,
+        topics,
+        omitted_topics,
         candidates,
     };
-    if serde_json::to_vec(&snapshot)
+    trim_supervisor_snapshot(&mut snapshot)?;
+    Ok(snapshot)
+}
+
+fn trim_supervisor_snapshot(snapshot: &mut ProjectSupervisorMaintenance) -> Result<(), String> {
+    while serde_json::to_vec(snapshot)
+        .map_err(|e| e.to_string())?
+        .len()
+        > MAX_SUPERVISOR_CONTEXT_BYTES
+        && !snapshot.knowledge.is_empty()
+    {
+        snapshot.knowledge.pop();
+    }
+    while serde_json::to_vec(snapshot)
+        .map_err(|e| e.to_string())?
+        .len()
+        > MAX_SUPERVISOR_CONTEXT_BYTES
+        && !snapshot.topics.is_empty()
+    {
+        snapshot.topics.pop();
+        snapshot.omitted_topics = snapshot.omitted_topics.saturating_add(1);
+    }
+    if serde_json::to_vec(snapshot)
         .map_err(|e| e.to_string())?
         .len()
         > MAX_SUPERVISOR_CONTEXT_BYTES
     {
         return Err("Supervisor learning context exceeds its aggregate byte limit".into());
     }
-    Ok(snapshot)
+    Ok(())
 }
 
 struct LearningBatchDbRow {
@@ -351,6 +517,73 @@ pub(crate) fn migrate_v19_learning_batches(connection: &Connection) -> Result<()
     }
     tx.execute_batch("INSERT INTO schema_migrations(version,applied_at_unix) VALUES (19,unixepoch()); PRAGMA user_version=19;").map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())
+}
+
+pub(crate) fn migrate_v20_topic_publications(connection: &Connection) -> Result<(), String> {
+    let tx = connection
+        .unchecked_transaction()
+        .map_err(|e| e.to_string())?;
+    let version: i64 = tx
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if version != 19 {
+        return Err(format!(
+            "Topic publication migration requires schema v19, found v{version}"
+        ));
+    }
+    tx.execute_batch(
+        "CREATE TABLE supervisor_topic_publications (
+            operation_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(project_id),
+            topic_key TEXT NOT NULL,
+            destination_root TEXT NOT NULL,
+            intent_json TEXT NOT NULL CHECK(length(intent_json)<=1048576),
+            intent_digest TEXT NOT NULL CHECK(length(intent_digest)=64),
+            state TEXT NOT NULL CHECK(state IN ('pending','published','conflict')),
+            receipt_json TEXT,
+            receipt_digest TEXT CHECK(receipt_digest IS NULL OR length(receipt_digest)=64),
+            conflict_json TEXT,
+            created_at_unix INTEGER NOT NULL,
+            published_at_unix INTEGER,
+            UNIQUE(project_id,topic_key),
+            CHECK((state='published' AND receipt_json IS NOT NULL AND receipt_digest IS NOT NULL AND published_at_unix IS NOT NULL AND conflict_json IS NULL)
+               OR (state='pending' AND receipt_json IS NULL AND receipt_digest IS NULL AND published_at_unix IS NULL AND conflict_json IS NULL)
+               OR (state='conflict' AND receipt_json IS NULL AND receipt_digest IS NULL AND published_at_unix IS NULL AND conflict_json IS NOT NULL))
+        );
+        CREATE INDEX supervisor_topic_publications_project ON supervisor_topic_publications(project_id,state,created_at_unix DESC,topic_key);
+        INSERT INTO schema_migrations(version,applied_at_unix) VALUES (20,unixepoch());
+        PRAGMA user_version=20;"
+    ).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
+pub(crate) fn validate_v20_topic_publications(connection: &Connection) -> Result<(), String> {
+    let mut stmt = connection
+        .prepare("PRAGMA table_info(supervisor_topic_publications)")
+        .map_err(|e| e.to_string())?;
+    let actual = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let required = [
+        "operation_id",
+        "project_id",
+        "topic_key",
+        "destination_root",
+        "intent_json",
+        "intent_digest",
+        "state",
+        "receipt_json",
+        "receipt_digest",
+        "conflict_json",
+        "created_at_unix",
+        "published_at_unix",
+    ];
+    if required.iter().any(|column| !actual.contains(*column)) {
+        return Err("database claims schema v20 but Topic publication ledger is incomplete".into());
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_v19_learning_batches(connection: &Connection) -> Result<(), String> {
@@ -548,7 +781,16 @@ pub struct ProjectSupervisorMaintenance {
     pub project_id: ProjectId,
     pub expired_candidates: usize,
     pub knowledge: Vec<SupervisorKnowledgeEntry>,
+    pub topics: Vec<SupervisorTopicEntry>,
+    pub omitted_topics: usize,
     pub candidates: Vec<SupervisorCandidateEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SupervisorTopicEntry {
+    pub topic_key: crate::topic::TopicKey,
+    pub content: String,
+    pub content_digest: Digest,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2044,6 +2286,213 @@ impl ConfigStore {
         }))
     }
 
+    pub(crate) fn supervisor_topic_intent(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<crate::topic::TopicIntent>, String> {
+        let row: Option<(String, String, String, String)> = self.connection.query_row(
+            "SELECT intent_json,intent_digest,project_id,destination_root FROM supervisor_topic_publications WHERE operation_id=?1",
+            [operation_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((intent_json, intent_digest, project_id, destination_root)) = row else {
+            return Ok(None);
+        };
+        verify_digest(&intent_json, &Digest::parse(intent_digest)?)?;
+        let intent: crate::topic::TopicIntent =
+            crate::protocol::parse_unique(intent_json.as_bytes())?;
+        if intent.operation_id != operation_id.as_str()
+            || intent.project_id.as_str() != project_id
+            || intent.destination_root.to_string_lossy() != destination_root
+            || !intent.destination_root.is_absolute()
+            || intent.content_digest != crate::topic::content_digest(&intent.content)
+        {
+            return Err(
+                "stored Supervisor Topic intent does not match its immutable identity".into(),
+            );
+        }
+        Ok(Some(intent))
+    }
+
+    pub(crate) fn supervisor_topic_conflict_reason(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<String>, String> {
+        let conflict_json: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT conflict_json FROM supervisor_topic_publications WHERE operation_id=?1 AND state='conflict'",
+                [operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some(conflict_json) = conflict_json else {
+            return Ok(None);
+        };
+        let conflict: serde_json::Value = crate::protocol::parse_unique(conflict_json.as_bytes())?;
+        let reason = conflict
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .filter(|reason| !reason.trim().is_empty())
+            .ok_or("stored Topic conflict has no reason")?;
+        if conflict
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(operation_id.as_str())
+            || conflict.get("state").and_then(serde_json::Value::as_str) != Some("conflict")
+        {
+            return Err("stored Topic conflict does not match its operation".into());
+        }
+        Ok(Some(reason.to_owned()))
+    }
+
+    pub(crate) fn supervisor_topic_intent_digest(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<String, String> {
+        let digest: String = self
+            .connection
+            .query_row(
+                "SELECT intent_digest FROM supervisor_topic_publications WHERE operation_id=?1",
+                [operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(Digest::parse(digest)?.to_string())
+    }
+
+    pub(crate) fn supervisor_topic_receipt(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<crate::topic::TopicReceipt>, String> {
+        let row: Option<(String, Option<String>, Option<String>)> = self.connection.query_row(
+            "SELECT state,receipt_json,receipt_digest FROM supervisor_topic_publications WHERE operation_id=?1",
+            [operation_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((state, json, digest)) = row else {
+            return Ok(None);
+        };
+        if state != "published" {
+            return Ok(None);
+        }
+        let json = json.ok_or("published Topic row has no receipt")?;
+        let digest = Digest::parse(digest.ok_or("published Topic row has no receipt digest")?)?;
+        verify_digest(&json, &digest)?;
+        let receipt: crate::topic::TopicReceipt = crate::protocol::parse_unique(json.as_bytes())?;
+        if receipt.manifest.operation_id != operation_id.as_str()
+            || receipt.manifest.content_sha256.as_str().is_empty()
+        {
+            return Err("stored Topic receipt has invalid identity".into());
+        }
+        Ok(Some(receipt))
+    }
+
+    pub(crate) fn record_supervisor_topic_conflict(
+        &mut self,
+        generation: u64,
+        operation_id: &OperationId,
+        reason: &str,
+    ) -> Result<(), String> {
+        let conflict_json = super::canonical_json(&serde_json::json!({
+            "operation_id": operation_id.as_str(),
+            "state": "conflict",
+            "reason": reason,
+        }))?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        validate_active_generation(&tx, generation)?;
+        let changed = tx.execute(
+            "UPDATE supervisor_topic_publications SET state='conflict',conflict_json=?2 WHERE operation_id=?1 AND state='pending'",
+            params![operation_id.as_str(), conflict_json],
+        ).map_err(|e| e.to_string())?;
+        if changed != 1 {
+            let existing: Option<String> = tx.query_row(
+                "SELECT conflict_json FROM supervisor_topic_publications WHERE operation_id=?1 AND state='conflict'",
+                [operation_id.as_str()],
+                |row| row.get(0),
+            ).optional().map_err(|e| e.to_string())?;
+            if existing.as_deref() != Some(conflict_json.as_str()) {
+                return Err(
+                    "Topic publication conflict lacks a pending intent or changed on replay".into(),
+                );
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn record_supervisor_topic_publication(
+        &mut self,
+        generation: u64,
+        operation_id: &OperationId,
+        receipt: &crate::topic::TopicReceipt,
+    ) -> Result<bool, String> {
+        let receipt_json = super::canonical_json(receipt)?;
+        let receipt_digest = Digest::parse(super::content_digest(&receipt_json))?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        validate_active_generation(&tx, generation)?;
+        let row: Option<SupervisorTopicPublicationDbRow> = tx.query_row(
+            "SELECT project_id,topic_key,destination_root,intent_json,receipt_json,receipt_digest FROM supervisor_topic_publications WHERE operation_id=?1 AND state IN ('pending','published')",
+            [operation_id.as_str()],
+            |row| Ok(SupervisorTopicPublicationDbRow { project_id: row.get(0)?, topic_key: row.get(1)?, destination_root: row.get(2)?, intent_json: row.get(3)?, receipt_json: row.get(4)?, receipt_digest: row.get(5)? }),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some(row) = row else {
+            return Err("Topic receipt has no durable pending intent".into());
+        };
+        let SupervisorTopicPublicationDbRow {
+            project_id: project,
+            topic_key: key,
+            destination_root: root,
+            intent_json,
+            receipt_json: old_json,
+            receipt_digest: old_digest,
+        } = row;
+        let intent_digest: String = tx
+            .query_row(
+                "SELECT intent_digest FROM supervisor_topic_publications WHERE operation_id=?1",
+                [operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        verify_digest(&intent_json, &Digest::parse(intent_digest)?)?;
+        let intent: crate::topic::TopicIntent =
+            crate::protocol::parse_unique(intent_json.as_bytes())?;
+        let expected_path = format!("projects/{}/topics/{}.md", project, key);
+        if intent.project_id.as_str() != project
+            || intent.key.as_str() != key
+            || intent.destination_root.to_string_lossy() != root
+            || intent.operation_id != operation_id.as_str()
+            || receipt.manifest.project_id != intent.project_id
+            || receipt.manifest.topic_key != intent.key
+            || receipt.manifest.operation_id != operation_id.as_str()
+            || receipt.manifest.relative_path != expected_path
+            || receipt.manifest.format != "okf-0.2"
+            || receipt.manifest.content_sha256 != intent.content_digest
+            || receipt.manifest.byte_count != intent.content.len()
+            || receipt.manifest.source_finding_ids != sorted_source_ids(&intent.sources)
+        {
+            return Err("Topic receipt does not match its exact durable intent".into());
+        }
+        if old_json.is_some() {
+            if old_json.as_deref() != Some(receipt_json.as_str())
+                || old_digest.as_deref() != Some(receipt_digest.as_str())
+            {
+                return Err("Topic publication receipt changed on replay".into());
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(false);
+        }
+        tx.execute("UPDATE supervisor_topic_publications SET state='published',receipt_json=?2,receipt_digest=?3,published_at_unix=?4 WHERE operation_id=?1 AND state='pending'", params![operation_id.as_str(),receipt_json,receipt_digest.as_str(),receipt.published_at_unix]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
     /// Persist the immutable postmortem request before filesystem publication.
     pub fn prepare_knowledge_publication(
         &mut self,
@@ -2358,6 +2807,7 @@ impl ConfigStore {
         project: &ProjectId,
         now_utc: &str,
         knowledge_limit: usize,
+        topic_destination_root: Option<&std::path::Path>,
     ) -> Result<ProjectSupervisorMaintenance, String> {
         if knowledge_limit == 0 || knowledge_limit > MAX_SUPERVISOR_KNOWLEDGE_ITEMS {
             return Err("Supervisor knowledge batch size is outside the configured bound".into());
@@ -2377,8 +2827,13 @@ impl ConfigStore {
         if !project_exists {
             return Err("Supervisor learning tick references an unknown project".into());
         }
-        let snapshot =
-            supervisor_learning_snapshot_in_transaction(&tx, project, now_utc, knowledge_limit)?;
+        let snapshot = supervisor_learning_snapshot_in_transaction(
+            &tx,
+            project,
+            now_utc,
+            knowledge_limit,
+            topic_destination_root,
+        )?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(snapshot)
     }
@@ -2392,6 +2847,7 @@ impl ConfigStore {
         configured_projects: &[ProjectId],
         now_unix: i64,
         interval_seconds: u64,
+        topic_destination_root: Option<&std::path::Path>,
     ) -> Result<Option<ProjectId>, String> {
         if now_unix < 0 || interval_seconds == 0 {
             return Err("Supervisor learning schedule requires positive bounded timing".into());
@@ -2482,8 +2938,13 @@ impl ConfigStore {
                 .collect::<Result<Vec<_>, String>>()?;
             drop(stmt);
             let checkpoint = latest_supervisor_checkpoint(&tx, &project_raw)?;
-            let maintenance =
-                supervisor_learning_snapshot_in_transaction(&tx, &project, &now_utc, 0)?;
+            let maintenance = supervisor_learning_snapshot_in_transaction(
+                &tx,
+                &project,
+                &now_utc,
+                0,
+                topic_destination_root,
+            )?;
             let mut findings = findings;
             let (base_snapshot, base_snapshot_json) = loop {
                 let snapshot = serde_json::json!({"type":"supervisor_learning_batch","project_id":project.as_str(),"config_revision":config_revision,"config_digest":config_digest,"issued_at_unix":now_unix,"prior_checkpoint":&checkpoint,"maintenance":&maintenance,"findings":&findings});
@@ -2522,6 +2983,7 @@ impl ConfigStore {
         owner_generation: u64,
         result: &crate::store::agent_results::IngestedAgentResult,
         now_unix: i64,
+        topic_destination_root: Option<&std::path::Path>,
     ) -> Result<(), String> {
         use crate::engine::orchestration::{AgentAssertion, RoleOutputKind, RoleResultPayload};
         if result.validated.kind != RoleOutputKind::LearningDecision
@@ -2705,8 +3167,12 @@ impl ConfigStore {
             }
             AgentAssertion::Succeeded => None,
         };
+        let mut topic_intents = Vec::new();
+        let mut rendered_topic_bytes = 0usize;
         if let Some(payload) = payload {
-            if !payload.topic_changes.is_empty()
+            let topic_changes_valid =
+                crate::topic::validate_changes(&payload.topic_changes).is_ok();
+            if !topic_changes_valid
                 || !payload.improvements.is_empty()
                 || payload.candidate_change.is_some()
                 || payload.observations.is_empty()
@@ -2724,6 +3190,75 @@ impl ConfigStore {
                 rejection.get_or_insert_with(|| {
                     "Supervisor learning decision is unsupported or exceeds host bounds".into()
                 });
+            }
+            if !payload.topic_changes.is_empty() && topic_changes_valid {
+                match topic_destination_root {
+                    Some(root) if root.is_absolute() => {
+                        for change in &payload.topic_changes {
+                            let mut sources = Vec::new();
+                            for source_id in &change.source_finding_ids {
+                                match resolve_topic_source(&tx, &binding.project_id, source_id)? {
+                                    Some(source) => sources.push(source),
+                                    None => {
+                                        rejection.get_or_insert_with(|| format!(
+                                            "Topic source Finding `{source_id}` is not a published Finding in this Project"
+                                        ));
+                                    }
+                                }
+                            }
+                            if sources.len() == change.source_finding_ids.len() {
+                                match crate::topic::render(&binding.project_id, change, &sources) {
+                                    Ok(content) => {
+                                        rendered_topic_bytes = rendered_topic_bytes
+                                            .checked_add(content.len())
+                                            .ok_or("Topic batch rendered byte count overflow")?;
+                                        if rendered_topic_bytes
+                                            > crate::topic::MAX_TOPIC_BATCH_DOCUMENT_BYTES
+                                        {
+                                            rejection.get_or_insert_with(|| "Supervisor Topic batch exceeds its rendered byte limit".into());
+                                        }
+                                        let key = crate::topic::TopicKey::parse(&change.topic_key)?;
+                                        let exists: bool = tx.query_row(
+                                            "SELECT EXISTS(SELECT 1 FROM supervisor_topic_publications WHERE project_id=?1 AND topic_key=?2)",
+                                            params![binding.project_id.as_str(), key.as_str()],
+                                            |row| row.get(0),
+                                        ).map_err(|error| error.to_string())?;
+                                        if exists {
+                                            rejection.get_or_insert_with(|| format!(
+                                                "Topic `{}` already has an accepted creation intent", key.as_str()
+                                            ));
+                                        }
+                                        let mut identity_hash = Sha256::new();
+                                        identity_hash.update(b"rex-supervisor-topic-create-v1\0");
+                                        identity_hash
+                                            .update(binding.project_id.as_str().as_bytes());
+                                        identity_hash.update(b"\0");
+                                        identity_hash.update(key.as_str().as_bytes());
+                                        let operation_id =
+                                            format!("topic-{:x}", identity_hash.finalize());
+                                        topic_intents.push(crate::topic::TopicIntent {
+                                            operation_id,
+                                            project_id: binding.project_id.clone(),
+                                            key,
+                                            destination_root: root.to_path_buf(),
+                                            content_digest: crate::topic::content_digest(&content),
+                                            content,
+                                            sources,
+                                        });
+                                    }
+                                    Err(error) => {
+                                        rejection.get_or_insert(error);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        rejection.get_or_insert_with(|| {
+                            "Topic publication requires an absolute host-configured knowledge root".into()
+                        });
+                    }
+                }
             }
             if payload.batch_id != wake.source_id
                 || payload.batch_digest.as_str() != digest
@@ -2767,6 +3302,41 @@ impl ConfigStore {
             payload.ok_or("validated Supervisor result has no typed learning decision")?;
         let canonical = serde_json::to_string(payload).map_err(|e| e.to_string())?;
         tx.execute("INSERT INTO learning_decisions(batch_id,evidence_id,result_digest,decision_json,accepted_at_unix) VALUES (?1,?2,?3,?4,?5)",params![payload.batch_id,result.receipt.evidence_id(),result.validated.result_digest.as_str(),canonical,now_unix]).map_err(|e|e.to_string())?;
+        if topic_intents.len() != payload.topic_changes.len() {
+            return Err("validated Topic proposal count changed before persistence".into());
+        }
+        for intent in topic_intents {
+            let intent_json = super::canonical_json(&intent)?;
+            if intent_json.len() > 1_048_576 || !intent.destination_root.is_absolute() {
+                return Err(
+                    "Supervisor Topic intent exceeds storage bounds or has a relative root".into(),
+                );
+            }
+            let intent_digest = Digest::parse(super::content_digest(&intent_json))?;
+            tx.execute(
+                "INSERT INTO supervisor_topic_publications(operation_id,project_id,topic_key,destination_root,intent_json,intent_digest,state,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,'pending',?7)",
+                params![intent.operation_id,intent.project_id.as_str(),intent.key.as_str(),intent.destination_root.to_string_lossy(),intent_json,intent_digest.as_str(),now_unix],
+            ).map_err(|error| error.to_string())?;
+            let request_json = super::canonical_json(&serde_json::json!({
+                "operation_id": intent.operation_id,
+                "intent_digest": intent_digest.as_str(),
+            }))?;
+            let effect = super::EffectIntent {
+                project_id: intent.project_id.clone(),
+                subject_type: "project".into(),
+                subject_id: intent.project_id.to_string(),
+                operation_id: intent.operation_id.clone(),
+                logical_key: format!("topic-create:{}:{}", intent.project_id, intent.key.as_str()),
+                kind: crate::engine::reducer::effect_name(
+                    &crate::engine::reducer::EffectKind::PublishTopic,
+                )
+                .into(),
+                request_digest: super::content_digest(&request_json),
+                request_json,
+                expected_revision: None,
+            };
+            super::insert_effect(&tx, &effect, now_unix)?;
+        }
         tx.execute("UPDATE learning_batches SET status='completed',completed_at_unix=?2 WHERE batch_id=?1 AND status='issued'",params![payload.batch_id,now_unix]).map_err(|e|e.to_string())?;
         for finding in findings {
             let changed=tx.execute("UPDATE learning_findings SET consumed_batch_id=?2 WHERE finding_id=?1 AND project_id=?3 AND publication_digest=?4 AND ordinal=?5 AND consumed_batch_id IS NULL",params![finding.id.as_str(),payload.batch_id,project,finding.publication_digest.as_str(),finding.ordinal]).map_err(|e|e.to_string())?;
@@ -3577,7 +4147,9 @@ mod tests {
 
     use super::{
         CandidateRegistration, KnowledgePublicationIntent, LEARNING_BATCH_MAX_FINDINGS,
-        LearningCandidateRecord, LearningFinding, StoredTrial, learning_finding_id, migrate_v10,
+        LearningCandidateRecord, LearningFinding, ProjectSupervisorMaintenance, StoredTrial,
+        SupervisorTopicEntry, learning_finding_id, migrate_v10, resolve_topic_source,
+        trim_supervisor_snapshot,
     };
     use crate::config::{AppliedConfig, SourceFile, SourceKind};
     use crate::domain::ids::{
@@ -3608,6 +4180,30 @@ mod tests {
 
     fn digest(byte: char) -> Digest {
         Digest::parse(byte.to_string().repeat(64)).unwrap()
+    }
+
+    #[test]
+    fn oversized_supervisor_topic_context_omits_oldest_with_count() {
+        let mut snapshot = ProjectSupervisorMaintenance {
+            project_id: ProjectId::parse("sample").unwrap(),
+            expired_candidates: 0,
+            knowledge: Vec::new(),
+            topics: (0..5)
+                .map(|index| SupervisorTopicEntry {
+                    topic_key: crate::topic::TopicKey::parse(&format!("topic-{index}")).unwrap(),
+                    content: "x".repeat(60_000),
+                    content_digest: digest('a'),
+                })
+                .collect(),
+            omitted_topics: 0,
+            candidates: Vec::new(),
+        };
+        trim_supervisor_snapshot(&mut snapshot).unwrap();
+        assert_eq!(snapshot.topics.len(), 4);
+        assert_eq!(snapshot.omitted_topics, 1);
+        assert!(
+            serde_json::to_vec(&snapshot).unwrap().len() <= super::MAX_SUPERVISOR_CONTEXT_BYTES
+        );
     }
 
     fn digest_serialized<T: serde::Serialize>(value: &T) -> Digest {
@@ -4261,7 +4857,7 @@ mod tests {
             .unwrap();
         assert_eq!(indexed.0, input.findings[0]);
         assert_eq!(indexed.1, receipt.manifest_digest.as_str());
-        store.connection.execute_batch("DROP TABLE learning_decisions; DROP TABLE learning_findings; DROP TABLE learning_batches; DELETE FROM schema_migrations WHERE version=19; PRAGMA user_version=18;").unwrap();
+        store.connection.execute_batch("DROP TABLE supervisor_topic_publications; DELETE FROM schema_migrations WHERE version=20; DROP TABLE learning_decisions; DROP TABLE learning_findings; DROP TABLE learning_batches; DELETE FROM schema_migrations WHERE version=19; PRAGMA user_version=18;").unwrap();
         drop(store);
         let migrated = ConfigStore::open_test(temp.path()).unwrap();
         let backfilled: String = migrated
@@ -4384,7 +4980,13 @@ mod tests {
             .unwrap();
         assert_eq!(count, 5);
         let supervisor = store
-            .maintain_project_supervisor_learning(generation, &project, "2026-11-08T00:00:00Z", 12)
+            .maintain_project_supervisor_learning(
+                generation,
+                &project,
+                "2026-11-08T00:00:00Z",
+                12,
+                None,
+            )
             .unwrap();
         assert_eq!(supervisor.project_id, project);
         assert_eq!(supervisor.expired_candidates, 0);
@@ -4428,7 +5030,8 @@ mod tests {
                     generation,
                     &[project.clone(), second_project.clone()],
                     100,
-                    3600
+                    3600,
+                    None
                 )
                 .unwrap(),
             Some(project.clone())
@@ -4439,7 +5042,8 @@ mod tests {
                     generation,
                     &[project.clone(), second_project.clone()],
                     101,
-                    3600
+                    3600,
+                    None
                 )
                 .unwrap(),
             Some(second_project.clone())
@@ -4528,7 +5132,8 @@ mod tests {
                     generation,
                     &[project.clone(), second_project.clone()],
                     3700,
-                    3600
+                    3600,
+                    None
                 )
                 .unwrap(),
             None
@@ -4561,6 +5166,7 @@ mod tests {
                     &[project.clone(), second_project.clone()],
                     3701,
                     3600,
+                    None
                 )
                 .unwrap(),
             None
@@ -4580,7 +5186,8 @@ mod tests {
                     generation,
                     std::slice::from_ref(&project),
                     100,
-                    3600
+                    3600,
+                    None
                 )
                 .unwrap(),
             Some(project.clone())
@@ -4648,7 +5255,8 @@ mod tests {
                     generation,
                     std::slice::from_ref(&project),
                     101,
-                    3600
+                    3600,
+                    None
                 )
                 .unwrap(),
             Some(project.clone())
@@ -4702,7 +5310,8 @@ mod tests {
                     generation,
                     std::slice::from_ref(&project),
                     100,
-                    3600
+                    3600,
+                    None
                 )
                 .unwrap(),
             None
@@ -4719,7 +5328,8 @@ mod tests {
                     generation,
                     std::slice::from_ref(&project),
                     101,
-                    3600
+                    3600,
+                    None
                 )
                 .unwrap(),
             Some(project.clone())
@@ -4735,7 +5345,8 @@ mod tests {
                     generation,
                     std::slice::from_ref(&project),
                     102,
-                    3600
+                    3600,
+                    None
                 )
                 .unwrap(),
             None
@@ -4780,6 +5391,24 @@ mod tests {
         maximum_finding: bool,
         claim_override: Option<(bool, bool)>,
     ) -> LearningDispatchFixture {
+        learning_dispatch_fixture_with_topic(
+            assertion,
+            unsupported_proposal,
+            maximum_finding,
+            claim_override,
+            false,
+            None,
+        )
+    }
+
+    fn learning_dispatch_fixture_with_topic(
+        assertion: crate::engine::orchestration::AgentAssertion,
+        unsupported_proposal: bool,
+        maximum_finding: bool,
+        claim_override: Option<(bool, bool)>,
+        create_topic: bool,
+        topic_source_override: Option<Digest>,
+    ) -> LearningDispatchFixture {
         let mut config = test_snapshot();
         let profile_id = ProfileId::parse("fixture-profile").unwrap();
         config.config.projects.insert(
@@ -4803,6 +5432,17 @@ mod tests {
             .unwrap(),
         );
         let (temp, mut store, project, generation, run) = running_store_with_snapshot(&config);
+        if create_topic {
+            config.config.knowledge = Some(crate::config::KnowledgeConfig {
+                format: "okf-0.2".into(),
+                root: temp
+                    .path()
+                    .join("topic-knowledge")
+                    .to_string_lossy()
+                    .into_owned(),
+                max_source_bytes: 1024,
+            });
+        }
         store
             .connection
             .execute(
@@ -4856,7 +5496,12 @@ mod tests {
             .next_due_effect(generation, i64::MAX)
             .unwrap()
             .unwrap();
-        KnowledgeEffectHandler::new(temp.path().join("learning-flow-knowledge"))
+        let knowledge_root = if create_topic {
+            std::path::PathBuf::from(&config.config.knowledge.as_ref().unwrap().root)
+        } else {
+            temp.path().join("learning-flow-knowledge")
+        };
+        KnowledgeEffectHandler::new(knowledge_root.clone())
             .execute(&mut store, generation, &effect)
             .unwrap();
         assert_eq!(
@@ -4866,6 +5511,11 @@ mod tests {
                     std::slice::from_ref(&project),
                     100,
                     3600,
+                    if create_topic {
+                        Some(knowledge_root.as_path())
+                    } else {
+                        None
+                    }
                 )
                 .unwrap(),
             Some(project.clone())
@@ -4883,7 +5533,7 @@ mod tests {
         let batch_id = batch_payload["batch_id"].as_str().unwrap().to_owned();
         let batch_digest = Digest::parse(batch_payload["batch_digest"].as_str().unwrap()).unwrap();
         assert_eq!(batch_payload["findings"].as_array().unwrap().len(), 1);
-        let wake_inputs = pending
+        let wake_inputs: Vec<crate::agent_api::AgentWakeItem> = pending
             .into_iter()
             .map(|wake| crate::agent_api::AgentWakeItem {
                 wake_input_id: wake.wake_input_id,
@@ -4910,16 +5560,54 @@ mod tests {
         } else {
             batch_digest
         };
+        let topic_changes = if create_topic {
+            let finding_id = topic_source_override.unwrap_or(
+                Digest::parse(
+                    batch_payload["findings"][0]["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                )
+                .unwrap(),
+            );
+            vec![crate::topic::TopicChange {
+                topic_key: "safe-replay".into(),
+                title: "Replay only the accepted bytes".into(),
+                summary: "An effect retry may publish only the exact immutable Topic document."
+                    .into(),
+                claims: vec![
+                    "Create-only publication preserves an unexpected existing target.".into(),
+                ],
+                applicability: "Use when retrying generated knowledge publication.".into(),
+                proposed_check: "Compare the saved content digest and preserve any mismatch."
+                    .into(),
+                counterexamples: vec![
+                    "A manual edit at the same path must remain unchanged.".into(),
+                ],
+                source_finding_ids: vec![finding_id],
+                expected_prior_digest: None,
+            }]
+        } else if unsupported_proposal {
+            vec![crate::topic::TopicChange {
+                topic_key: "topic-update".into(),
+                title: "Updated topic".into(),
+                summary: "Unsupported revision fixture.".into(),
+                claims: vec!["A revision is not yet supported.".into()],
+                applicability: "Fixture only.".into(),
+                proposed_check: "Remain rejected.".into(),
+                counterexamples: Vec::new(),
+                source_finding_ids: vec![Digest::parse("c".repeat(64)).unwrap()],
+                expected_prior_digest: Some(Digest::parse("d".repeat(64)).unwrap()),
+            }]
+        } else {
+            Vec::new()
+        };
         let decision_payload = crate::engine::orchestration::LearningDecisionPayload {
             batch_id: claimed_batch_id,
             batch_digest: claimed_batch_digest,
             config_revision,
             observations: vec!["The Finding is stable and reproducible.".into()],
-            topic_changes: if unsupported_proposal {
-                vec!["topic update proposal".into()]
-            } else {
-                Vec::new()
-            },
+            topic_changes,
             checkpoint: checkpoint.clone(),
             improvements: Vec::new(),
             candidate_change: None,
@@ -4933,6 +5621,41 @@ mod tests {
             result_digest: None,
             artifact_refs: Vec::new(),
         };
+        let message = if create_topic {
+            let schema = crate::roles::result_schema(crate::domain::types::Role::Supervisor);
+            let encoded_message = serde_json::to_string(&message).unwrap();
+            let final_response = [
+                serde_json::json!({"type":"thread.started","thread_id":"topic-thread-1"}),
+                serde_json::json!({"type":"item.completed","item":{"type":"agent_message","text":serde_json::to_string(&serde_json::json!({"result": encoded_message})).unwrap()}}),
+                serde_json::json!({"type":"turn.completed"}),
+            ].iter().map(serde_json::Value::to_string).collect::<Vec<_>>().join("\n");
+            let (_, parsed) = crate::providers::parse_result(
+                crate::domain::types::AgentAdapter::Codex,
+                final_response.as_bytes(),
+                &schema,
+            )
+            .unwrap();
+            serde_json::from_value(parsed).unwrap()
+        } else {
+            message
+        };
+        if create_topic {
+            let inbox_root = temp.path().join("topic-inbox");
+            fs::create_dir(&inbox_root).unwrap();
+            let mut snapshot = crate::agent_api::AgentWakeSnapshot {
+                schema_version: 1,
+                project_id: project.clone(),
+                role_session_id: format!("project:{}:supervisor", project.as_str()),
+                agent_run_id: "learning-flow-agent".into(),
+                digest: Digest::parse("0".repeat(64)).unwrap(),
+                inputs: wake_inputs.clone(),
+                worker_correction_context: None,
+            };
+            crate::agent_api::publish_wake_snapshot(&inbox_root, snapshot.clone()).unwrap();
+            let read = crate::agent_api::read_inbox(&inbox_root, "learning-flow-agent", 0).unwrap();
+            assert_eq!(read, wake_inputs);
+            assert!(snapshot.serialized_bytes().unwrap().len() < crate::agent_api::MAX_INBOX_BYTES);
+        }
         let canonical_root = fs::canonicalize(temp.path()).unwrap();
         let result = crate::store::agent_results::host_validation_fixture::host_validated_supervisor_result_in_with_wake_inputs(
             &mut store,
@@ -5141,6 +5864,1106 @@ mod tests {
             serde_json::from_str::<BTreeMap<String, String>>(&checkpoint_json).unwrap(),
             checkpoint
         );
+    }
+
+    #[test]
+    fn typed_topic_runs_from_provider_result_through_effect_into_next_batch() {
+        let fixture = learning_dispatch_fixture_with_topic(
+            crate::engine::orchestration::AgentAssertion::Succeeded,
+            false,
+            false,
+            None,
+            true,
+            None,
+        );
+        let LearningDispatchFixture {
+            _temp,
+            mut store,
+            project,
+            generation,
+            batch_id: _,
+            result,
+            config,
+            config_digest,
+            checkpoint: _,
+        } = fixture;
+        let root = std::path::PathBuf::from(&config.knowledge.as_ref().unwrap().root);
+
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_with_topic_root_for_test(
+                &mut store,
+                generation,
+                101,
+                &config,
+                config_digest,
+                &result,
+                Some(root.clone()),
+            )
+            .unwrap()
+        );
+        let operation_id: String = store
+            .connection
+            .query_row(
+                "SELECT operation_id FROM supervisor_topic_publications WHERE project_id=?1",
+                [project.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let effect: String = store
+            .connection
+            .query_row(
+                "SELECT kind FROM effects WHERE operation_id=?1",
+                [&operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(effect, "publish_topic");
+        let operation = OperationId::parse(operation_id.clone()).unwrap();
+        let intent = store.supervisor_topic_intent(&operation).unwrap().unwrap();
+        crate::topic::publish_create_only(&intent).unwrap();
+        assert!(
+            store
+                .supervisor_topic_receipt(&operation)
+                .unwrap()
+                .is_none()
+        );
+        let handler = crate::topic_effect::TopicEffectHandler::new(root.clone());
+        let limits = crate::effects::EffectLimits {
+            max_attempts: 3,
+            max_age: std::time::Duration::from_secs(3600),
+            retry_base: std::time::Duration::from_secs(1),
+            retry_max: std::time::Duration::from_secs(8),
+        };
+        let tick = crate::effects::EffectDispatcher::tick(
+            &mut store,
+            generation,
+            102,
+            &[&handler],
+            limits,
+        )
+        .unwrap();
+        assert!(matches!(
+            tick,
+            crate::effects::DispatchTick::Completed { .. }
+        ));
+        let (state, content, content_digest): (String, String, String) = store.connection.query_row(
+            "SELECT state,intent_json,intent_digest FROM supervisor_topic_publications WHERE operation_id=?1",
+            [&operation_id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(state, "published");
+        let intent: crate::topic::TopicIntent =
+            crate::protocol::parse_unique(content.as_bytes()).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(content.as_bytes())),
+            content_digest
+        );
+        let effect = store
+            .effect_by_logical_key(&format!("topic-create:{}:{}", project, intent.key.as_str()))
+            .unwrap()
+            .unwrap();
+        let durable_effect_receipt: String = store
+            .connection
+            .query_row(
+                "SELECT receipt_json FROM effects WHERE operation_id=?1",
+                [&operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let replayed_receipt = handler.execute(&mut store, generation, &effect).unwrap();
+        let durable_receipt: crate::topic::TopicReceipt =
+            crate::protocol::parse_unique(durable_effect_receipt.as_bytes()).unwrap();
+        assert_eq!(replayed_receipt, durable_receipt);
+        let file = root.join(format!(
+            "projects/{}/topics/{}.md",
+            project,
+            intent.key.as_str()
+        ));
+        assert_eq!(std::fs::read(&file).unwrap(), intent.content.as_bytes());
+        let run_hash = format!(
+            "{:x}",
+            Sha256::digest(intent.sources[0].ticket_run_id.as_bytes())
+        );
+        let source_file = root.join(format!("projects/{}/postmortems/{run_hash}.md", project));
+        let source_bytes = std::fs::read(&source_file).unwrap();
+        assert!(
+            intent
+                .content
+                .contains(&format!("../postmortems/{run_hash}.md")),
+            "rendered Topic omitted its source resource link: {}",
+            intent.content
+        );
+        assert_eq!(
+            file.parent()
+                .unwrap()
+                .join(format!("../postmortems/{run_hash}.md"))
+                .canonicalize()
+                .unwrap(),
+            source_file.canonicalize().unwrap()
+        );
+        assert!(
+            intent
+                .content
+                .contains(intent.sources[0].finding_id.as_str())
+        );
+        assert!(
+            intent
+                .content
+                .contains(intent.sources[0].publication_digest.as_str())
+        );
+        assert!(
+            String::from_utf8_lossy(&source_bytes)
+                .contains("A published Finding reaches a durable Supervisor decision\\.")
+        );
+        let ack: String = store
+            .connection
+            .query_row(
+                "SELECT disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                [result.receipt.evidence_id()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ack, "applied");
+        let tx = store.connection.transaction().unwrap();
+        let consumed_source =
+            resolve_topic_source(&tx, &project, &intent.sources[0].finding_id).unwrap();
+        assert!(
+            consumed_source.is_some(),
+            "published Finding provenance remains usable after its learning batch is consumed"
+        );
+        tx.commit().unwrap();
+
+        assert_eq!(
+            store
+                .queue_due_supervisor_learning(
+                    generation,
+                    std::slice::from_ref(&project),
+                    4000,
+                    3600,
+                    Some(root.as_path())
+                )
+                .unwrap(),
+            Some(project.clone())
+        );
+        let wakes = store
+            .pending_role_wake_inputs(
+                &project,
+                &format!("project:{}:supervisor", project.as_str()),
+                16,
+            )
+            .unwrap();
+        let next = wakes
+            .iter()
+            .find(|wake| wake.source_type == "learning_batch")
+            .unwrap();
+        let topics = next.payload_json["maintenance"]["topics"]
+            .as_array()
+            .unwrap();
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0]["content"], intent.content);
+        assert_eq!(topics[0]["content_digest"], intent.content_digest.as_str());
+        let changed_root = _temp.path().join("changed-knowledge-root");
+        let changed_destination = store
+            .maintain_project_supervisor_learning(
+                generation,
+                &project,
+                "2026-11-08T00:00:00Z",
+                12,
+                Some(&changed_root),
+            )
+            .unwrap();
+        assert!(
+            changed_destination.topics.is_empty(),
+            "a snapshot for a new knowledge root must exclude Topics published under the old root"
+        );
+        assert_eq!(changed_destination.omitted_topics, 0);
+        store
+            .connection
+            .execute(
+                "UPDATE supervisor_topic_publications SET destination_root=?2 WHERE project_id=?1",
+                params![project.as_str(), changed_root.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        assert!(
+            store
+                .maintain_project_supervisor_learning(
+                    generation,
+                    &project,
+                    "2026-11-08T00:00:00Z",
+                    12,
+                    Some(&changed_root),
+                )
+                .is_err()
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE supervisor_topic_publications SET destination_root=?2 WHERE project_id=?1",
+                params![project.as_str(), root.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+
+        drop(store);
+        let reopened = ConfigStore::open_test(_temp.path()).unwrap();
+        assert!(
+            reopened
+                .supervisor_topic_receipt(&operation)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn consumed_finding_can_source_a_later_accepted_topic_decision() {
+        let fixture = learning_dispatch_fixture_with_topic(
+            crate::engine::orchestration::AgentAssertion::Succeeded,
+            false,
+            false,
+            None,
+            true,
+            None,
+        );
+        let LearningDispatchFixture {
+            _temp,
+            mut store,
+            project,
+            generation,
+            batch_id: first_batch_id,
+            result: first_result,
+            config,
+            config_digest,
+            ..
+        } = fixture;
+        let root = std::path::PathBuf::from(&config.knowledge.as_ref().unwrap().root);
+        crate::engine::factory_runtime::tests::apply_agent_result_with_topic_root_for_test(
+            &mut store,
+            generation,
+            101,
+            &config,
+            config_digest.clone(),
+            &first_result,
+            Some(root.clone()),
+        )
+        .unwrap();
+        let first_intent_json: String = store
+            .connection
+            .query_row(
+                "SELECT intent_json FROM supervisor_topic_publications WHERE project_id=?1",
+                [project.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let first_intent: crate::topic::TopicIntent =
+            crate::protocol::parse_unique(first_intent_json.as_bytes()).unwrap();
+        let consumed_source = first_intent.sources[0].finding_id.clone();
+        let old_consumed: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT consumed_batch_id FROM learning_findings WHERE finding_id=?1",
+                [consumed_source.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_consumed.as_deref(), Some(first_batch_id.as_str()));
+
+        assert_eq!(
+            store
+                .queue_due_supervisor_learning(
+                    generation,
+                    std::slice::from_ref(&project),
+                    4000,
+                    3600,
+                    None
+                )
+                .unwrap(),
+            Some(project.clone())
+        );
+        let session = format!("project:{}:supervisor", project.as_str());
+        let pending = store
+            .pending_role_wake_inputs(&project, &session, 16)
+            .unwrap();
+        let batch_wake = pending
+            .iter()
+            .find(|wake| wake.source_type == "learning_batch")
+            .unwrap();
+        let batch_payload = batch_wake.payload_json.clone();
+        let second_batch_id = batch_payload["batch_id"].as_str().unwrap().to_owned();
+        assert_ne!(second_batch_id, first_batch_id);
+        let second_wakes = pending
+            .into_iter()
+            .map(|wake| crate::agent_api::AgentWakeItem {
+                wake_input_id: wake.wake_input_id,
+                source_type: wake.source_type,
+                source_id: wake.source_id,
+                source_revision: wake.source_revision,
+                priority: wake.priority,
+                payload_json: wake.payload_json,
+                host_artifact_source_evidence_ids: Vec::new(),
+                host_artifacts: Vec::new(),
+                host_completion_context: None,
+            })
+            .collect();
+        let project_state = store.project(&project).unwrap().unwrap();
+        let second_payload = crate::engine::orchestration::LearningDecisionPayload {
+            batch_id: second_batch_id.clone(),
+            batch_digest: Digest::parse(batch_payload["batch_digest"].as_str().unwrap()).unwrap(),
+            config_revision: project_state.config_revision,
+            observations: vec![
+                "A previously consumed Finding remains valid source evidence.".into(),
+            ],
+            topic_changes: vec![crate::topic::TopicChange {
+                topic_key: "later-consumed-source".into(),
+                title: "Use durable consumed evidence".into(),
+                summary: "A later decision can cite a Finding consumed by an earlier batch.".into(),
+                claims: vec!["Consumption records which batch used a Finding.".into()],
+                applicability: "Use when a later Topic depends on prior published evidence.".into(),
+                proposed_check: "Resolve the Finding by its published provenance.".into(),
+                counterexamples: Vec::new(),
+                source_finding_ids: vec![consumed_source.clone()],
+                expected_prior_digest: None,
+            }],
+            checkpoint: BTreeMap::new(),
+            improvements: Vec::new(),
+            candidate_change: None,
+        };
+        let message = crate::roles::RoleResultMessage {
+            schema_version: 1,
+            message_id: "later-consumed-source-result".into(),
+            kind: crate::engine::orchestration::RoleOutputKind::LearningDecision,
+            assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+            structured_result: serde_json::to_value(second_payload).unwrap(),
+            result_digest: None,
+            artifact_refs: Vec::new(),
+        };
+        let second_result = crate::store::agent_results::host_validation_fixture::host_validated_supervisor_result_in_with_wake_inputs(
+            &mut store,
+            &std::fs::canonicalize(_temp.path()).unwrap(),
+            generation,
+            project.clone(),
+            message,
+            crate::domain::ids::AgentRunId::parse("later-consumed-source-agent").unwrap(),
+            second_wakes,
+        ).unwrap().ingested;
+        crate::engine::factory_runtime::tests::apply_agent_result_with_topic_root_for_test(
+            &mut store,
+            generation,
+            4001,
+            &config,
+            config_digest,
+            &second_result,
+            Some(root),
+        )
+        .unwrap();
+
+        assert_eq!(
+            store
+                .connection
+                .query_row::<String, _, _>(
+                    "SELECT disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                    [second_result.receipt.evidence_id()],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            "applied"
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<String, _, _>(
+                    "SELECT status FROM learning_batches WHERE batch_id=?1",
+                    [&second_batch_id],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            "completed"
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<String, _, _>(
+                    "SELECT consumed_batch_id FROM learning_findings WHERE finding_id=?1",
+                    [consumed_source.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            first_batch_id
+        );
+        let second_intent_json: String = store.connection.query_row(
+            "SELECT intent_json FROM supervisor_topic_publications WHERE project_id=?1 AND topic_key='later-consumed-source'",
+            [project.as_str()], |row| row.get(0),
+        ).unwrap();
+        let second_intent: crate::topic::TopicIntent =
+            crate::protocol::parse_unique(second_intent_json.as_bytes()).unwrap();
+        assert_eq!(
+            second_intent
+                .sources
+                .iter()
+                .map(|source| source.finding_id.clone())
+                .collect::<Vec<_>>(),
+            vec![consumed_source]
+        );
+        assert_eq!(store.connection.query_row::<i64, _, _>(
+            "SELECT count(*) FROM learning_findings WHERE project_id=?1 AND consumed_batch_id=?2",
+            rusqlite::params![project.as_str(), second_batch_id], |row| row.get(0),
+        ).unwrap(), batch_payload["findings"].as_array().unwrap().len() as i64);
+    }
+
+    #[test]
+    fn foreign_topic_source_is_rejected_without_consuming_findings_or_creating_intent() {
+        let fixture = learning_dispatch_fixture_with_topic(
+            crate::engine::orchestration::AgentAssertion::Succeeded,
+            false,
+            false,
+            None,
+            true,
+            Some(digest('e')),
+        );
+        let LearningDispatchFixture {
+            _temp: _,
+            mut store,
+            project,
+            generation,
+            batch_id,
+            mut result,
+            config,
+            config_digest,
+            checkpoint: _,
+        } = fixture;
+        let root = std::path::PathBuf::from(&config.knowledge.as_ref().unwrap().root);
+        let mut foreign_project = store.project(&project).unwrap().unwrap();
+        foreign_project.id = ProjectId::parse("foreign").unwrap();
+        foreign_project.desired_lifecycle = "stopped".into();
+        store.insert_project(&foreign_project).unwrap();
+        let foreign_run = TicketRunId::parse("foreign-1-g1").unwrap();
+        store
+            .create_ticket_run(
+                generation,
+                &foreign_project.id,
+                &TicketNamespace::parse("github:org/foreign").unwrap(),
+                &TicketId::parse("1").unwrap(),
+                &foreign_run,
+                1,
+                "postmortem",
+                "In Progress",
+            )
+            .unwrap();
+        let foreign_input = PostmortemInput {
+            operation_id: OperationId::parse("foreign-learning-publication").unwrap(),
+            project_id: foreign_project.id.clone(),
+            ticket_run_id: foreign_run.clone(),
+            title: "Foreign learning fixture".into(),
+            summary: "A valid published foreign source.".into(),
+            findings: vec!["This Finding is published for another Project.".into()],
+            sources: vec![],
+            generated_at: "2026-11-07T00:00:00Z".into(),
+            max_source_bytes: 1024,
+        };
+        let request_json = serde_json::to_string(&foreign_input).unwrap();
+        let foreign_intent = KnowledgePublicationIntent {
+            operation_id: foreign_input.operation_id.clone(),
+            project_id: foreign_input.project_id.clone(),
+            ticket_run_id: foreign_run,
+            request_digest: Digest::parse(format!("{:x}", Sha256::digest(request_json.as_bytes())))
+                .unwrap(),
+            request_json,
+        };
+        store
+            .prepare_knowledge_publication(generation, &foreign_intent)
+            .unwrap();
+        let foreign_effect = store
+            .next_due_effect(generation, i64::MAX)
+            .unwrap()
+            .unwrap();
+        KnowledgeEffectHandler::new(root.clone())
+            .execute(&mut store, generation, &foreign_effect)
+            .unwrap();
+        let foreign_finding: String = store
+            .connection
+            .query_row(
+                "SELECT finding_id FROM learning_findings WHERE project_id=?1",
+                [foreign_project.id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let tx = store.connection.transaction().unwrap();
+        assert!(
+            resolve_topic_source(
+                &tx,
+                &foreign_project.id,
+                &Digest::parse(foreign_finding.clone()).unwrap()
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            resolve_topic_source(
+                &tx,
+                &project,
+                &Digest::parse(foreign_finding.clone()).unwrap()
+            )
+            .unwrap()
+            .is_none()
+        );
+        tx.commit().unwrap();
+        let mut decision: crate::engine::orchestration::LearningDecisionPayload =
+            serde_json::from_value(result.validated.structured_result.clone()).unwrap();
+        decision.topic_changes[0].source_finding_ids =
+            vec![Digest::parse(foreign_finding).unwrap()];
+        result.validated.structured_result = serde_json::to_value(&decision).unwrap();
+        result.validated.typed_payload =
+            crate::engine::orchestration::RoleResultPayload::LearningDecision(decision);
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_with_topic_root_for_test(
+                &mut store,
+                generation,
+                101,
+                &config,
+                config_digest,
+                &result,
+                Some(root),
+            )
+            .unwrap()
+        );
+        let disposition: String = store
+            .connection
+            .query_row(
+                "SELECT disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                [result.receipt.evidence_id()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(disposition, "rejected_by_host");
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM supervisor_topic_publications WHERE project_id=?1",
+                    [project.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.connection.query_row::<i64,_,_>(
+            "SELECT count(*) FROM learning_findings WHERE project_id=?1 AND consumed_batch_id=?2",
+            rusqlite::params![project.as_str(),batch_id], |row| row.get(0),
+        ).unwrap(), 0);
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM learning_decisions WHERE batch_id=?1",
+                    [&batch_id],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            0
+        );
+        let tx = store.connection.transaction().unwrap();
+        assert!(
+            resolve_topic_source(&tx, &project, &digest('c'))
+                .unwrap()
+                .is_none()
+        );
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn invalid_topic_changes_skip_source_resolution() {
+        let fixture = learning_dispatch_fixture_with_topic(
+            crate::engine::orchestration::AgentAssertion::Succeeded,
+            false,
+            false,
+            None,
+            true,
+            None,
+        );
+        let LearningDispatchFixture {
+            _temp: _,
+            mut store,
+            project,
+            generation,
+            mut result,
+            config,
+            config_digest,
+            batch_id,
+            checkpoint: _,
+        } = fixture;
+        let root = std::path::PathBuf::from(&config.knowledge.as_ref().unwrap().root);
+        let mut decision: crate::engine::orchestration::LearningDecisionPayload =
+            serde_json::from_value(result.validated.structured_result.clone()).unwrap();
+        let source_id = decision.topic_changes[0].source_finding_ids[0].clone();
+        let ticket_run_id: String = store
+            .connection
+            .query_row(
+                "SELECT ticket_run_id FROM learning_findings WHERE project_id=?1 AND finding_id=?2",
+                params![project.as_str(), source_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE knowledge_publications SET request_digest=?3 WHERE project_id=?1 AND ticket_run_id=?2",
+                params![project.as_str(), ticket_run_id, "0".repeat(64)],
+            )
+            .unwrap();
+
+        decision
+            .topic_changes
+            .push(decision.topic_changes[0].clone());
+        result.validated.structured_result = serde_json::to_value(&decision).unwrap();
+        result.validated.typed_payload =
+            crate::engine::orchestration::RoleResultPayload::LearningDecision(decision);
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_with_topic_root_for_test(
+                &mut store,
+                generation,
+                101,
+                &config,
+                config_digest,
+                &result,
+                Some(root),
+            )
+            .unwrap()
+        );
+        let disposition: String = store
+            .connection
+            .query_row(
+                "SELECT disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                [result.receipt.evidence_id()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(disposition, "rejected_by_host");
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM supervisor_topic_publications WHERE project_id=?1",
+                    [project.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM learning_decisions WHERE batch_id=?1",
+                    [&batch_id],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn failed_topic_ack_rolls_back_decision_finding_consumption_intent_and_outbox() {
+        let fixture = learning_dispatch_fixture_with_topic(
+            crate::engine::orchestration::AgentAssertion::Succeeded,
+            false,
+            false,
+            None,
+            true,
+            None,
+        );
+        let LearningDispatchFixture {
+            _temp: _,
+            mut store,
+            project,
+            generation,
+            batch_id,
+            result,
+            config,
+            config_digest,
+            checkpoint: _,
+        } = fixture;
+        let root = std::path::PathBuf::from(&config.knowledge.as_ref().unwrap().root);
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_topic_ack BEFORE INSERT ON agent_result_reducer_ack
+             BEGIN SELECT RAISE(ABORT, 'fixture rejects Topic result ACK'); END;",
+            )
+            .unwrap();
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_with_topic_root_for_test(
+                &mut store,
+                generation,
+                101,
+                &config,
+                config_digest,
+                &result,
+                Some(root),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM supervisor_topic_publications WHERE project_id=?1",
+                    [project.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM effects WHERE kind='publish_topic' AND project_id=?1",
+                    [project.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM learning_decisions WHERE batch_id=?1",
+                    [&batch_id],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.connection.query_row::<i64,_,_>(
+            "SELECT count(*) FROM learning_findings WHERE project_id=?1 AND consumed_batch_id=?2",
+            rusqlite::params![project.as_str(),batch_id], |row| row.get(0),
+        ).unwrap(), 0);
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                    [result.receipt.evidence_id()],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn existing_pending_topic_key_is_reserved_and_new_proposal_rejected() {
+        let fixture = learning_dispatch_fixture_with_topic(
+            crate::engine::orchestration::AgentAssertion::Succeeded,
+            false,
+            false,
+            None,
+            true,
+            None,
+        );
+        let LearningDispatchFixture {
+            _temp: _,
+            mut store,
+            project,
+            generation,
+            batch_id,
+            result,
+            config,
+            config_digest,
+            checkpoint: _,
+        } = fixture;
+        let root = std::path::PathBuf::from(&config.knowledge.as_ref().unwrap().root);
+        store.connection.execute(
+            "INSERT INTO supervisor_topic_publications(operation_id,project_id,topic_key,destination_root,intent_json,intent_digest,state,created_at_unix) VALUES ('pending-existing',?1,'safe-replay',?2,'{}',?3,'pending',99)",
+            rusqlite::params![project.as_str(),root.to_string_lossy(),"0".repeat(64)],
+        ).unwrap();
+        crate::engine::factory_runtime::tests::apply_agent_result_with_topic_root_for_test(
+            &mut store,
+            generation,
+            101,
+            &config,
+            config_digest,
+            &result,
+            Some(root),
+        )
+        .unwrap();
+        let disposition: String = store
+            .connection
+            .query_row(
+                "SELECT disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                [result.receipt.evidence_id()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(disposition, "rejected_by_host");
+        assert_eq!(store.connection.query_row::<i64,_,_>(
+            "SELECT count(*) FROM supervisor_topic_publications WHERE project_id=?1 AND topic_key='safe-replay'",
+            [project.as_str()], |row| row.get(0),
+        ).unwrap(), 1);
+        assert_eq!(store.connection.query_row::<i64,_,_>(
+            "SELECT count(*) FROM learning_findings WHERE project_id=?1 AND consumed_batch_id=?2",
+            rusqlite::params![project.as_str(),batch_id], |row| row.get(0),
+        ).unwrap(), 0);
+    }
+
+    #[test]
+    fn changed_topic_destination_is_a_durable_rejection() {
+        let fixture = learning_dispatch_fixture_with_topic(
+            crate::engine::orchestration::AgentAssertion::Succeeded,
+            false,
+            false,
+            None,
+            true,
+            None,
+        );
+        let LearningDispatchFixture {
+            _temp: _,
+            mut store,
+            project,
+            generation,
+            result,
+            config,
+            config_digest,
+            batch_id: _,
+            checkpoint: _,
+        } = fixture;
+        let root = std::path::PathBuf::from(&config.knowledge.as_ref().unwrap().root);
+        crate::engine::factory_runtime::tests::apply_agent_result_with_topic_root_for_test(
+            &mut store,
+            generation,
+            101,
+            &config,
+            config_digest,
+            &result,
+            Some(root.clone()),
+        )
+        .unwrap();
+        let operation_id: String = store
+            .connection
+            .query_row(
+                "SELECT operation_id FROM supervisor_topic_publications WHERE project_id=?1",
+                [project.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| {
+                panic!("Topic intent must be accepted before its effect is dispatched")
+            });
+        let operation = OperationId::parse(operation_id.clone()).unwrap();
+        let handler = crate::topic_effect::TopicEffectHandler::new(root.with_extension("changed"));
+        let limits = crate::effects::EffectLimits {
+            max_attempts: 3,
+            max_age: std::time::Duration::from_secs(3600),
+            retry_base: std::time::Duration::from_secs(1),
+            retry_max: std::time::Duration::from_secs(8),
+        };
+        let tick = crate::effects::EffectDispatcher::tick(
+            &mut store,
+            generation,
+            102,
+            &[&handler],
+            limits,
+        )
+        .unwrap();
+        assert!(matches!(
+            tick,
+            crate::effects::DispatchTick::Completed { .. }
+        ));
+        let state: String = store
+            .connection
+            .query_row(
+                "SELECT state FROM supervisor_topic_publications WHERE operation_id=?1",
+                [&operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "conflict");
+        assert!(
+            store
+                .supervisor_topic_receipt(&operation)
+                .unwrap()
+                .is_none()
+        );
+        let status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM effects WHERE operation_id=?1",
+                [&operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+        assert!(
+            !root
+                .join(format!("projects/{}/topics/safe-replay.md", project))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn unexpected_existing_topic_file_is_preserved_and_durably_rejected() {
+        let fixture = learning_dispatch_fixture_with_topic(
+            crate::engine::orchestration::AgentAssertion::Succeeded,
+            false,
+            false,
+            None,
+            true,
+            None,
+        );
+        let LearningDispatchFixture {
+            _temp: temp,
+            mut store,
+            project,
+            generation,
+            result,
+            config,
+            config_digest,
+            batch_id: _,
+            checkpoint: _,
+        } = fixture;
+        let root = std::path::PathBuf::from(&config.knowledge.as_ref().unwrap().root);
+        crate::engine::factory_runtime::tests::apply_agent_result_with_topic_root_for_test(
+            &mut store,
+            generation,
+            101,
+            &config,
+            config_digest,
+            &result,
+            Some(root.clone()),
+        )
+        .unwrap();
+        let target = root.join(format!("projects/{}/topics/safe-replay.md", project));
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"human-owned contents").unwrap();
+        let operation_id: String = store
+            .connection
+            .query_row(
+                "SELECT operation_id FROM supervisor_topic_publications WHERE project_id=?1",
+                [project.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| {
+                panic!("Topic intent must be accepted before its effect is dispatched")
+            });
+        let handler = crate::topic_effect::TopicEffectHandler::new(root.clone());
+        let effect = store
+            .next_due_effect(generation, i64::MAX)
+            .unwrap()
+            .unwrap();
+        let request = crate::effects::EffectRequest {
+            intent: effect,
+            attempt_count: 1,
+            created_at_unix: 101,
+        };
+        let first_observation = {
+            let mut context = crate::effects::EffectContext {
+                store: &mut store,
+                owner_generation: generation,
+                now_unix: 102,
+            };
+            crate::effects::EffectHandler::handle(
+                &handler,
+                crate::effects::EffectMode::Submit,
+                &request,
+                &mut context,
+            )
+            .unwrap()
+        };
+        let crate::effects::EffectObservation::Rejected {
+            receipt: first_receipt,
+        } = first_observation
+        else {
+            panic!("conflicting Topic must be durably rejected");
+        };
+        let state: String = store
+            .connection
+            .query_row(
+                "SELECT state FROM supervisor_topic_publications WHERE operation_id=?1",
+                [&operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "conflict");
+        drop(store);
+        fs::remove_file(&target).unwrap();
+        let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let generation = store
+            .start_owner(&crate::store::OwnerMetadata {
+                owner_nonce: "topic-conflict-replay".into(),
+                state_root: temp.path().display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "test-restart".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let replayed_observation = {
+            let mut context = crate::effects::EffectContext {
+                store: &mut store,
+                owner_generation: generation,
+                now_unix: 103,
+            };
+            crate::effects::EffectHandler::handle(
+                &handler,
+                crate::effects::EffectMode::Submit,
+                &request,
+                &mut context,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            replayed_observation,
+            crate::effects::EffectObservation::Rejected {
+                receipt: first_receipt
+            }
+        );
+        assert!(
+            !target.exists(),
+            "a saved conflict must not republish after the conflicting file is removed"
+        );
+        let limits = crate::effects::EffectLimits {
+            max_attempts: 3,
+            max_age: std::time::Duration::from_secs(3600),
+            retry_base: std::time::Duration::from_secs(1),
+            retry_max: std::time::Duration::from_secs(8),
+        };
+        let tick = crate::effects::EffectDispatcher::tick(
+            &mut store,
+            generation,
+            103,
+            &[&handler],
+            limits,
+        )
+        .unwrap();
+        assert!(matches!(
+            tick,
+            crate::effects::DispatchTick::Completed { .. }
+        ));
+        assert!(
+            !target.exists(),
+            "dispatcher replay must terminally reject without republishing"
+        );
+        let state: String = store
+            .connection
+            .query_row(
+                "SELECT state FROM supervisor_topic_publications WHERE operation_id=?1",
+                [&operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "conflict");
+        let status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM effects WHERE operation_id=?1",
+                [&operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
     }
 
     #[test]
@@ -5624,6 +7447,7 @@ mod tests {
                     &[project.clone(), second_project.clone()],
                     201,
                     3600,
+                    None
                 )
                 .unwrap(),
             Some(second_project)

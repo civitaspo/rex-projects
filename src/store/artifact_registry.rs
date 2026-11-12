@@ -313,7 +313,7 @@ pub(crate) fn validate_v12_schema(connection: &Connection) -> Result<(), String>
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if !matches!(version, 12..=19) {
+    if !(12..=crate::store::SCHEMA_VERSION).contains(&version) {
         return Err(format!(
             "artifact registry schema version mismatch: {version}"
         ));
@@ -425,7 +425,7 @@ pub fn validate_v13_schema(connection: &Connection) -> Result<(), String> {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if !matches!(version, 13..=19) {
+    if !(13..=crate::store::SCHEMA_VERSION).contains(&version) {
         return Err(format!(
             "Agent block lifecycle schema version mismatch: {version}"
         ));
@@ -502,7 +502,7 @@ pub fn validate_v14_schema(connection: &Connection) -> Result<(), String> {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if !matches!(version, 14..=19) {
+    if !(14..=crate::store::SCHEMA_VERSION).contains(&version) {
         return Err(format!(
             "process evidence schema version mismatch: {version}"
         ));
@@ -1754,6 +1754,8 @@ mod tests {
                  DROP TABLE learning_decisions;
                  DROP TABLE learning_findings;
                  DROP TABLE learning_batches;
+                 DROP TABLE supervisor_topic_publications;
+                 DELETE FROM schema_migrations WHERE version=20;
                  DELETE FROM schema_migrations WHERE version=19;
                  DROP TRIGGER agent_launch_phase_transitions;
                  CREATE TEMP TABLE saved_agent_launch_reservations AS

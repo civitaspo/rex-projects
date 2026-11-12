@@ -745,7 +745,7 @@ pub(crate) fn validate_v18_schema(connection: &Connection) -> Result<(), String>
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if !(18..=19).contains(&version) {
+    if !(18..=crate::store::SCHEMA_VERSION).contains(&version) {
         return Err(format!(
             "Agent launch phase schema version mismatch: {version}"
         ));
@@ -776,7 +776,7 @@ mod tests {
     fn schema_18_adds_conservative_launch_phase_and_monotonic_transitions() {
         let state = tempfile::tempdir().unwrap();
         let store = crate::store::ConfigStore::open_test(state.path()).unwrap();
-        assert_eq!(crate::store::SCHEMA_VERSION, 19);
+        assert_eq!(crate::store::SCHEMA_VERSION, 20);
         validate_v18_schema(&store.connection).unwrap();
         let legacy_default: String = store
             .connection
@@ -807,6 +807,8 @@ mod tests {
              DROP TABLE learning_decisions;
              DROP TABLE learning_findings;
              DROP TABLE learning_batches;
+             DROP TABLE supervisor_topic_publications;
+             DELETE FROM schema_migrations WHERE version=20;
              DELETE FROM schema_migrations WHERE version=19;
              ALTER TABLE agent_launch_reservations DROP COLUMN launch_phase;
              DELETE FROM schema_migrations WHERE version=18;
