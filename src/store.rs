@@ -38,7 +38,7 @@ pub(crate) mod provider_qualification;
 #[path = "store/rex_view_tables.rs"]
 pub(crate) mod rex_view_tables;
 
-pub const SCHEMA_VERSION: i64 = 19;
+pub const SCHEMA_VERSION: i64 = 20;
 #[path = "store/accepted_plans.rs"]
 pub mod accepted_plans;
 pub mod agent_runtime;
@@ -622,7 +622,7 @@ impl ConfigStore {
             artifact_registry::validate_v12_schema(&connection)?;
             artifact_registry::validate_v13_schema(&connection)?;
         }
-        if matches!(existing_version, 14..=19) {
+        if (14..=SCHEMA_VERSION).contains(&existing_version) {
             artifact_registry::validate_v12_schema(&connection)?;
             artifact_registry::validate_v13_schema(&connection)?;
             artifact_registry::validate_v14_schema(&connection)?;
@@ -636,8 +636,11 @@ impl ConfigStore {
         if existing_version >= 18 {
             agent_launch_phase::validate_v18_schema(&connection)?;
         }
-        if existing_version == 19 {
+        if existing_version >= 19 {
             learning_store::validate_v19_learning_batches(&connection)?;
+        }
+        if existing_version == 20 {
+            learning_store::validate_v20_topic_publications(&connection)?;
         }
         connection
             .execute_batch(
@@ -752,9 +755,16 @@ impl ConfigStore {
             }
             learning_store::migrate_v19_learning_batches(&connection)?;
         }
+        if existing_version < 20 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            learning_store::migrate_v20_topic_publications(&connection)?;
+        }
         artifact_registry::validate_v12_schema(&connection)?;
         agent_launch_phase::validate_v18_schema(&connection)?;
         learning_store::validate_v19_learning_batches(&connection)?;
+        learning_store::validate_v20_topic_publications(&connection)?;
         Ok(Self {
             connection,
             _machine_lock: machine_lock,
@@ -5868,6 +5878,7 @@ pub(crate) mod tests {
             EffectKind::Operation,
             EffectKind::StartPostmortem,
             EffectKind::PublishKnowledge,
+            EffectKind::PublishTopic,
             EffectKind::PublishProfile,
             EffectKind::CompleteTicket,
             EffectKind::StartAgent,

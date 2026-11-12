@@ -65,7 +65,7 @@ pub(crate) fn validate_v17_schema(connection: &Connection) -> Result<(), String>
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if !matches!(version, 17..=19) {
+    if !(17..=crate::store::SCHEMA_VERSION).contains(&version) {
         return Err(format!(
             "provider qualification recovery schema version mismatch: {version}"
         ));
@@ -232,6 +232,8 @@ mod tests {
                 "DROP TABLE learning_decisions;
                  DROP TABLE learning_findings;
                  DROP TABLE learning_batches;
+                 DROP TABLE supervisor_topic_publications;
+                 DELETE FROM schema_migrations WHERE version=20;
                  DELETE FROM schema_migrations WHERE version=19;
                  CREATE TEMP TABLE preserved_provider_qualification_jobs AS
                  SELECT request_id,project_id,role,profile_id,profile_digest,config_revision,

@@ -50,6 +50,32 @@ fn get_recovery_ticket(
 }
 
 #[cfg(test)]
+mod topic_destination_tests {
+    use super::resolve_knowledge_root;
+
+    #[test]
+    fn relative_knowledge_root_is_bound_to_config_directory_once() {
+        let mut config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "adapters": {"tickets": {"kind":"cli", "command":["tickets"]}},
+            "projects": {},
+            "knowledge": {"format":"okf-0.2", "root":"knowledge", "max_source_bytes":1024}
+        }))
+        .unwrap();
+        let config_dir = std::path::Path::new("/tmp/rex-projects-config");
+        assert_eq!(
+            resolve_knowledge_root(&config, config_dir),
+            Some(config_dir.join("knowledge")),
+        );
+        config.knowledge.as_mut().unwrap().root = "/var/tmp/rex-projects-knowledge".into();
+        assert_eq!(
+            resolve_knowledge_root(&config, config_dir),
+            Some(std::path::PathBuf::from("/var/tmp/rex-projects-knowledge")),
+        );
+    }
+}
+
+#[cfg(test)]
 mod merge_claim_recovery_ticket_cli_tests {
     use super::*;
     use crate::adapters::tickets::{AdapterCapabilities, AdapterDescription, TicketCommandAdapter};
@@ -245,6 +271,7 @@ pub struct RuntimeServices {
     runtime_binary: PathBuf,
     runtime_binary_digest: Digest,
     config_file: PathBuf,
+    topic_publication_root: Option<PathBuf>,
     artifacts: ArtifactStore,
     delivery: RuntimeDelivery,
     mailbox_scan: MailboxScanState,
@@ -252,6 +279,17 @@ pub struct RuntimeServices {
     rex_lifecycle_last_tick: Option<i64>,
     agent_recovery: crate::agent_recovery::AgentRecoveryRuntime,
     provider_qualification_recovery_ids: BTreeSet<String>,
+}
+
+fn resolve_knowledge_root(config: &Config, config_dir: &Path) -> Option<PathBuf> {
+    config.knowledge.as_ref().map(|knowledge| {
+        let root = PathBuf::from(&knowledge.root);
+        if root.is_absolute() {
+            root
+        } else {
+            config_dir.join(root)
+        }
+    })
 }
 
 pub(crate) fn operator_plan_ready_for_launch(
@@ -965,6 +1003,7 @@ impl RuntimeServices {
         let config_dir = config_file
             .parent()
             .ok_or("configuration file has no parent directory")?;
+        let topic_publication_root = resolve_knowledge_root(&applied_config.config, config_dir);
         let mut active_rex_environment = BTreeMap::new();
         active_rex_environment.insert(
             OsString::from("REX_SESSION"),
@@ -1107,16 +1146,13 @@ impl RuntimeServices {
                 environment.metadata().id.clone(),
             )?,
         ));
-        if let Some(knowledge) = &applied_config.config.knowledge {
-            let root = PathBuf::from(&knowledge.root);
-            let root = if root.is_absolute() {
-                root
-            } else {
-                config_dir.join(root)
-            };
+        if let Some(root) = topic_publication_root.as_ref() {
             handlers.push(Box::new(
-                crate::knowledge_effect::KnowledgeEffectHandler::new(root),
+                crate::knowledge_effect::KnowledgeEffectHandler::new(root.clone()),
             ));
+            handlers.push(Box::new(crate::topic_effect::TopicEffectHandler::new(
+                root.clone(),
+            )));
         }
         let declarative_root = host_environment
             .get(std::ffi::OsStr::new("XDG_CONFIG_HOME"))
@@ -1177,6 +1213,7 @@ impl RuntimeServices {
             runtime_binary: runtime_binary.to_owned(),
             runtime_binary_digest: runtime_binary_digest.clone(),
             config_file,
+            topic_publication_root,
             artifacts,
             delivery,
             mailbox_scan: MailboxScanState::default(),
@@ -3126,6 +3163,10 @@ impl FactoryRuntimeServices for RuntimeServices {
 
     fn configuration_digest(&self) -> &Digest {
         &self.configuration_digest
+    }
+
+    fn topic_publication_root(&self) -> Option<&std::path::Path> {
+        self.topic_publication_root.as_deref()
     }
 
     fn human_evidence_documents(

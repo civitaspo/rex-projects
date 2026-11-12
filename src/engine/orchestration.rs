@@ -914,7 +914,7 @@ role_payload!(LearningDecisionPayload {
     batch_digest: Digest,
     config_revision: Revision,
     observations: Vec<String>,
-    topic_changes: Vec<String>,
+    topic_changes: Vec<crate::topic::TopicChange>,
     checkpoint: BTreeMap<String, String>,
     improvements: Vec<String>,
     candidate_change: Option<BTreeMap<String, String>>,
