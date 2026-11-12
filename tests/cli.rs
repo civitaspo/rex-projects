@@ -407,6 +407,32 @@ fn dashboard_json_surfaces_ambiguous_launch_without_changing_ownership() {
         );
     }
 
+    for (pool, slot_index) in [("rex_projects_hook", 0), ("agent", 1)] {
+        db.execute(
+            "UPDATE execution_slots SET pool=?1,slot_index=?2 WHERE owner_id='agentrun1'",
+            rusqlite::params![pool, slot_index],
+        )
+        .unwrap();
+        let output = command(&config, &state, &home)
+            .args(["--json", "dashboard"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let snapshot: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            !snapshot["waits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["kind"] == "agent_launch_handoff"),
+            "a different execution slot must not match the launch reservation"
+        );
+    }
+    db.execute_batch(
+        "UPDATE execution_slots SET pool='agent',slot_index=0 WHERE owner_id='agentrun1';",
+    )
+    .unwrap();
+
     db.execute_batch(
         "DROP TRIGGER agent_launch_phase_transitions;
          UPDATE agent_launch_reservations SET launch_phase='create_attempted' WHERE agent_run_id='agentrun1';",

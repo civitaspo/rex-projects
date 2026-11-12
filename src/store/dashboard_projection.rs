@@ -262,7 +262,7 @@ pub fn read_projection(state_root: &Path) -> Result<DashboardSnapshot, String> {
 fn read_ambiguous_launch_waits(db: &Connection) -> Result<Vec<(String, WaitRow)>, String> {
     let mut statement = db
         .prepare(
-            "SELECT a.agent_run_id,a.project_id,a.operation_id,a.reservation_digest,a.reservation_json,a.launch_phase,r.state,r.launch_operation_id,s.project_id,s.ticket_run_id,s.owner_kind,s.owner_id,s.disposition,e.project_id,e.subject_type,e.subject_id,e.kind,e.request_json,e.request_digest,e.status
+            "SELECT a.agent_run_id,a.project_id,a.operation_id,a.reservation_digest,a.reservation_json,a.launch_phase,r.state,r.launch_operation_id,s.project_id,s.ticket_run_id,s.owner_kind,s.owner_id,s.disposition,e.project_id,e.subject_type,e.subject_id,e.kind,e.request_json,e.request_digest,e.status,s.pool,s.slot_index
              FROM agent_launch_reservations a
              JOIN agent_runs r ON r.agent_run_id=a.agent_run_id AND r.project_id=a.project_id
              JOIN execution_slots s ON s.owner_kind='agent_run' AND s.owner_id=a.agent_run_id AND s.project_id=a.project_id
@@ -296,6 +296,8 @@ fn read_ambiguous_launch_waits(db: &Connection) -> Result<Vec<(String, WaitRow)>
                 row.get::<_, Option<String>>(17)?,
                 row.get::<_, Option<String>>(18)?,
                 row.get::<_, Option<String>>(19)?,
+                row.get::<_, String>(20)?,
+                row.get::<_, u32>(21)?,
             ))
         })
         .map_err(|error| error.to_string())?;
@@ -322,6 +324,8 @@ fn read_ambiguous_launch_waits(db: &Connection) -> Result<Vec<(String, WaitRow)>
             request_json,
             request_digest,
             effect_status,
+            slot_pool,
+            slot_index,
         ) = row.map_err(|error| error.to_string())?;
         let Ok(run_id) = AgentRunId::parse(run_id) else {
             continue;
@@ -344,6 +348,8 @@ fn read_ambiguous_launch_waits(db: &Connection) -> Result<Vec<(String, WaitRow)>
             || !matches!(run_state.as_str(), "launch_pending" | "unknown")
             || !matches!(disposition.as_str(), "launch_pending" | "unknown")
             || reservation["ticket_run_id"].as_str() != slot_ticket.as_deref()
+            || reservation["pool"].as_str() != Some(slot_pool.as_str())
+            || reservation["slot_index"].as_u64() != Some(u64::from(slot_index))
         {
             continue;
         }
