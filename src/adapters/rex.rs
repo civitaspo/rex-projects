@@ -336,6 +336,41 @@ pub struct OwnedWindow {
     pub blocks: Vec<OwnedBlock>,
 }
 
+/// Complete, identity-checked session inventory for the rejected-launch
+/// finalizer. Its fields are private so callers cannot claim completeness for
+/// an arbitrary or filtered Rex response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CompleteRexSessionInventory {
+    server_instance_id: String,
+    session_id: String,
+    windows: Vec<CompleteObservedWindow>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CompleteObservedWindow {
+    window_id: String,
+    block_labels: Vec<String>,
+}
+
+impl CompleteRexSessionInventory {
+    pub(crate) fn matches_view(&self, server: &str, session: &str, window: &str) -> bool {
+        self.server_instance_id == server
+            && self.session_id == session
+            && self
+                .windows
+                .iter()
+                .filter(|item| item.window_id == window)
+                .count()
+                == 1
+    }
+
+    pub(crate) fn contains_block_label(&self, label: &str) -> bool {
+        self.windows
+            .iter()
+            .any(|window| window.block_labels.iter().any(|observed| observed == label))
+    }
+}
+
 /// Host-created, exact Rex identity for a disposable provider qualification session.
 /// The wrapper re-observes this session and its sole window/block before it can
 /// construct the opaque `RexQualificationFixture` used by run-step.
@@ -1238,6 +1273,16 @@ impl RexCliTransport {
             .collect()
     }
 
+    /// Read the session once and retain every label needed to veto an unsafe
+    /// no-create finalization. Unlike the UI projection above, malformed or
+    /// unlabelled windows/blocks make the observation unusable.
+    pub(crate) fn observe_complete_session(&self) -> Result<CompleteRexSessionInventory, RexError> {
+        self.verify_identity()?;
+        let view = self.session_view()?;
+        self.verify_identity()?;
+        parse_complete_session_inventory(view, &self.expected_instance_id, &self.session_id)
+    }
+
     pub fn list_window_blocks(
         &self,
         window: &RexWindow,
@@ -1581,6 +1626,104 @@ impl RexCliTransport {
         }
         Ok(output)
     }
+}
+
+fn parse_complete_session_inventory(
+    view: Value,
+    server_instance_id: &str,
+    expected_session_id: &str,
+) -> Result<CompleteRexSessionInventory, RexError> {
+    if view.get("session_id").and_then(Value::as_str) != Some(expected_session_id) {
+        return Err(RexError::Protocol(
+            "complete Rex inventory has a missing or mismatched session ID".into(),
+        ));
+    }
+    let windows = view
+        .get("windows")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RexError::Protocol("complete Rex inventory has no windows array".into()))?;
+    let mut window_ids = std::collections::BTreeSet::new();
+    let mut block_ids = std::collections::BTreeSet::new();
+    let mut complete_windows = Vec::with_capacity(windows.len());
+    for window in windows {
+        let window_id = window
+            .get("window_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+            .ok_or_else(|| {
+                RexError::Protocol("complete Rex inventory has an invalid window ID".into())
+            })?;
+        let label = window
+            .get("label")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+            .ok_or_else(|| {
+                RexError::Protocol("complete Rex inventory has an invalid window label".into())
+            })?;
+        if !window_ids.insert(window_id.to_owned()) {
+            return Err(RexError::Protocol(
+                "complete Rex inventory has duplicate window IDs".into(),
+            ));
+        }
+        let layers = window
+            .get("layers")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                RexError::Protocol("complete Rex inventory has no layers array".into())
+            })?;
+        let mut block_labels = Vec::new();
+        for layer in layers {
+            let blocks = layer
+                .get("blocks")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    RexError::Protocol("complete Rex inventory has no blocks array".into())
+                })?;
+            for block in blocks {
+                let block_id = block
+                    .get("block_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+                    .ok_or_else(|| {
+                        RexError::Protocol("complete Rex inventory has an invalid block ID".into())
+                    })?;
+                let block_label = block
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+                    .ok_or_else(|| {
+                        RexError::Protocol(
+                            "complete Rex inventory has an invalid block label".into(),
+                        )
+                    })?;
+                if !block_ids.insert(block_id.to_owned()) {
+                    return Err(RexError::Protocol(
+                        "complete Rex inventory has duplicate block IDs".into(),
+                    ));
+                }
+                block_labels.push(block_label.to_owned());
+            }
+        }
+        let _ = label;
+        complete_windows.push(CompleteObservedWindow {
+            window_id: window_id.to_owned(),
+            block_labels,
+        });
+    }
+    Ok(CompleteRexSessionInventory {
+        server_instance_id: server_instance_id.to_owned(),
+        session_id: expected_session_id.to_owned(),
+        windows: complete_windows,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn complete_session_inventory_for_test(
+    view: Value,
+    server_instance_id: &str,
+    session_id: &str,
+) -> Result<CompleteRexSessionInventory, RexError> {
+    parse_complete_session_inventory(view, server_instance_id, session_id)
 }
 
 #[derive(Deserialize)]
@@ -2013,6 +2156,72 @@ mod tests {
         let label = owned_block_label("run-secret-name").unwrap();
         assert!(label.starts_with("rex-projects-run-"));
         assert!(!label.contains("run-secret-name"));
+    }
+
+    #[test]
+    fn complete_session_inventory_requires_full_identity_and_unique_shape() {
+        let base = serde_json::json!({
+            "session_id": "session-1",
+            "windows": [{
+                "window_id": "window-1",
+                "label": "user-window",
+                "layers": [{"blocks": [{"block_id":"block-1","label":"user-block"}]}]
+            }]
+        });
+        let complete =
+            complete_session_inventory_for_test(base.clone(), "server-1", "session-1").unwrap();
+        assert!(complete.matches_view("server-1", "session-1", "window-1"));
+        assert!(complete.contains_block_label("user-block"));
+        assert!(!complete.matches_view("other-server", "session-1", "window-1"));
+        assert!(!complete.matches_view("server-1", "other-session", "window-1"));
+
+        let mut malformed = base.clone();
+        malformed.as_object_mut().unwrap().remove("session_id");
+        assert!(complete_session_inventory_for_test(malformed, "server-1", "session-1").is_err());
+        let mut malformed = base.clone();
+        malformed["session_id"] = serde_json::json!("other-session");
+        assert!(complete_session_inventory_for_test(malformed, "server-1", "session-1").is_err());
+        let mut malformed = base.clone();
+        let duplicate_window = malformed["windows"][0].clone();
+        malformed["windows"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate_window);
+        assert!(complete_session_inventory_for_test(malformed, "server-1", "session-1").is_err());
+        let mut malformed = base.clone();
+        let duplicate_block = malformed["windows"][0]["layers"][0]["blocks"][0].clone();
+        malformed["windows"][0]["layers"][0]["blocks"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate_block);
+        assert!(complete_session_inventory_for_test(malformed, "server-1", "session-1").is_err());
+        let mut malformed = base.clone();
+        malformed["windows"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("label");
+        assert!(complete_session_inventory_for_test(malformed, "server-1", "session-1").is_err());
+        let mut malformed = base.clone();
+        malformed["windows"][0]["window_id"] = serde_json::json!("bad\nwindow");
+        assert!(complete_session_inventory_for_test(malformed, "server-1", "session-1").is_err());
+        let mut malformed = base.clone();
+        malformed["windows"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("layers");
+        assert!(complete_session_inventory_for_test(malformed, "server-1", "session-1").is_err());
+        let mut malformed = base.clone();
+        malformed["windows"][0]["layers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("blocks");
+        assert!(complete_session_inventory_for_test(malformed, "server-1", "session-1").is_err());
+        let mut malformed = base;
+        malformed["windows"][0]["layers"][0]["blocks"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("label");
+        assert!(complete_session_inventory_for_test(malformed, "server-1", "session-1").is_err());
     }
 
     #[test]
