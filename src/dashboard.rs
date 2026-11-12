@@ -1336,18 +1336,23 @@ mod tests {
     fn pty_failed_alternate_screen_setup_restores_raw_mode() {
         let mut master_fd = 0;
         let mut slave_fd = 0;
-        assert_eq!(
-            unsafe {
-                libc::openpty(
-                    &mut master_fd,
-                    &mut slave_fd,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
-            },
-            0
-        );
+        let openpty_result = unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if openpty_result != 0 {
+            let error = io::Error::last_os_error();
+            panic!(
+                "openpty failed: kind={:?}, raw_os_error={:?}",
+                error.kind(),
+                error.raw_os_error()
+            );
+        }
         let _master = unsafe { File::from_raw_fd(master_fd) };
         let slave = unsafe { File::from_raw_fd(slave_fd) };
         let observer = slave.try_clone().unwrap();
@@ -1383,18 +1388,23 @@ mod tests {
     fn run_pty_fixture(marked: bool, send_sigterm: bool, send_ctrl_c: bool) {
         let mut master_fd = 0;
         let mut slave_fd = 0;
-        assert_eq!(
-            unsafe {
-                libc::openpty(
-                    &mut master_fd,
-                    &mut slave_fd,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
-            },
-            0
-        );
+        let openpty_result = unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if openpty_result != 0 {
+            let error = io::Error::last_os_error();
+            panic!(
+                "openpty failed: kind={:?}, raw_os_error={:?}",
+                error.kind(),
+                error.raw_os_error()
+            );
+        }
         let mut master = unsafe { File::from_raw_fd(master_fd) };
         let slave = unsafe { File::from_raw_fd(slave_fd) };
         let observer = slave.try_clone().unwrap();
