@@ -475,7 +475,6 @@ impl FactoryRuntime {
             &configured_projects,
             now_unix,
             learning_interval,
-            12,
         )?;
         let (keys, mut external_errors) = build_scan_keys(config, &runnable, services);
         if let Some(key) = next_pending_candidate_key(store, &runnable, config, &keys)?
@@ -745,6 +744,12 @@ fn apply_agent_result(
     use crate::engine::orchestration::{RoleOutputKind, RoleResultPayload, WorkBaseSource};
 
     let binding = &result.validated.binding;
+    if binding.role == Role::Supervisor
+        && result.validated.kind != RoleOutputKind::LearningDecision
+        && result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
+    {
+        store.reoffer_unhandled_learning_batch(owner_generation, result)?;
+    }
     if binding.role == Role::Coordinator
         && binding.ticket_run_id.is_some()
         && let Some(recovery) = store.recovery_authorization_for_coordinator_result(result)?
@@ -839,6 +844,11 @@ fn apply_agent_result(
         && result.validated.assertion == crate::engine::orchestration::AgentAssertion::Succeeded
     {
         return store.apply_supervisor_intervention(owner_generation, result);
+    }
+    if binding.role == Role::Supervisor && result.validated.kind == RoleOutputKind::LearningDecision
+    {
+        store.consume_supervisor_learning_decision(owner_generation, result, now_unix)?;
+        return Ok(true);
     }
     if binding.role == Role::Supervisor
         && result.validated.kind == RoleOutputKind::TicketProposal

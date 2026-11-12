@@ -8946,6 +8946,45 @@ pub(crate) mod host_validation_fixture {
         )
     }
 
+    /// Builds and ingests a host-validated Supervisor result bound to its durable wake inputs.
+    pub(crate) fn host_validated_supervisor_result_in_with_wake_inputs(
+        store: &mut ConfigStore,
+        root: &std::path::Path,
+        owner_generation: u64,
+        project_id: ProjectId,
+        message: RoleResultMessage,
+        agent_run_id: AgentRunId,
+        wake_inputs: Vec<crate::agent_api::AgentWakeItem>,
+    ) -> Result<InPlaceValidatedResultFixture, String> {
+        let prepared = host_validated_result_inner(
+            store,
+            root,
+            owner_generation,
+            project_id,
+            None,
+            Role::Supervisor,
+            message,
+            Some(agent_run_id),
+            wake_inputs,
+            None,
+            None,
+            None,
+        )
+        .map_err(|error| format!("host validated Supervisor fixture setup: {error}"))?;
+        let ingested = store
+            .store_validated_agent_result(
+                &prepared.artifacts,
+                owner_generation,
+                &prepared.terminal,
+                prepared.message,
+            )
+            .map_err(|error| format!("host validated Supervisor result ingestion: {error}"))?;
+        Ok(InPlaceValidatedResultFixture {
+            artifacts: prepared.artifacts,
+            ingested,
+        })
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "Test fixture binds explicit wake and Coordinator parent identities"
@@ -9475,6 +9514,75 @@ pub(crate) mod host_validation_fixture {
                 |row| row.get(0),
             )
             .map_err(|error| error.to_string())?;
+        if role == Role::Supervisor && !wake_snapshot.inputs.is_empty() {
+            let reservation = crate::launch::AgentLaunchReservation {
+                schema_version: crate::launch::LAUNCH_SCHEMA_VERSION,
+                agent_run_id: agent_run_id.clone(),
+                project_id: project_id.clone(),
+                role,
+                role_session_id: authority.role_session_id.clone(),
+                parent_run_id: authority.parent_run_id.clone(),
+                parent_role: authority.parent_role,
+                ticket_run_id: ticket_run_id.clone(),
+                ticket_revision: authority.ticket_revision,
+                config_revision: authority.config_revision,
+                config_digest: authority.config_digest.clone(),
+                attempt: authority.attempt,
+                run_epoch: authority.run_epoch,
+                controller_generation: owner_generation,
+                project_epoch,
+                operation_id: authority.operation_id.clone(),
+                operation_recipe_id: None,
+                worker_assignment: None,
+                rex_view_id: authority.rex_view_id.clone(),
+                runtime_binary_digest: authority.runtime_binary_digest.clone(),
+                environment_snapshot_id: authority.environment_snapshot_id.clone(),
+                profile_id: authority.profile_id.clone(),
+                profile_digest: authority.profile_digest.clone(),
+                instruction_digest: authority.instruction_digest.clone(),
+                result_schema_digest: authority.result_schema_digest.clone(),
+                wake_snapshot: wake_snapshot.clone(),
+                qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
+                descriptor_path: authority.descriptor_path.clone(),
+                workspace_path: authority.workspace_path.clone(),
+                control_dir: authority.control_dir.clone(),
+                mailbox_directory: authority.control_dir.join("mailbox"),
+                mailbox_capability_digest: authority.mailbox_capability_digest.clone(),
+                mailbox_expires_at_unix: mailbox_expires_at,
+                mailbox_max_request_bytes: mailbox_limits.max_request_bytes as u64,
+                mailbox_max_pending_requests: mailbox_limits.max_pending_requests as u32,
+                pool: "agent".into(),
+                slot_index,
+                global_capacity: 1,
+                project_capacity: 1,
+            };
+            if role == Role::Supervisor && !reservation.wake_snapshot.inputs.is_empty() {
+                crate::agent_api::publish_wake_snapshot(
+                    &authority.control_dir,
+                    reservation.wake_snapshot.clone(),
+                )?;
+                let inbox = crate::agent_api::read_inbox(&authority.control_dir, run_id_str, 0)?;
+                if inbox != reservation.wake_snapshot.inputs {
+                    return Err(
+                        "fixture Agent inbox differs from its immutable wake reservation".into(),
+                    );
+                }
+            }
+            let reservation_json = crate::store::canonical_json(&reservation)?;
+            let wake_json = crate::store::canonical_json(&wake_snapshot)?;
+            store.connection.execute(
+            "INSERT INTO agent_wake_context(agent_run_id,snapshot_digest,snapshot_json,created_at_unix) VALUES (?1,?2,?3,?4)",
+            rusqlite::params![run_id_str, wake_snapshot.digest.as_str(), wake_json, now],
+        ).map_err(|error| error.to_string())?;
+            store.connection.execute(
+            "INSERT INTO agent_launch_reservations(agent_run_id,project_id,operation_id,controller_generation,project_epoch,reservation_digest,reservation_json,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,'authorized',?8,?8)",
+            rusqlite::params![run_id_str, project_id.as_str(), authority.operation_id.as_str(), owner_generation, project_epoch, reservation.digest()?.as_str(), reservation_json, now],
+        ).map_err(|error| error.to_string())?;
+            store.connection.execute(
+            "INSERT INTO agent_mailboxes(agent_run_id,canonical_directory,capability_digest,expires_at_unix,max_request_bytes,max_pending_requests) VALUES (?1,?2,?3,?4,?5,?6)",
+                        rusqlite::params![run_id_str, authority.control_dir.join("mailbox").display().to_string(), authority.mailbox_capability_digest.as_str(), mailbox_expires_at, mailbox_limits.max_request_bytes, mailbox_limits.max_pending_requests],
+        ).map_err(|error| error.to_string())?;
+        }
         store.connection.execute(
             "INSERT INTO execution_slots(pool,slot_index,project_id,ticket_run_id,owner_kind,owner_id,reservation_epoch,controller_generation,process_identity_json,disposition) VALUES ('agent',?1,?2,?3,'agent_run',?4,?5,?6,NULL,'live')",
             rusqlite::params![slot_index, project_id.as_str(), ticket_run_id.as_ref().map(TicketRunId::as_str), run_id_str, project_epoch, owner_generation],
