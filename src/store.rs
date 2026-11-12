@@ -4743,7 +4743,7 @@ impl ConfigStore {
             [request.agent_run_id.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional().map_err(|error| error.to_string())?;
-        if let Some((reservation_json, lifecycle)) = reservation {
+        let reservation = if let Some((reservation_json, lifecycle)) = reservation {
             if lifecycle != "authorized" {
                 return Err("Agent launch reservation has not been finalized".into());
             }
@@ -4781,6 +4781,7 @@ impl ConfigStore {
             {
                 return Err("Agent launch reservation lacks its finalized active Rex block and wake context".into());
             }
+            Some(reservation)
         } else {
             let existing_ack: Option<(Option<String>, Option<String>)> = tx.query_row(
                 "SELECT start_request_digest,launch_receipt_json FROM agent_launch_state WHERE agent_run_id=?1",
@@ -4789,7 +4790,8 @@ impl ConfigStore {
             if persisted_start_ack(existing_ack)?.is_none() {
                 return Err("new Agent starts require a finalized launch reservation".into());
             }
-        }
+            None
+        };
         authority.validate()?;
         let qualification_json: String = tx
             .query_row(
@@ -4839,6 +4841,9 @@ impl ConfigStore {
             }
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(receipt);
+        }
+        if let Some(reservation) = reservation.as_ref() {
+            agent_runtime::validate_start_agent_ticket_run(&tx, current_generation, reservation)?;
         }
         let wrapper_json = serde_json::to_string(observed).map_err(|error| error.to_string())?;
         let changed = tx.execute(
@@ -6812,6 +6817,19 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn ticket_run_freshness_is_enforced_only_before_first_start_acknowledgement() {
+        published_publication_fixture(
+            true,
+            Some(MergeClaimRecoveryFixture::FirstStartAckFence),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
     fn resumed_merge_intent_passes_runtime_preparation_and_builds_package() {
         published_publication_fixture(
             true,
@@ -7314,6 +7332,7 @@ pub(crate) mod tests {
         Resume,
         AssessmentLaunch,
         StaleStartFence,
+        FirstStartAckFence,
         IntentLaunch,
         StaleCoordinatorConfig,
         StaleMergeDecisionConfig,
@@ -7337,7 +7356,10 @@ pub(crate) mod tests {
         let reject_twice = recovery_case.is_some();
         let exercise_runtime_launch = matches!(
             recovery_case,
-            Some(MergeClaimRecoveryFixture::AssessmentLaunch)
+            Some(
+                MergeClaimRecoveryFixture::AssessmentLaunch
+                    | MergeClaimRecoveryFixture::FirstStartAckFence
+            )
         );
         let exercise_stale_start_fence = matches!(
             recovery_case,
@@ -10218,6 +10240,176 @@ pub(crate) mod tests {
                         package_digest.as_str(),
                         content_digest(std::str::from_utf8(&package_bytes).unwrap())
                     );
+                    if matches!(
+                        recovery_case,
+                        Some(MergeClaimRecoveryFixture::FirstStartAckFence)
+                    ) {
+                        let authority = AgentLaunchAuthority {
+                            agent_run_id: reservation.agent_run_id.clone(),
+                            project_id: reservation.project_id.clone(),
+                            role: reservation.role,
+                            role_session_id: reservation.role_session_id.clone(),
+                            parent_run_id: reservation.parent_run_id.clone(),
+                            parent_role: reservation.parent_role,
+                            ticket_run_id: reservation.ticket_run_id.clone(),
+                            ticket_revision: reservation.ticket_revision,
+                            config_revision: reservation.config_revision,
+                            config_digest: reservation.config_digest.clone(),
+                            attempt: reservation.attempt,
+                            run_epoch: reservation.run_epoch,
+                            controller_generation: reservation.controller_generation,
+                            operation_id: reservation.operation_id.clone(),
+                            operation_recipe_id: reservation.operation_recipe_id.clone(),
+                            rex_view_id: reservation.rex_view_id.clone(),
+                            descriptor_digest: package_digest,
+                            runtime_binary_digest: reservation.runtime_binary_digest.clone(),
+                            descriptor_path: reservation.descriptor_path.clone(),
+                            environment_snapshot_id: reservation.environment_snapshot_id.clone(),
+                            profile_id: reservation.profile_id.clone(),
+                            profile_digest: reservation.profile_digest.clone(),
+                            instruction_digest: reservation.instruction_digest.clone(),
+                            result_schema_digest: reservation.result_schema_digest.clone(),
+                            wake_snapshot_digest: reservation.wake_snapshot.digest.clone(),
+                            qualification_receipt_digest: reservation
+                                .qualification_receipt_digest
+                                .clone(),
+                            rex_server_identity: observed_block.server_instance_id.clone(),
+                            rex_session_id: observed_block.session_id.clone(),
+                            rex_window_id: observed_block.window_id.clone(),
+                            rex_block_id: observed_block.block_id.clone(),
+                            workspace_path: reservation.workspace_path.clone(),
+                            control_dir: reservation.control_dir.clone(),
+                            mailbox_capability_digest: reservation
+                                .mailbox_capability_digest
+                                .clone(),
+                        };
+                        crate::start_agent::register_reserved_mailbox(
+                            &mut store,
+                            owner_generation,
+                            &reservation,
+                        )
+                        .unwrap();
+                        store
+                            .register_agent_launch_authority(owner_generation, &authority)
+                            .unwrap();
+                        store
+                            .register_rex_view_block(
+                                owner_generation,
+                                &crate::launch::RexViewBlock {
+                                    view_id: reservation.rex_view_id.clone(),
+                                    block_id: observed_block.block_id.clone(),
+                                    agent_run_id: Some(agent_run_id.clone()),
+                                    role: Some(reservation.role),
+                                    ownership: crate::launch::RexBlockOwnership::Factory,
+                                    lifecycle: crate::launch::RexBlockLifecycle::Active,
+                                    process_absent_confirmed: false,
+                                    retained_until_unix: None,
+                                },
+                            )
+                            .unwrap();
+                        store
+                            .finalize_agent_launch_reservation(
+                                owner_generation,
+                                &agent_run_id,
+                                &reservation.digest().unwrap(),
+                                &authority,
+                            )
+                            .unwrap();
+                        let request = crate::launch::AgentStartRequest {
+                            schema_version: crate::launch::LAUNCH_SCHEMA_VERSION,
+                            operation_id: reservation.operation_id.clone(),
+                            agent_run_id: agent_run_id.clone(),
+                            project_id: project_id.clone(),
+                            controller_generation: owner_generation,
+                            descriptor_digest: authority.descriptor_digest.clone(),
+                            runtime_binary_digest: authority.runtime_binary_digest.clone(),
+                            environment_snapshot_id: authority.environment_snapshot_id.clone(),
+                            qualification_receipt_digest: authority
+                                .qualification_receipt_digest
+                                .clone(),
+                            wrapper_pid: 42,
+                            wrapper_start_identity: "prepared-merge-decision-wrapper".into(),
+                            rex_launch_anchor: None,
+                            rex_session_id: observed_block.session_id.clone(),
+                            rex_block_id: observed_block.block_id.clone(),
+                        };
+                        let observed = crate::launch::ObservedWrapperIdentity {
+                            pid: request.wrapper_pid,
+                            start_identity: request.wrapper_start_identity.clone(),
+                            rex_session_id: request.rex_session_id.clone(),
+                            rex_block_id: request.rex_block_id.clone(),
+                            runtime_binary_digest: request.runtime_binary_digest.clone(),
+                            rex_launch_anchor: None,
+                        };
+                        let original: (u64, String) = store.connection.query_row(
+                            "SELECT revision,internal_phase FROM ticket_runs WHERE ticket_run_id=?1",
+                            [ticket_run_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?)),
+                        ).unwrap();
+                        let held_slot: (String, String, u64) = store.connection.query_row(
+                            "SELECT disposition,owner_id,reservation_epoch FROM execution_slots WHERE pool=?1 AND slot_index=?2",
+                            rusqlite::params![reservation.pool,reservation.slot_index],
+                            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+                        ).unwrap();
+                        for (revision, phase) in [
+                            (original.0 + 1, original.1.as_str()),
+                            (original.0, "done"),
+                            (original.0, "canceled"),
+                        ] {
+                            store.connection.execute(
+                                "UPDATE ticket_runs SET revision=?2,internal_phase=?3 WHERE ticket_run_id=?1",
+                                rusqlite::params![ticket_run_id.as_str(), revision, phase],
+                            ).unwrap();
+                            let error = store.authorize_agent_start(owner_generation, &request, &observed).expect_err("a stale prepared TicketRun must not receive its first start ACK");
+                            assert!(error.contains("active phase changed"), "{error}");
+                            assert_eq!(store.persisted_start_receipt(&request).unwrap(), None);
+                            let current_slot: (String, String, u64) = store.connection.query_row(
+                                "SELECT disposition,owner_id,reservation_epoch FROM execution_slots WHERE pool=?1 AND slot_index=?2",
+                                rusqlite::params![reservation.pool,reservation.slot_index],
+                                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+                            ).unwrap();
+                            assert_eq!(current_slot, held_slot);
+                            assert_eq!(
+                                store.agent_launch_authority(&agent_run_id).unwrap(),
+                                Some(authority.clone())
+                            );
+                        }
+                        store.connection.execute(
+                            "UPDATE ticket_runs SET revision=?2,internal_phase=?3 WHERE ticket_run_id=?1",
+                            rusqlite::params![ticket_run_id.as_str(), original.0, original.1],
+                        ).unwrap();
+                        let accepted = store
+                            .authorize_agent_start(owner_generation, &request, &observed)
+                            .unwrap();
+                        store.connection.execute(
+                            "UPDATE ticket_runs SET revision=revision+1,internal_phase='done' WHERE ticket_run_id=?1",
+                            [ticket_run_id.as_str()],
+                        ).unwrap();
+                        assert_eq!(
+                            store
+                                .authorize_agent_start(owner_generation, &request, &observed)
+                                .unwrap(),
+                            accepted
+                        );
+                        let mut different_request = request.clone();
+                        different_request.wrapper_start_identity = "different-wrapper".into();
+                        let mut different_observed = observed.clone();
+                        different_observed.start_identity =
+                            different_request.wrapper_start_identity.clone();
+                        assert!(
+                            store
+                                .authorize_agent_start(
+                                    owner_generation,
+                                    &different_request,
+                                    &different_observed
+                                )
+                                .unwrap_err()
+                                .contains("different persisted start acknowledgement")
+                        );
+                        assert_eq!(
+                            store.persisted_start_receipt(&request).unwrap(),
+                            Some(accepted)
+                        );
+                    }
                     return;
                 }
 
