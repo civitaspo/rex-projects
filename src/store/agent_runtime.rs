@@ -312,7 +312,51 @@ fn ticket_has_active_child(
     ).map_err(|error| error.to_string())
 }
 
+/// Use the caller's connection or transaction to check the exact immutable launch scope.
+pub(crate) fn validate_start_agent_ticket_run(
+    connection: &Connection,
+    owner_generation: u64,
+    reservation: &AgentLaunchReservation,
+) -> Result<(), String> {
+    let (Some(ticket_run_id), Some(ticket_revision)) =
+        (&reservation.ticket_run_id, reservation.ticket_revision)
+    else {
+        if reservation.role == crate::domain::types::Role::Supervisor {
+            return Ok(());
+        }
+        return Err("ticket-role launch reservation has no TicketRun scope".into());
+    };
+    let current: Option<(String, u64, String)> = connection
+            .query_row(
+                "SELECT t.project_id,t.revision,t.internal_phase FROM ticket_runs t WHERE t.ticket_run_id=?1 AND EXISTS(SELECT 1 FROM controller_owners o WHERE o.singleton=1 AND o.generation=?2 AND o.stopped_at_unix IS NULL)",
+                rusqlite::params![ticket_run_id.as_str(), owner_generation],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+    let Some((project_id, revision, phase)) = current else {
+        return Err("launch TicketRun is missing or controller owner generation is stale".into());
+    };
+    if project_id != reservation.project_id.as_str()
+        || revision != ticket_revision.0
+        || matches!(phase.as_str(), "done" | "canceled")
+    {
+        return Err(
+            "TicketRun project, revision, or active phase changed after Agent reservation".into(),
+        );
+    }
+    Ok(())
+}
+
 impl ConfigStore {
+    pub(crate) fn validate_start_agent_ticket_run(
+        &self,
+        owner_generation: u64,
+        reservation: &AgentLaunchReservation,
+    ) -> Result<(), String> {
+        validate_start_agent_ticket_run(&self.connection, owner_generation, reservation)
+    }
+
     pub fn agent_launch_project_epoch(
         &self,
         agent_run_id: &crate::domain::ids::AgentRunId,

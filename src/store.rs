@@ -4743,7 +4743,7 @@ impl ConfigStore {
             [request.agent_run_id.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional().map_err(|error| error.to_string())?;
-        if let Some((reservation_json, lifecycle)) = reservation {
+        let reservation = if let Some((reservation_json, lifecycle)) = reservation {
             if lifecycle != "authorized" {
                 return Err("Agent launch reservation has not been finalized".into());
             }
@@ -4781,6 +4781,7 @@ impl ConfigStore {
             {
                 return Err("Agent launch reservation lacks its finalized active Rex block and wake context".into());
             }
+            Some(reservation)
         } else {
             let existing_ack: Option<(Option<String>, Option<String>)> = tx.query_row(
                 "SELECT start_request_digest,launch_receipt_json FROM agent_launch_state WHERE agent_run_id=?1",
@@ -4789,7 +4790,8 @@ impl ConfigStore {
             if persisted_start_ack(existing_ack)?.is_none() {
                 return Err("new Agent starts require a finalized launch reservation".into());
             }
-        }
+            None
+        };
         authority.validate()?;
         let qualification_json: String = tx
             .query_row(
@@ -4839,6 +4841,9 @@ impl ConfigStore {
             }
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(receipt);
+        }
+        if let Some(reservation) = reservation.as_ref() {
+            agent_runtime::validate_start_agent_ticket_run(&tx, current_generation, reservation)?;
         }
         let wrapper_json = serde_json::to_string(observed).map_err(|error| error.to_string())?;
         let changed = tx.execute(
@@ -6799,6 +6804,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn stale_ticket_run_is_rejected_by_the_production_start_agent_handler() {
+        published_publication_fixture(
+            true,
+            Some(MergeClaimRecoveryFixture::StaleStartFence),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn ticket_run_freshness_is_enforced_only_before_first_start_acknowledgement() {
+        published_publication_fixture(
+            true,
+            Some(MergeClaimRecoveryFixture::FirstStartAckFence),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
     fn resumed_merge_intent_passes_runtime_preparation_and_builds_package() {
         published_publication_fixture(
             true,
@@ -7300,6 +7331,8 @@ pub(crate) mod tests {
     enum MergeClaimRecoveryFixture {
         Resume,
         AssessmentLaunch,
+        StaleStartFence,
+        FirstStartAckFence,
         IntentLaunch,
         StaleCoordinatorConfig,
         StaleMergeDecisionConfig,
@@ -7323,7 +7356,14 @@ pub(crate) mod tests {
         let reject_twice = recovery_case.is_some();
         let exercise_runtime_launch = matches!(
             recovery_case,
-            Some(MergeClaimRecoveryFixture::AssessmentLaunch)
+            Some(
+                MergeClaimRecoveryFixture::AssessmentLaunch
+                    | MergeClaimRecoveryFixture::FirstStartAckFence
+            )
+        );
+        let exercise_stale_start_fence = matches!(
+            recovery_case,
+            Some(MergeClaimRecoveryFixture::StaleStartFence)
         );
         let exercise_stale_recovery_config = matches!(
             recovery_case,
@@ -7409,7 +7449,10 @@ pub(crate) mod tests {
         ]);
         let corrected_head = run_git(&["rev-parse", "HEAD"]);
         let mut applied = snapshot(&"a".repeat(64));
-        let runtime_launch_config = if exercise_runtime_launch || exercise_runtime_second_turn {
+        let runtime_launch_config = if exercise_runtime_launch
+            || exercise_runtime_second_turn
+            || exercise_stale_start_fence
+        {
             use std::os::unix::fs::PermissionsExt;
 
             let bin = temp.path().join("recovery-runtime-bin");
@@ -7492,7 +7535,7 @@ pub(crate) mod tests {
             serde_json::from_value::<ProjectConfig>(serde_json::json!({
                 "mode": "goal",
                 "ticket_adapter": "tickets",
-                "ticket_scope": if exercise_runtime_launch || exercise_runtime_second_turn { serde_json::json!({"project":"project-a"}) } else { serde_json::json!({}) },
+                "ticket_scope": if exercise_runtime_launch || exercise_runtime_second_turn || exercise_stale_start_fence { serde_json::json!({"project":"project-a"}) } else { serde_json::json!({}) },
                 "repositories": ["repo-a"],
                 "roles": {
                     "coordinator": "worker_codex",
@@ -7558,7 +7601,7 @@ pub(crate) mod tests {
             })
             .unwrap();
         assert_eq!(owner_generation, 1);
-        if exercise_runtime_launch || exercise_runtime_second_turn {
+        if exercise_runtime_launch || exercise_runtime_second_turn || exercise_stale_start_fence {
             let profile_id = crate::domain::ids::ProfileId::parse("worker_codex").unwrap();
             let profile = applied.profiles.get(&profile_id).unwrap();
             let profile_digest = agent_profile_digest(profile).unwrap();
@@ -9935,7 +9978,7 @@ pub(crate) mod tests {
                     resumed_subject.digest().unwrap(),
                     subject.publication_set_digest
                 );
-                if exercise_runtime_launch {
+                if exercise_runtime_launch || exercise_stale_start_fence {
                     let config_file = &runtime_launch_config.as_ref().unwrap().0;
                     let runtime_state = temp.path().join("runtime-state");
                     std::fs::create_dir_all(&runtime_state).unwrap();
@@ -10018,6 +10061,130 @@ pub(crate) mod tests {
                             .count(),
                         1
                     );
+                    if exercise_stale_start_fence {
+                        store
+                            .validate_start_agent_ticket_run(owner_generation, &reservation)
+                            .expect("the prepared reservation is current before the race");
+                        let reserved_revision = reservation.ticket_revision.unwrap().0;
+                        store
+                            .connection
+                            .execute(
+                                "UPDATE ticket_runs SET internal_phase='done',revision=?2 WHERE project_id=?1 AND ticket_run_id=?3",
+                                rusqlite::params![project_id.as_str(), reserved_revision + 1, ticket_run_id.as_str()],
+                            )
+                            .unwrap();
+
+                        let payload = crate::launch::StartAgentEffectPayload {
+                            schema_version: crate::launch::LAUNCH_SCHEMA_VERSION,
+                            agent_run_id: agent_run_id.clone(),
+                            launch_reservation_digest: reservation.digest().unwrap(),
+                        };
+                        let request_json = serde_json::to_string(&payload).unwrap();
+                        let request = crate::effects::EffectRequest {
+                            intent: EffectIntent {
+                                project_id: project_id.clone(),
+                                subject_type: "agent_run".into(),
+                                subject_id: agent_run_id.to_string(),
+                                operation_id: reservation.operation_id.to_string(),
+                                logical_key: "start-stale-ticket-run".into(),
+                                kind: "start_agent".into(),
+                                request_json: request_json.clone(),
+                                request_digest: content_digest(&request_json).to_owned(),
+                                expected_revision: None,
+                            },
+                            attempt_count: 1,
+                            created_at_unix: 20,
+                        };
+                        let result = services.handle_start_agent_for_test(
+                            crate::effects::EffectMode::Reconcile,
+                            &request,
+                            &mut crate::effects::EffectContext {
+                                store: &mut store,
+                                owner_generation,
+                                now_unix: 20,
+                            },
+                        );
+                        assert!(result.unwrap_err().contains("active phase changed"));
+                        assert!(!reservation.descriptor_path.exists());
+                        assert!(!temp.path().join("recovery-split-created").exists());
+                        let lifecycle: String = store
+                            .connection
+                            .query_row(
+                                "SELECT lifecycle FROM agent_launch_reservations WHERE agent_run_id=?1",
+                                [agent_run_id.as_str()],
+                                |row| row.get(0),
+                            )
+                            .unwrap();
+                        assert_eq!(lifecycle, "reserved");
+                        let (stored_digest, stored_json): (String, String) = store
+                            .connection
+                            .query_row(
+                                "SELECT reservation_digest,reservation_json FROM agent_launch_reservations WHERE agent_run_id=?1",
+                                [agent_run_id.as_str()],
+                                |row| Ok((row.get(0)?, row.get(1)?)),
+                            )
+                            .unwrap();
+                        assert_eq!(stored_digest, reservation.digest().unwrap().as_str());
+                        let stored_reservation: crate::launch::AgentLaunchReservation =
+                            crate::protocol::parse_unique(stored_json.as_bytes()).unwrap();
+                        assert_eq!(stored_reservation, reservation);
+                        let slot: (String, String) = store
+                            .connection
+                            .query_row(
+                                "SELECT disposition,owner_id FROM execution_slots WHERE pool=?1 AND slot_index=?2",
+                                rusqlite::params![reservation.pool, reservation.slot_index],
+                                |row| Ok((row.get(0)?, row.get(1)?)),
+                            )
+                            .unwrap();
+                        assert_ne!(slot.0, "released");
+                        assert_eq!(slot.1, agent_run_id.as_str());
+                        let authority_count: u64 = store
+                            .connection
+                            .query_row(
+                                "SELECT COUNT(*) FROM agent_launch_authority WHERE agent_run_id=?1",
+                                [agent_run_id.as_str()],
+                                |row| row.get(0),
+                            )
+                            .unwrap();
+                        assert_eq!(authority_count, 0);
+
+                        let wrapper_attempt = services.ensure_parked_wrapper_for_test(
+                            &mut store,
+                            20,
+                            &reservation,
+                            &temp.path().join("absolute-environment-handoff"),
+                        );
+                        assert!(
+                            wrapper_attempt
+                                .unwrap_err()
+                                .contains("active phase changed")
+                        );
+                        assert!(!temp.path().join("recovery-split-created").exists());
+
+                        let late_block = crate::adapters::rex::RexContextBlock {
+                            server_instance_id: rex_identity.instance_id.clone(),
+                            session_id: rex_identity.session_id.clone(),
+                            window_id: active_ticket_view.view.rex_window_id.clone(),
+                            block_id: "stale-launch-late-check-block".into(),
+                            label: crate::adapters::rex::owned_agent_block_label(
+                                agent_run_id.as_str(),
+                            )
+                            .unwrap(),
+                            flavor: "shell".into(),
+                        };
+                        let late_package = services.build_run_step_package_for_test(
+                            &mut store,
+                            20,
+                            &reservation,
+                            &late_block,
+                        );
+                        assert!(
+                            late_package
+                                .unwrap_err()
+                                .contains("missing or terminal TicketRun")
+                        );
+                        return;
+                    }
                     let view = store
                         .rex_view_history(&project_id)
                         .unwrap()
@@ -10073,6 +10240,176 @@ pub(crate) mod tests {
                         package_digest.as_str(),
                         content_digest(std::str::from_utf8(&package_bytes).unwrap())
                     );
+                    if matches!(
+                        recovery_case,
+                        Some(MergeClaimRecoveryFixture::FirstStartAckFence)
+                    ) {
+                        let authority = AgentLaunchAuthority {
+                            agent_run_id: reservation.agent_run_id.clone(),
+                            project_id: reservation.project_id.clone(),
+                            role: reservation.role,
+                            role_session_id: reservation.role_session_id.clone(),
+                            parent_run_id: reservation.parent_run_id.clone(),
+                            parent_role: reservation.parent_role,
+                            ticket_run_id: reservation.ticket_run_id.clone(),
+                            ticket_revision: reservation.ticket_revision,
+                            config_revision: reservation.config_revision,
+                            config_digest: reservation.config_digest.clone(),
+                            attempt: reservation.attempt,
+                            run_epoch: reservation.run_epoch,
+                            controller_generation: reservation.controller_generation,
+                            operation_id: reservation.operation_id.clone(),
+                            operation_recipe_id: reservation.operation_recipe_id.clone(),
+                            rex_view_id: reservation.rex_view_id.clone(),
+                            descriptor_digest: package_digest,
+                            runtime_binary_digest: reservation.runtime_binary_digest.clone(),
+                            descriptor_path: reservation.descriptor_path.clone(),
+                            environment_snapshot_id: reservation.environment_snapshot_id.clone(),
+                            profile_id: reservation.profile_id.clone(),
+                            profile_digest: reservation.profile_digest.clone(),
+                            instruction_digest: reservation.instruction_digest.clone(),
+                            result_schema_digest: reservation.result_schema_digest.clone(),
+                            wake_snapshot_digest: reservation.wake_snapshot.digest.clone(),
+                            qualification_receipt_digest: reservation
+                                .qualification_receipt_digest
+                                .clone(),
+                            rex_server_identity: observed_block.server_instance_id.clone(),
+                            rex_session_id: observed_block.session_id.clone(),
+                            rex_window_id: observed_block.window_id.clone(),
+                            rex_block_id: observed_block.block_id.clone(),
+                            workspace_path: reservation.workspace_path.clone(),
+                            control_dir: reservation.control_dir.clone(),
+                            mailbox_capability_digest: reservation
+                                .mailbox_capability_digest
+                                .clone(),
+                        };
+                        crate::start_agent::register_reserved_mailbox(
+                            &mut store,
+                            owner_generation,
+                            &reservation,
+                        )
+                        .unwrap();
+                        store
+                            .register_agent_launch_authority(owner_generation, &authority)
+                            .unwrap();
+                        store
+                            .register_rex_view_block(
+                                owner_generation,
+                                &crate::launch::RexViewBlock {
+                                    view_id: reservation.rex_view_id.clone(),
+                                    block_id: observed_block.block_id.clone(),
+                                    agent_run_id: Some(agent_run_id.clone()),
+                                    role: Some(reservation.role),
+                                    ownership: crate::launch::RexBlockOwnership::Factory,
+                                    lifecycle: crate::launch::RexBlockLifecycle::Active,
+                                    process_absent_confirmed: false,
+                                    retained_until_unix: None,
+                                },
+                            )
+                            .unwrap();
+                        store
+                            .finalize_agent_launch_reservation(
+                                owner_generation,
+                                &agent_run_id,
+                                &reservation.digest().unwrap(),
+                                &authority,
+                            )
+                            .unwrap();
+                        let request = crate::launch::AgentStartRequest {
+                            schema_version: crate::launch::LAUNCH_SCHEMA_VERSION,
+                            operation_id: reservation.operation_id.clone(),
+                            agent_run_id: agent_run_id.clone(),
+                            project_id: project_id.clone(),
+                            controller_generation: owner_generation,
+                            descriptor_digest: authority.descriptor_digest.clone(),
+                            runtime_binary_digest: authority.runtime_binary_digest.clone(),
+                            environment_snapshot_id: authority.environment_snapshot_id.clone(),
+                            qualification_receipt_digest: authority
+                                .qualification_receipt_digest
+                                .clone(),
+                            wrapper_pid: 42,
+                            wrapper_start_identity: "prepared-merge-decision-wrapper".into(),
+                            rex_launch_anchor: None,
+                            rex_session_id: observed_block.session_id.clone(),
+                            rex_block_id: observed_block.block_id.clone(),
+                        };
+                        let observed = crate::launch::ObservedWrapperIdentity {
+                            pid: request.wrapper_pid,
+                            start_identity: request.wrapper_start_identity.clone(),
+                            rex_session_id: request.rex_session_id.clone(),
+                            rex_block_id: request.rex_block_id.clone(),
+                            runtime_binary_digest: request.runtime_binary_digest.clone(),
+                            rex_launch_anchor: None,
+                        };
+                        let original: (u64, String) = store.connection.query_row(
+                            "SELECT revision,internal_phase FROM ticket_runs WHERE ticket_run_id=?1",
+                            [ticket_run_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?)),
+                        ).unwrap();
+                        let held_slot: (String, String, u64) = store.connection.query_row(
+                            "SELECT disposition,owner_id,reservation_epoch FROM execution_slots WHERE pool=?1 AND slot_index=?2",
+                            rusqlite::params![reservation.pool,reservation.slot_index],
+                            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+                        ).unwrap();
+                        for (revision, phase) in [
+                            (original.0 + 1, original.1.as_str()),
+                            (original.0, "done"),
+                            (original.0, "canceled"),
+                        ] {
+                            store.connection.execute(
+                                "UPDATE ticket_runs SET revision=?2,internal_phase=?3 WHERE ticket_run_id=?1",
+                                rusqlite::params![ticket_run_id.as_str(), revision, phase],
+                            ).unwrap();
+                            let error = store.authorize_agent_start(owner_generation, &request, &observed).expect_err("a stale prepared TicketRun must not receive its first start ACK");
+                            assert!(error.contains("active phase changed"), "{error}");
+                            assert_eq!(store.persisted_start_receipt(&request).unwrap(), None);
+                            let current_slot: (String, String, u64) = store.connection.query_row(
+                                "SELECT disposition,owner_id,reservation_epoch FROM execution_slots WHERE pool=?1 AND slot_index=?2",
+                                rusqlite::params![reservation.pool,reservation.slot_index],
+                                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+                            ).unwrap();
+                            assert_eq!(current_slot, held_slot);
+                            assert_eq!(
+                                store.agent_launch_authority(&agent_run_id).unwrap(),
+                                Some(authority.clone())
+                            );
+                        }
+                        store.connection.execute(
+                            "UPDATE ticket_runs SET revision=?2,internal_phase=?3 WHERE ticket_run_id=?1",
+                            rusqlite::params![ticket_run_id.as_str(), original.0, original.1],
+                        ).unwrap();
+                        let accepted = store
+                            .authorize_agent_start(owner_generation, &request, &observed)
+                            .unwrap();
+                        store.connection.execute(
+                            "UPDATE ticket_runs SET revision=revision+1,internal_phase='done' WHERE ticket_run_id=?1",
+                            [ticket_run_id.as_str()],
+                        ).unwrap();
+                        assert_eq!(
+                            store
+                                .authorize_agent_start(owner_generation, &request, &observed)
+                                .unwrap(),
+                            accepted
+                        );
+                        let mut different_request = request.clone();
+                        different_request.wrapper_start_identity = "different-wrapper".into();
+                        let mut different_observed = observed.clone();
+                        different_observed.start_identity =
+                            different_request.wrapper_start_identity.clone();
+                        assert!(
+                            store
+                                .authorize_agent_start(
+                                    owner_generation,
+                                    &different_request,
+                                    &different_observed
+                                )
+                                .unwrap_err()
+                                .contains("different persisted start acknowledgement")
+                        );
+                        assert_eq!(
+                            store.persisted_start_receipt(&request).unwrap(),
+                            Some(accepted)
+                        );
+                    }
                     return;
                 }
 
