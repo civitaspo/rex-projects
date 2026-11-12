@@ -1624,6 +1624,72 @@ pub(crate) mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
+    pub(crate) fn observe_merge_item_for_base_advance_test(
+        applied: AppliedConfig,
+        item: &crate::store::merge_work::MergeWorkItem,
+        live_base_sha: &str,
+    ) -> Result<String, String> {
+        use serde_json::json;
+
+        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let binary_dir = root.path().join("bin");
+        std::fs::create_dir(&binary_dir).map_err(|error| error.to_string())?;
+        let gh_path = binary_dir.join("gh");
+        std::fs::write(&gh_path, "#!/bin/sh\nexit 0\n").map_err(|error| error.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| error.to_string())?;
+        }
+        let subject = &item.document.evidence.subject;
+        let head_sha = &subject.head_sha;
+        let node_id = &subject.pull_request_node_id;
+        let repository_id = subject.forge_repository_id;
+        let responses = vec![
+            json!({"id":repository_id,"full_name":"acme/widgets","default_branch":"main","allow_merge_commit":true,"allow_squash_merge":true,"allow_rebase_merge":true}),
+            json!({"node_id":node_id,"number":9,"state":"open","draft":false,"merged":false,"head":{"sha":head_sha,"ref":"feature","repo":{"id":repository_id}},"base":{"sha":live_base_sha,"ref":"main","repo":{"id":repository_id}},"body":"Reviewed body\n"}),
+            json!([]),
+            json!({"check_runs":[]}),
+            json!({"total_count":0,"workflow_runs":[]}),
+            json!({"total_count":0,"workflow_runs":[]}),
+            json!([]),
+            json!([]),
+            json!([]),
+            json!({"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}),
+            json!([]),
+            json!([]),
+            json!({"name":"main","protected":true}),
+            json!({"required_status_checks":{"strict":true,"contexts":[]},"required_pull_request_reviews":{"required_approving_review_count":0,"dismiss_stale_reviews":true},"enforce_admins":{"enabled":true},"allow_force_pushes":{"enabled":false},"allow_deletions":{"enabled":false}}),
+        ];
+        let runner = std::sync::Arc::new(FixtureRunner {
+            replies: Mutex::new(
+                responses
+                    .into_iter()
+                    .map(|response| {
+                        serde_json::to_vec(&response).map_err(|error| error.to_string())
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+            requests: Mutex::new(Vec::new()),
+        });
+        let source = RuntimeMergeEvidenceSource::with_github_runner(
+            applied,
+            vec![binary_dir],
+            BTreeMap::new(),
+            runner.clone(),
+        );
+        let (forge, pull) = source.forge_for_item(item)?;
+        let observation = forge.observe(&pull).map_err(|error| error.to_string())?;
+        if runner.requests.lock().unwrap().is_empty() {
+            return Err("production Forge observer did not invoke the fixture runner".into());
+        }
+        match observation.pull_request {
+            crate::forge::Observed::Complete { value, .. } => Ok(value.base_sha),
+            crate::forge::Observed::Unknown { reason, .. } => Err(reason),
+        }
+    }
+
     pub(crate) fn reconcile_merge_for_store_test(
         applied: AppliedConfig,
         request: &crate::effects::EffectRequest,

@@ -1674,7 +1674,7 @@ pub(crate) mod tests {
 
     #[test]
     fn merge_work_receipt_consumer_enforces_approval_and_builds_postmortem_inbox() {
-        merge_review_approval_fixture(false, None, false, false);
+        merge_review_approval_fixture(false, None, false, false, None);
     }
 
     #[test]
@@ -1684,6 +1684,7 @@ pub(crate) mod tests {
             Some(PreparedBodyReceiptCase::PassingAppliedChangedBody),
             true,
             false,
+            None,
         );
     }
 
@@ -1694,12 +1695,18 @@ pub(crate) mod tests {
             Some(PreparedBodyReceiptCase::PassingAppliedChangedBody),
             true,
             true,
+            None,
         );
     }
 
     #[test]
+    fn legacy_approved_request_with_advanced_live_base_is_held_before_external_mutation() {
+        merge_review_approval_fixture(false, None, true, false, Some("c".repeat(40)));
+    }
+
+    #[test]
     fn verified_merge_persists_required_operator_plan_and_launch_readiness() {
-        merge_review_approval_fixture(true, None, false, false);
+        merge_review_approval_fixture(true, None, false, false, None);
     }
 
     #[test]
@@ -1709,6 +1716,7 @@ pub(crate) mod tests {
             Some(PreparedBodyReceiptCase::UnknownRecovered),
             false,
             false,
+            None,
         );
     }
 
@@ -1720,6 +1728,7 @@ pub(crate) mod tests {
             Some(PreparedBodyReceiptCase::PassingRecoveredChangedBody),
             false,
             false,
+            None,
         );
     }
 
@@ -1730,6 +1739,7 @@ pub(crate) mod tests {
             Some(PreparedBodyReceiptCase::PassingRecoveredNoop),
             false,
             false,
+            None,
         );
     }
 
@@ -1740,6 +1750,7 @@ pub(crate) mod tests {
             Some(PreparedBodyReceiptCase::PassingAppliedChangedBody),
             false,
             false,
+            None,
         );
     }
 
@@ -1980,6 +1991,7 @@ pub(crate) mod tests {
         body_case: Option<PreparedBodyReceiptCase>,
         request_guard_test: bool,
         reconcile_request_guard_test: bool,
+        advanced_live_base_sha: Option<String>,
     ) {
         use crate::domain::ids::{
             Digest, HumanRequestId, OperationId, ProjectId, Revision, TicketRunId,
@@ -2108,6 +2120,19 @@ pub(crate) mod tests {
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml"),
         )
         .unwrap();
+        if advanced_live_base_sha.is_some() {
+            loaded
+                .config
+                .repositories
+                .get_mut(&crate::domain::ids::RepositoryId::parse("example").unwrap())
+                .unwrap()
+                .clone_url = "https://github.com/acme/widgets.git".into();
+            loaded.digest = Digest::parse(format!(
+                "{:x}",
+                sha2::Sha256::digest(serde_json::to_vec(&loaded.config).unwrap())
+            ))
+            .unwrap();
+        }
         let recipe_id = if required_operations {
             loaded.config.operation_actions.insert(
                 "observe_deployment".into(),
@@ -2456,6 +2481,28 @@ pub(crate) mod tests {
         assert_eq!(first.expected_revision, Some(6));
 
         if request_guard_test {
+            if let Some(live_base_sha) = &advanced_live_base_sha {
+                assert_eq!(work_item.document.evidence.subject.base_sha, "b".repeat(40));
+                assert_eq!(first_request.step_key, "merge");
+                assert!(
+                    store
+                        .accepted_merge_work_review_approval(&request_id, &work_item, 13)
+                        .unwrap()
+                        .is_some()
+                );
+                let observed_base_sha = crate::runtime_services::merge::tests::
+                    observe_merge_item_for_base_advance_test(
+                        loaded.clone(),
+                        &work_item,
+                        live_base_sha,
+                    )
+                    .unwrap();
+                assert_eq!(observed_base_sha, *live_base_sha);
+                assert_ne!(
+                    observed_base_sha,
+                    work_item.document.evidence.subject.base_sha
+                );
+            }
             let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let runner = std::sync::Arc::new(UnexpectedGitHubCall(calls.clone()));
             store
@@ -2523,6 +2570,10 @@ pub(crate) mod tests {
                 } else {
                     "not_attempted_by_this_dispatch"
                 }
+            );
+            assert_eq!(
+                receipt["reason"],
+                "request_executor_has_no_verifiable_execution_contract"
             );
             assert_eq!(receipt["new_mutation_attempted"], false);
             assert_eq!(
