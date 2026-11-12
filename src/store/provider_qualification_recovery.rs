@@ -65,7 +65,7 @@ pub(crate) fn validate_v17_schema(connection: &Connection) -> Result<(), String>
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if version != 17 {
+    if !matches!(version, 17..=18) {
         return Err(format!(
             "provider qualification recovery schema version mismatch: {version}"
         ));
@@ -109,7 +109,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn schema_17_migration_is_idempotent_and_validates_exact_launch_columns() {
+    fn schema_17_layout_is_preserved_by_schema_18_and_validates_exact_launch_columns() {
         let state = tempfile::tempdir().unwrap();
         let store = crate::store::ConfigStore::open_test(state.path()).unwrap();
         assert_eq!(
@@ -117,7 +117,7 @@ mod tests {
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            17
+            18
         );
         validate_v17_schema(&store.connection).unwrap();
         drop(store);
@@ -127,6 +127,7 @@ mod tests {
         crate::store::artifact_registry::validate_v13_schema(&reopened.connection).unwrap();
         crate::store::artifact_registry::validate_v14_schema(&reopened.connection).unwrap();
         validate_v17_schema(&reopened.connection).unwrap();
+        crate::store::agent_launch_phase::validate_v18_schema(&reopened.connection).unwrap();
         reopened
             .connection
             .execute_batch("DROP TRIGGER provider_qualification_launch_phase_transitions")
@@ -215,7 +216,7 @@ mod tests {
         let mut layout_statement = canonical
             .prepare(
                 "SELECT sql FROM sqlite_master
-                 WHERE tbl_name='provider_qualification_jobs' AND sql IS NOT NULL
+                 WHERE tbl_name IN ('provider_qualification_jobs','agent_launch_reservations') AND sql IS NOT NULL
                  ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, name",
             )
             .unwrap();
@@ -234,7 +235,12 @@ mod tests {
                         rex_window_id,rex_block_id,result_json,evidence_digest,created_at_unix,
                         updated_at_unix
                  FROM provider_qualification_jobs;
-                 DROP TABLE provider_qualification_jobs;",
+                 CREATE TEMP TABLE preserved_agent_launch_reservations AS
+                 SELECT agent_run_id,project_id,operation_id,controller_generation,project_epoch,
+                        reservation_digest,reservation_json,lifecycle,created_at_unix,updated_at_unix
+                 FROM agent_launch_reservations;
+                 DROP TABLE provider_qualification_jobs;
+                 DROP TABLE agent_launch_reservations;",
             )
             .unwrap();
         for statement in v16_layout {
@@ -254,7 +260,12 @@ mod tests {
                         updated_at_unix
                  FROM preserved_provider_qualification_jobs;
                  DROP TABLE preserved_provider_qualification_jobs;
-                 DELETE FROM schema_migrations WHERE version=17;
+                 INSERT INTO agent_launch_reservations
+                 SELECT agent_run_id,project_id,operation_id,controller_generation,project_epoch,
+                        reservation_digest,reservation_json,lifecycle,created_at_unix,updated_at_unix
+                 FROM preserved_agent_launch_reservations;
+                 DROP TABLE preserved_agent_launch_reservations;
+                 DELETE FROM schema_migrations WHERE version>=17;
                  PRAGMA user_version=16;",
             )
             .unwrap();

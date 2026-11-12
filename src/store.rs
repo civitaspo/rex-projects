@@ -21,6 +21,8 @@ use crate::launch::{
     RexViewCleanupCandidate, RexViewKind, RexViewRecord, authorize_start,
 };
 
+#[path = "store/agent_launch_phase.rs"]
+pub(crate) mod agent_launch_phase;
 pub mod agent_recovery;
 #[path = "store/dashboard_projection.rs"]
 pub mod dashboard_projection;
@@ -36,7 +38,7 @@ pub(crate) mod provider_qualification;
 #[path = "store/rex_view_tables.rs"]
 pub(crate) mod rex_view_tables;
 
-pub const SCHEMA_VERSION: i64 = 17;
+pub const SCHEMA_VERSION: i64 = 18;
 #[path = "store/accepted_plans.rs"]
 pub mod accepted_plans;
 pub mod agent_runtime;
@@ -436,6 +438,45 @@ impl Drop for MachineLock {
 }
 
 impl ConfigStore {
+    pub(crate) fn pre_handoff_agent_launch_admission(
+        &mut self,
+        owner_generation: u64,
+        reservation: &crate::launch::AgentLaunchReservation,
+    ) -> Result<agent_launch_phase::Admission, String> {
+        agent_launch_phase::pre_handoff_admission(
+            &mut self.connection,
+            owner_generation,
+            reservation,
+        )
+    }
+
+    pub(crate) fn mark_agent_launch_create_attempted(
+        &mut self,
+        owner_generation: u64,
+        reservation: &crate::launch::AgentLaunchReservation,
+    ) -> Result<agent_launch_phase::Admission, String> {
+        agent_launch_phase::mark_create_attempted(
+            &mut self.connection,
+            owner_generation,
+            reservation,
+        )
+    }
+
+    pub(crate) fn agent_launch_phase(
+        &self,
+        reservation: &crate::launch::AgentLaunchReservation,
+    ) -> Result<agent_launch_phase::Phase, String> {
+        agent_launch_phase::current_phase(&self.connection, reservation)
+    }
+
+    pub(crate) fn mark_agent_launch_ambiguous(
+        &mut self,
+        owner_generation: u64,
+        reservation: &crate::launch::AgentLaunchReservation,
+    ) -> Result<(), String> {
+        agent_launch_phase::mark_ambiguous(&mut self.connection, owner_generation, reservation)
+    }
+
     /// Open an existing controller database for read-only inspection.
     ///
     /// This path never creates the state root or database and never runs migrations.
@@ -567,7 +608,7 @@ impl ConfigStore {
             artifact_registry::validate_v12_schema(&connection)?;
             artifact_registry::validate_v13_schema(&connection)?;
         }
-        if matches!(existing_version, 14..=17) {
+        if matches!(existing_version, 14..=18) {
             artifact_registry::validate_v12_schema(&connection)?;
             artifact_registry::validate_v13_schema(&connection)?;
             artifact_registry::validate_v14_schema(&connection)?;
@@ -575,8 +616,11 @@ impl ConfigStore {
         if existing_version >= 16 {
             merge_claim_recovery::validate_v16_schema(&connection)?;
         }
-        if existing_version == 17 {
+        if existing_version >= 17 {
             provider_qualification_recovery::validate_v17_schema(&connection)?;
+        }
+        if existing_version == 18 {
+            agent_launch_phase::validate_v18_schema(&connection)?;
         }
         connection
             .execute_batch(
@@ -679,6 +723,14 @@ impl ConfigStore {
             provider_qualification_recovery::migrate_v17(&connection)?;
         }
         provider_qualification_recovery::validate_v17_schema(&connection)?;
+        if existing_version < 18 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            agent_launch_phase::migrate_v18(&connection)?;
+        }
+        artifact_registry::validate_v12_schema(&connection)?;
+        agent_launch_phase::validate_v18_schema(&connection)?;
         Ok(Self {
             connection,
             _machine_lock: machine_lock,
@@ -5313,7 +5365,10 @@ fn validate_effect(effect: &EffectIntent) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_active_generation(tx: &rusqlite::Transaction<'_>, expected: u64) -> Result<(), String> {
+pub(crate) fn validate_active_generation(
+    tx: &rusqlite::Transaction<'_>,
+    expected: u64,
+) -> Result<(), String> {
     let active: Option<u64> = tx.query_row("SELECT generation FROM controller_owners WHERE singleton=1 AND stopped_at_unix IS NULL", [], |row| row.get(0)).optional().map_err(|e| e.to_string())?;
     if active != Some(expected) {
         return Err("controller owner generation is stale".into());
@@ -6817,6 +6872,84 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn stale_ticket_run_after_create_attempt_is_never_typed_precreate_rejection() {
+        published_publication_fixture(
+            true,
+            Some(MergeClaimRecoveryFixture::StaleAfterCreateAttempt),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn stale_ticket_run_at_create_cas_rejects_and_cleans_handoff_on_replay() {
+        published_publication_fixture(
+            true,
+            Some(MergeClaimRecoveryFixture::StaleAtCreateCas),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn old_controller_cannot_win_precreate_cas_after_takeover() {
+        published_publication_fixture(
+            true,
+            Some(MergeClaimRecoveryFixture::OldOwnerPrecreateCas),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn exact_block_with_not_started_phase_is_marked_ambiguous_and_held() {
+        published_publication_fixture(
+            true,
+            Some(MergeClaimRecoveryFixture::ContradictoryObservedBlock),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn duplicate_agent_run_blocks_with_not_started_phase_are_ambiguous_and_held() {
+        published_publication_fixture(
+            true,
+            Some(MergeClaimRecoveryFixture::DuplicateObservedBlocks),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn mismatched_agent_run_block_metadata_with_not_started_phase_is_ambiguous_and_held() {
+        published_publication_fixture(
+            true,
+            Some(MergeClaimRecoveryFixture::MismatchedObservedBlockMetadata),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
     fn ticket_run_freshness_is_enforced_only_before_first_start_acknowledgement() {
         published_publication_fixture(
             true,
@@ -7332,6 +7465,12 @@ pub(crate) mod tests {
         Resume,
         AssessmentLaunch,
         StaleStartFence,
+        StaleAfterCreateAttempt,
+        StaleAtCreateCas,
+        OldOwnerPrecreateCas,
+        ContradictoryObservedBlock,
+        DuplicateObservedBlocks,
+        MismatchedObservedBlockMetadata,
         FirstStartAckFence,
         IntentLaunch,
         StaleCoordinatorConfig,
@@ -7363,7 +7502,35 @@ pub(crate) mod tests {
         );
         let exercise_stale_start_fence = matches!(
             recovery_case,
-            Some(MergeClaimRecoveryFixture::StaleStartFence)
+            Some(
+                MergeClaimRecoveryFixture::StaleStartFence
+                    | MergeClaimRecoveryFixture::StaleAfterCreateAttempt
+                    | MergeClaimRecoveryFixture::StaleAtCreateCas
+                    | MergeClaimRecoveryFixture::OldOwnerPrecreateCas
+                    | MergeClaimRecoveryFixture::ContradictoryObservedBlock
+                    | MergeClaimRecoveryFixture::DuplicateObservedBlocks
+                    | MergeClaimRecoveryFixture::MismatchedObservedBlockMetadata
+            )
+        );
+        let exercise_stale_after_create_attempt = matches!(
+            recovery_case,
+            Some(MergeClaimRecoveryFixture::StaleAfterCreateAttempt)
+        );
+        let exercise_stale_at_create_cas = matches!(
+            recovery_case,
+            Some(MergeClaimRecoveryFixture::StaleAtCreateCas)
+        );
+        let exercise_old_owner_precreate_cas = matches!(
+            recovery_case,
+            Some(MergeClaimRecoveryFixture::OldOwnerPrecreateCas)
+        );
+        let exercise_contradictory_observed_block = matches!(
+            recovery_case,
+            Some(
+                MergeClaimRecoveryFixture::ContradictoryObservedBlock
+                    | MergeClaimRecoveryFixture::DuplicateObservedBlocks
+                    | MergeClaimRecoveryFixture::MismatchedObservedBlockMetadata
+            )
         );
         let exercise_stale_recovery_config = matches!(
             recovery_case,
@@ -7485,6 +7652,11 @@ pub(crate) mod tests {
             );
             let window_state = temp.path().join("recovery-window-label");
             let split_state = temp.path().join("recovery-split-created");
+            let block_label_state = temp.path().join("recovery-agent-block-label");
+            let duplicate_state = temp.path().join("recovery-agent-block-duplicate");
+            let metadata_state = temp.path().join("recovery-agent-block-metadata-mismatch");
+            let metadata_calls_state = temp.path().join("recovery-agent-block-metadata-calls");
+            let split_calls_state = temp.path().join("recovery-split-calls");
             std::fs::write(
                 &window_state,
                 crate::adapters::rex::owned_ticket_window_label("github:acme/repo-a", "PAY-12")
@@ -7494,9 +7666,14 @@ pub(crate) mod tests {
             write_executable(
                 &rex_cli,
                 &format!(
-                    "#!/bin/sh\ncase \"$*\" in\n  *\"whoami --json\"*) printf '%s\\n' '{{\"endpoint\":\"http://fixture\",\"instance_id\":\"fixture-rex\",\"host_id\":\"fixture-host\",\"rex_version\":\"test\"}}' ;;\n  *\"api list --json\"*) printf '%s\\n' '{{\"methods\":{{\"session.view\":{{}},\"session.new_window\":{{}},\"session.new_split\":{{}},\"session.focus_block\":{{}},\"session.zoom_block\":{{}},\"block.close\":{{}}}}}}' ;;\n  *\"api call session.view\"*) label=$(cat '{window_state}'); if [ -f '{split_state}' ]; then printf '{{\"windows\":[{{\"window_id\":\"fixture-window\",\"label\":\"%s\",\"layers\":[{{\"blocks\":[{{\"block_id\":\"anchor-block\",\"label\":\"anchor\",\"flavor\":\"shell\"}},{{\"block_id\":\"recovery-merge-decision-block\",\"label\":\"agent\",\"flavor\":\"shell\"}}]}}]}}]}}\\n' \"$label\"; else printf '{{\"windows\":[{{\"window_id\":\"fixture-window\",\"label\":\"%s\",\"layers\":[{{\"blocks\":[{{\"block_id\":\"anchor-block\",\"label\":\"anchor\",\"flavor\":\"shell\"}}]}}]}}]}}\\n' \"$label\"; fi ;;\n  *\"api call session.new_split\"*) touch '{split_state}'; printf '%s\\n' '{{\"block_ids\":[\"recovery-merge-decision-block\"]}}' ;;\n  *\"api call session.new_window\"*) for arg do payload=$arg; done; label=$(printf '%s' \"$payload\" | sed -E 's/.*\\\"window_label\\\":\\\"([^\\\"]*)\\\".*/\\\\1/'); printf '%s' \"$label\" > '{window_state}'; printf '%s\\n' '{{\"window_id\":\"fixture-window\",\"block_ids\":[\"anchor-block\"]}}' ;;\n  *\"events -s fixture-session --json\"*) exit 0 ;;\n  *) exit 91 ;;\nesac\n",
+                    "#!/bin/sh\ncase \"$*\" in\n  *\"whoami --json\"*) printf '%s\\n' '{{\"endpoint\":\"http://fixture\",\"instance_id\":\"fixture-rex\",\"host_id\":\"fixture-host\",\"rex_version\":\"test\"}}' ;;\n  *\"api list --json\"*) printf '%s\\n' '{{\"methods\":{{\"session.view\":{{}},\"session.new_window\":{{}},\"session.new_split\":{{}},\"session.focus_block\":{{}},\"session.zoom_block\":{{}},\"block.close\":{{}}}}}}' ;;\n  *\"api call session.view\"*) label=$(cat '{window_state}'); window_id=fixture-window; if [ -f '{metadata_state}' ]; then calls=0; [ ! -f '{metadata_calls_state}' ] || calls=$(cat '{metadata_calls_state}'); calls=$((calls+1)); printf '%s' \"$calls\" > '{metadata_calls_state}'; if [ \"$calls\" -gt 1 ]; then window_id=contradictory-window; fi; fi; if [ -f '{split_state}' ]; then agent_label=$(cat '{block_label_state}'); if [ -f '{duplicate_state}' ]; then printf '{{\"windows\":[{{\"window_id\":\"%s\",\"label\":\"%s\",\"layers\":[{{\"blocks\":[{{\"block_id\":\"anchor-block\",\"label\":\"anchor\",\"flavor\":\"shell\"}},{{\"block_id\":\"recovery-merge-decision-block\",\"label\":\"%s\",\"flavor\":\"shell\"}},{{\"block_id\":\"recovery-merge-decision-block-duplicate\",\"label\":\"%s\",\"flavor\":\"shell\"}}]}}]}}]}}\\n' \"$window_id\" \"$label\" \"$agent_label\" \"$agent_label\"; else printf '{{\"windows\":[{{\"window_id\":\"%s\",\"label\":\"%s\",\"layers\":[{{\"blocks\":[{{\"block_id\":\"anchor-block\",\"label\":\"anchor\",\"flavor\":\"shell\"}},{{\"block_id\":\"recovery-merge-decision-block\",\"label\":\"%s\",\"flavor\":\"shell\"}}]}}]}}]}}\\n' \"$window_id\" \"$label\" \"$agent_label\"; fi; else printf '{{\"windows\":[{{\"window_id\":\"%s\",\"label\":\"%s\",\"layers\":[{{\"blocks\":[{{\"block_id\":\"anchor-block\",\"label\":\"anchor\",\"flavor\":\"shell\"}}]}}]}}]}}\\n' \"$window_id\" \"$label\"; fi ;;\n  *\"api call session.new_split\"*) printf 'called\\n' >> '{split_calls_state}'; for arg do payload=$arg; done; agent_label=$(printf '%s' \"$payload\" | sed -E 's/.*\\\"label\\\":\\\"([^\\\"]*)\\\".*/\\\\1/'); printf '%s' \"$agent_label\" > '{block_label_state}'; touch '{split_state}'; printf '%s\\n' '{{\"block_ids\":[\"recovery-merge-decision-block\"]}}' ;;\n  *\"api call session.new_window\"*) for arg do payload=$arg; done; label=$(printf '%s' \"$payload\" | sed -E 's/.*\\\"window_label\\\":\\\"([^\\\"]*)\\\".*/\\\\1/'); printf '%s' \"$label\" > '{window_state}'; printf '%s\\n' '{{\"window_id\":\"fixture-window\",\"block_ids\":[\"anchor-block\"]}}' ;;\n  *\"events -s fixture-session --json\"*) exit 0 ;;\n  *) exit 91 ;;\nesac\n",
                     window_state = window_state.display(),
                     split_state = split_state.display(),
+                    block_label_state = block_label_state.display(),
+                    duplicate_state = duplicate_state.display(),
+                    metadata_state = metadata_state.display(),
+                    metadata_calls_state = metadata_calls_state.display(),
+                    split_calls_state = split_calls_state.display(),
                 ),
             );
             write_executable(&provider_cli, "#!/bin/sh\nexit 0\n");
@@ -10046,6 +10223,12 @@ pub(crate) mod tests {
                         .agent_launch_reservation_for_run(&agent_run_id)
                         .unwrap()
                         .expect("runtime preparation persists an immutable launch reservation");
+                    let launch_phase: String = store.connection.query_row(
+                        "SELECT launch_phase FROM agent_launch_reservations WHERE agent_run_id=?1",
+                        [agent_run_id.as_str()],
+                        |row| row.get(0),
+                    ).unwrap();
+                    assert_eq!(launch_phase, "not_started");
                     assert_eq!(
                         reservation.ticket_revision.unwrap().0,
                         subject.blocked_revision + 1
@@ -10062,9 +10245,128 @@ pub(crate) mod tests {
                         1
                     );
                     if exercise_stale_start_fence {
-                        store
-                            .validate_start_agent_ticket_run(owner_generation, &reservation)
-                            .expect("the prepared reservation is current before the race");
+                        super::agent_runtime::validate_start_agent_ticket_run(
+                            &store.connection,
+                            owner_generation,
+                            &reservation,
+                        )
+                        .expect("the prepared reservation is current before the race");
+                        if exercise_old_owner_precreate_cas {
+                            let new_generation = store
+                                .start_owner(&OwnerMetadata {
+                                    owner_nonce: "precreate-cas-takeover".into(),
+                                    state_root: temp.path().to_string_lossy().into_owned(),
+                                    config_source: "factory".into(),
+                                    process_start_identity: "precreate-cas-takeover-test".into(),
+                                    executable_path: "/tmp/rex-projects-test".into(),
+                                    executable_digest: "e".repeat(64),
+                                    rex_endpoint: None,
+                                    rex_server_identity: None,
+                                    rex_session_id: None,
+                                    rex_block_id: None,
+                                })
+                                .unwrap();
+                            assert!(new_generation > owner_generation);
+                            let error = store
+                                .mark_agent_launch_create_attempted(owner_generation, &reservation)
+                                .unwrap_err();
+                            assert!(error.contains("owner generation is stale"), "{error}");
+                            assert_eq!(
+                                store.agent_launch_phase(&reservation).unwrap(),
+                                super::agent_launch_phase::Phase::NotStarted
+                            );
+                            let held: (String, String) = store.connection.query_row(
+                                "SELECT disposition,owner_id FROM execution_slots WHERE pool=?1 AND slot_index=?2",
+                                rusqlite::params![reservation.pool,reservation.slot_index],
+                                |row| Ok((row.get(0)?,row.get(1)?)),
+                            ).unwrap();
+                            assert_eq!(held.0, "unknown");
+                            assert_eq!(held.1, reservation.agent_run_id.as_str());
+                            return;
+                        }
+                        if exercise_contradictory_observed_block {
+                            std::fs::write(temp.path().join("recovery-split-created"), "existing")
+                                .unwrap();
+                            std::fs::write(
+                                temp.path().join("recovery-agent-block-label"),
+                                crate::adapters::rex::owned_agent_block_label(
+                                    agent_run_id.as_str(),
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap();
+                            match recovery_case.unwrap() {
+                                MergeClaimRecoveryFixture::DuplicateObservedBlocks => {
+                                    std::fs::write(
+                                        temp.path().join("recovery-agent-block-duplicate"),
+                                        "duplicate",
+                                    )
+                                    .unwrap();
+                                }
+                                MergeClaimRecoveryFixture::MismatchedObservedBlockMetadata => {
+                                    std::fs::write(
+                                        temp.path().join("recovery-agent-block-metadata-mismatch"),
+                                        "mismatch",
+                                    )
+                                    .unwrap();
+                                }
+                                _ => {}
+                            }
+                            let error = services
+                                .ensure_parked_wrapper_for_test(
+                                    &mut store,
+                                    20,
+                                    &reservation,
+                                    &temp.path().join("absolute-environment-handoff"),
+                                )
+                                .unwrap_err();
+                            assert!(
+                                error.contains("not_started")
+                                    || error.contains("multiple Rex blocks")
+                                    || error.contains("does not match the AgentRun"),
+                                "{error}"
+                            );
+                            assert_eq!(
+                                store.agent_launch_phase(&reservation).unwrap(),
+                                super::agent_launch_phase::Phase::Ambiguous
+                            );
+                            assert!(!temp.path().join("recovery-split-calls").exists());
+                            let held: (String, String) = store.connection.query_row(
+                                "SELECT disposition,owner_id FROM execution_slots WHERE pool=?1 AND slot_index=?2",
+                                rusqlite::params![reservation.pool,reservation.slot_index],
+                                |row| Ok((row.get(0)?,row.get(1)?)),
+                            ).unwrap();
+                            assert_ne!(held.0, "released");
+                            assert_eq!(held.1, reservation.agent_run_id.as_str());
+                            return;
+                        }
+                        if exercise_stale_after_create_attempt {
+                            assert_eq!(
+                                store
+                                    .mark_agent_launch_create_attempted(
+                                        owner_generation,
+                                        &reservation
+                                    )
+                                    .unwrap(),
+                                super::agent_launch_phase::Admission::Proceed,
+                            );
+                            assert!(
+                                store
+                                    .mark_agent_launch_create_attempted(
+                                        owner_generation,
+                                        &reservation
+                                    )
+                                    .is_err()
+                            );
+                        } else {
+                            let retained_handoff = environment
+                                .create_handoff_for_operation(
+                                    &runtime_state,
+                                    reservation.operation_id.as_str(),
+                                )
+                                .unwrap();
+                            assert!(retained_handoff.path().exists());
+                        }
                         let reserved_revision = reservation.ticket_revision.unwrap().0;
                         store
                             .connection
@@ -10073,6 +10375,100 @@ pub(crate) mod tests {
                                 rusqlite::params![project_id.as_str(), reserved_revision + 1, ticket_run_id.as_str()],
                             )
                             .unwrap();
+
+                        let cas_rejection = if exercise_stale_at_create_cas {
+                            match store
+                                .mark_agent_launch_create_attempted(owner_generation, &reservation)
+                                .unwrap()
+                            {
+                                super::agent_launch_phase::Admission::Rejected { receipt } => {
+                                    assert!(receipt.contains("ticket_run_stale_before_rex_create"));
+                                    assert!(
+                                        environment
+                                            .operation_handoff_path(
+                                                &runtime_state,
+                                                reservation.operation_id.as_str(),
+                                            )
+                                            .unwrap()
+                                            .exists()
+                                    );
+                                    Some(receipt)
+                                }
+                                other => {
+                                    panic!("stale create CAS must reject before Rex: {other:?}")
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
+                        if exercise_stale_at_create_cas {
+                            // Model a crash after the durable no-create marker but before
+                            // the handler can clean its one-use handoff. A later replay must
+                            // return the same rejection even after the Project changes.
+                            store
+                                .connection
+                                .execute(
+                                    "UPDATE projects SET desired_lifecycle='paused' WHERE project_id=?1",
+                                    [project_id.as_str()],
+                                )
+                                .unwrap();
+                            store
+                                .connection
+                                .execute(
+                                    "UPDATE project_runtimes SET desired_lifecycle='paused',observed_lifecycle='paused',project_epoch=project_epoch+1 WHERE project_id=?1",
+                                    [project_id.as_str()],
+                                )
+                                .unwrap();
+                            assert!(
+                                store
+                                    .pre_handoff_agent_launch_admission(
+                                        owner_generation + 1,
+                                        &reservation,
+                                    )
+                                    .is_err(),
+                                "replay still requires the active controller owner"
+                            );
+                            let mut substituted_reservation = reservation.clone();
+                            substituted_reservation.config_digest =
+                                Digest::parse("d".repeat(64)).unwrap();
+                            assert!(
+                                store
+                                    .pre_handoff_agent_launch_admission(
+                                        owner_generation,
+                                        &substituted_reservation,
+                                    )
+                                    .is_err(),
+                                "replay still requires the immutable reservation"
+                            );
+                            assert_eq!(
+                                store.agent_launch_phase(&reservation).unwrap(),
+                                super::agent_launch_phase::Phase::PrecreateRejected,
+                                "failed identity checks must leave the durable rejection intact"
+                            );
+                            assert!(
+                                services
+                                    .ensure_parked_wrapper_for_test(
+                                        &mut store,
+                                        20,
+                                        &reservation,
+                                        &temp.path().join("absolute-environment-handoff"),
+                                    )
+                                    .unwrap_err()
+                                    .contains("Project"),
+                                "live wrapper/create paths must still reject a changed Project"
+                            );
+                            assert!(
+                                environment
+                                    .operation_handoff_path(
+                                        &runtime_state,
+                                        reservation.operation_id.as_str(),
+                                    )
+                                    .unwrap()
+                                    .exists(),
+                                "the simulated interrupted handler has not cleaned the handoff yet"
+                            );
+                        }
 
                         let payload = crate::launch::StartAgentEffectPayload {
                             schema_version: crate::launch::LAUNCH_SCHEMA_VERSION,
@@ -10104,8 +10500,54 @@ pub(crate) mod tests {
                                 now_unix: 20,
                             },
                         );
-                        assert!(result.unwrap_err().contains("active phase changed"));
+                        if exercise_stale_after_create_attempt {
+                            let error = result.unwrap_err();
+                            assert!(error.contains("after the Rex create boundary"), "{error}");
+                        } else {
+                            let rejection_receipt = match result.unwrap() {
+                                crate::effects::EffectObservation::Rejected { receipt } => receipt,
+                                other => panic!(
+                                    "stale pre-create TicketRun must be typed Rejected, got {other:?}"
+                                ),
+                            };
+                            assert!(
+                                rejection_receipt.contains("ticket_run_stale_before_rex_create")
+                            );
+                            if let Some(expected) = cas_rejection {
+                                assert_eq!(rejection_receipt, expected);
+                            }
+                            let replay = services
+                                .handle_start_agent_for_test(
+                                    crate::effects::EffectMode::Reconcile,
+                                    &request,
+                                    &mut crate::effects::EffectContext {
+                                        store: &mut store,
+                                        owner_generation,
+                                        now_unix: 21,
+                                    },
+                                )
+                                .unwrap();
+                            assert_eq!(
+                                replay,
+                                crate::effects::EffectObservation::Rejected {
+                                    receipt: rejection_receipt,
+                                },
+                                "a crash before effect completion must replay the same durable rejection",
+                            );
+                        }
                         assert!(!reservation.descriptor_path.exists());
+                        if !exercise_stale_after_create_attempt {
+                            assert!(
+                                !environment
+                                    .operation_handoff_path(
+                                        &runtime_state,
+                                        reservation.operation_id.as_str(),
+                                    )
+                                    .unwrap()
+                                    .exists(),
+                                "durable precreate rejection replay cleans the exact unused handoff",
+                            );
+                        }
                         assert!(!temp.path().join("recovery-split-created").exists());
                         let lifecycle: String = store
                             .connection
@@ -10116,6 +10558,19 @@ pub(crate) mod tests {
                             )
                             .unwrap();
                         assert_eq!(lifecycle, "reserved");
+                        let phase: String = store.connection.query_row(
+                            "SELECT launch_phase FROM agent_launch_reservations WHERE agent_run_id=?1",
+                            [agent_run_id.as_str()],
+                            |row| row.get(0),
+                        ).unwrap();
+                        assert_eq!(
+                            phase,
+                            if exercise_stale_after_create_attempt {
+                                "create_attempted"
+                            } else {
+                                "precreate_rejected"
+                            }
+                        );
                         let (stored_digest, stored_json): (String, String) = store
                             .connection
                             .query_row(
@@ -10136,8 +10591,8 @@ pub(crate) mod tests {
                                 |row| Ok((row.get(0)?, row.get(1)?)),
                             )
                             .unwrap();
-                        assert_ne!(slot.0, "released");
                         assert_eq!(slot.1, agent_run_id.as_str());
+                        assert_ne!(slot.0, "released");
                         let authority_count: u64 = store
                             .connection
                             .query_row(
@@ -10154,10 +10609,14 @@ pub(crate) mod tests {
                             &reservation,
                             &temp.path().join("absolute-environment-handoff"),
                         );
+                        let wrapper_error = wrapper_attempt.unwrap_err();
                         assert!(
-                            wrapper_attempt
-                                .unwrap_err()
-                                .contains("active phase changed")
+                            if exercise_stale_at_create_cas {
+                                wrapper_error.contains("Project")
+                            } else {
+                                wrapper_error.contains("durable create boundary")
+                            },
+                            "{wrapper_error}"
                         );
                         assert!(!temp.path().join("recovery-split-created").exists());
 
@@ -10178,10 +10637,15 @@ pub(crate) mod tests {
                             &reservation,
                             &late_block,
                         );
+                        let package_error = late_package.unwrap_err();
                         assert!(
-                            late_package
-                                .unwrap_err()
-                                .contains("missing or terminal TicketRun")
+                            if exercise_stale_at_create_cas {
+                                package_error.contains("Project")
+                                    || package_error.contains("missing or terminal TicketRun")
+                            } else {
+                                package_error.contains("missing or terminal TicketRun")
+                            },
+                            "{package_error}"
                         );
                         return;
                     }
@@ -10244,6 +10708,12 @@ pub(crate) mod tests {
                         recovery_case,
                         Some(MergeClaimRecoveryFixture::FirstStartAckFence)
                     ) {
+                        assert_eq!(
+                            store
+                                .mark_agent_launch_create_attempted(owner_generation, &reservation)
+                                .unwrap(),
+                            super::agent_launch_phase::Admission::Proceed,
+                        );
                         let authority = AgentLaunchAuthority {
                             agent_run_id: reservation.agent_run_id.clone(),
                             project_id: reservation.project_id.clone(),
@@ -10261,7 +10731,7 @@ pub(crate) mod tests {
                             operation_id: reservation.operation_id.clone(),
                             operation_recipe_id: reservation.operation_recipe_id.clone(),
                             rex_view_id: reservation.rex_view_id.clone(),
-                            descriptor_digest: package_digest,
+                            descriptor_digest: package_digest.clone(),
                             runtime_binary_digest: reservation.runtime_binary_digest.clone(),
                             descriptor_path: reservation.descriptor_path.clone(),
                             environment_snapshot_id: reservation.environment_snapshot_id.clone(),
@@ -10315,6 +10785,71 @@ pub(crate) mod tests {
                                 &authority,
                             )
                             .unwrap();
+                        // Simulate the prior create being visible in Rex but its wrapper ACK
+                        // being lost. The production materializer must adopt this exact block
+                        // without issuing a second split or recreating the one-use env handoff.
+                        let split_state = temp.path().join("recovery-split-created");
+                        let split_calls = temp.path().join("recovery-split-calls");
+                        let expected_block_label =
+                            crate::adapters::rex::owned_agent_block_label(agent_run_id.as_str())
+                                .unwrap();
+                        std::fs::write(&split_state, "prior-create").unwrap();
+                        std::fs::write(
+                            temp.path().join("recovery-agent-block-label"),
+                            &expected_block_label,
+                        )
+                        .unwrap();
+                        let handoff = services
+                            .environment_handoff_path_for_test(&mut store, 20, &reservation)
+                            .unwrap();
+                        assert!(handoff.is_absolute());
+                        assert!(
+                            !handoff.exists(),
+                            "retry must not recreate the consumed one-use handoff"
+                        );
+                        let adopted = services
+                            .ensure_parked_wrapper_for_test(&mut store, 20, &reservation, &handoff)
+                            .unwrap();
+                        assert_eq!(adopted.block_id, observed_block.block_id);
+                        assert_eq!(adopted.label, expected_block_label);
+                        assert!(
+                            !split_calls.exists(),
+                            "adoption must not issue another Rex create"
+                        );
+                        assert_eq!(
+                            store.agent_launch_phase(&reservation).unwrap(),
+                            super::agent_launch_phase::Phase::CreateAttempted
+                        );
+                        let replayed_package = services
+                            .build_run_step_package_for_test(
+                                &mut store,
+                                20,
+                                &reservation,
+                                &observed_block,
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            replayed_package
+                                .publish_once(&reservation.descriptor_path)
+                                .unwrap(),
+                            package_digest,
+                            "authorized retry must rebuild the identical immutable package",
+                        );
+                        store
+                            .finalize_agent_launch_reservation(
+                                owner_generation,
+                                &agent_run_id,
+                                &reservation.digest().unwrap(),
+                                &authority,
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            store
+                                .pre_handoff_agent_launch_admission(owner_generation, &reservation)
+                                .unwrap(),
+                            super::agent_launch_phase::Admission::Proceed,
+                            "authorized-but-unacknowledged retries may reconcile their exact prior block",
+                        );
                         let request = crate::launch::AgentStartRequest {
                             schema_version: crate::launch::LAUNCH_SCHEMA_VERSION,
                             operation_id: reservation.operation_id.clone(),
@@ -10361,6 +10896,16 @@ pub(crate) mod tests {
                             ).unwrap();
                             let error = store.authorize_agent_start(owner_generation, &request, &observed).expect_err("a stale prepared TicketRun must not receive its first start ACK");
                             assert!(error.contains("active phase changed"), "{error}");
+                            let error = store
+                                .pre_handoff_agent_launch_admission(owner_generation, &reservation)
+                                .expect_err(
+                                    "stale TicketRun after a create attempt must remain uncertain",
+                                );
+                            assert!(error.contains("after the Rex create boundary"), "{error}");
+                            assert_eq!(
+                                store.agent_launch_phase(&reservation).unwrap(),
+                                super::agent_launch_phase::Phase::CreateAttempted
+                            );
                             assert_eq!(store.persisted_start_receipt(&request).unwrap(), None);
                             let current_slot: (String, String, u64) = store.connection.query_row(
                                 "SELECT disposition,owner_id,reservation_epoch FROM execution_slots WHERE pool=?1 AND slot_index=?2",

@@ -313,7 +313,7 @@ pub(crate) fn validate_v12_schema(connection: &Connection) -> Result<(), String>
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if !matches!(version, 12..=17) {
+    if !matches!(version, 12..=18) {
         return Err(format!(
             "artifact registry schema version mismatch: {version}"
         ));
@@ -338,6 +338,9 @@ pub(crate) fn validate_v12_schema(connection: &Connection) -> Result<(), String>
     }
     if version >= 17 {
         crate::store::provider_qualification_recovery::apply_v17_layout(&canonical)?;
+    }
+    if version >= 18 {
+        crate::store::agent_launch_phase::apply_v18_layout(&canonical)?;
     }
     for table in V12_TABLES {
         let actual = read_table_layout(connection, table)?;
@@ -422,7 +425,7 @@ pub fn validate_v13_schema(connection: &Connection) -> Result<(), String> {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if !matches!(version, 13..=17) {
+    if !matches!(version, 13..=18) {
         return Err(format!(
             "Agent block lifecycle schema version mismatch: {version}"
         ));
@@ -499,7 +502,7 @@ pub fn validate_v14_schema(connection: &Connection) -> Result<(), String> {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if !matches!(version, 14..=17) {
+    if !matches!(version, 14..=18) {
         return Err(format!(
             "process evidence schema version mismatch: {version}"
         ));
@@ -605,6 +608,18 @@ pub(super) fn canonical_v12_schema() -> Result<Connection, String> {
     crate::store::publication_monitor::migrate_v12_publication_baselines(&tx)?;
     crate::store::merge_work::migrate_v12_merge_work_items(&tx)?;
     tx.commit().map_err(|error| error.to_string())?;
+    Ok(canonical)
+}
+
+pub(super) fn canonical_v18_schema() -> Result<Connection, String> {
+    let canonical = canonical_v12_schema()?;
+    let tx = canonical
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    crate::store::ConfigStore::migrate_v14_process_evidence(&tx)?;
+    tx.commit().map_err(|error| error.to_string())?;
+    crate::store::provider_qualification_recovery::apply_v17_layout(&canonical)?;
+    crate::store::agent_launch_phase::apply_v18_layout(&canonical)?;
     Ok(canonical)
 }
 
@@ -1710,6 +1725,16 @@ mod tests {
                 )
                 .unwrap()
         });
+        let reservation_layout = canonical
+            .prepare(
+                "SELECT sql FROM sqlite_master WHERE tbl_name='agent_launch_reservations' AND sql IS NOT NULL
+                 ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         let connection = Connection::open(&database).unwrap();
         assert_eq!(
             connection
@@ -1726,6 +1751,12 @@ mod tests {
             .execute_batch(
                 "PRAGMA foreign_keys=OFF;
                  BEGIN IMMEDIATE;
+                 DROP TRIGGER agent_launch_phase_transitions;
+                 CREATE TEMP TABLE saved_agent_launch_reservations AS
+                     SELECT agent_run_id,project_id,operation_id,controller_generation,project_epoch,
+                            reservation_digest,reservation_json,lifecycle,created_at_unix,updated_at_unix
+                     FROM agent_launch_reservations;
+                 DROP TABLE agent_launch_reservations;
                  DROP TRIGGER agent_run_adoptions_immutable_update;
                  DROP TRIGGER agent_run_adoptions_immutable_delete;
                  CREATE TEMP TABLE saved_agent_run_adoptions AS SELECT * FROM agent_run_adoptions;
@@ -1740,6 +1771,18 @@ mod tests {
                  DELETE FROM schema_migrations WHERE version>=14;
                  PRAGMA user_version=13;
                  ",
+            )
+            .unwrap();
+        for statement in reservation_layout {
+            connection.execute_batch(&statement).unwrap();
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO agent_launch_reservations
+                 SELECT agent_run_id,project_id,operation_id,controller_generation,project_epoch,
+                        reservation_digest,reservation_json,lifecycle,created_at_unix,updated_at_unix
+                 FROM saved_agent_launch_reservations;
+                 DROP TABLE saved_agent_launch_reservations;",
             )
             .unwrap();
         for statement in provider_layout {

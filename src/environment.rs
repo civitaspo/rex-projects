@@ -163,20 +163,9 @@ impl EnvironmentSnapshot {
         state_root: &Path,
         operation_id: &str,
     ) -> Result<EnvironmentHandoff, EnvironmentError> {
-        if operation_id.is_empty() || operation_id.len() > 128 || operation_id.contains('\0') {
-            return Err(EnvironmentError::Invalid(
-                "invalid launch operation identity",
-            ));
-        }
         let directory = state_root.join("environment-handoffs");
         create_private_directory(&directory)?;
-        let identity = [
-            self.metadata.id.as_str().as_bytes(),
-            b"\0",
-            operation_id.as_bytes(),
-        ]
-        .concat();
-        let path = directory.join(format!("{:x}.env", Sha256::digest(identity)));
+        let path = self.operation_handoff_path(state_root, operation_id)?;
         let _lock = lock_handoff(&path)?;
         let claim_path = path.with_extension("env.claim");
         if claim_path.exists() {
@@ -224,6 +213,62 @@ impl EnvironmentSnapshot {
             consumed: false,
             retained: true,
         })
+    }
+
+    /// Return the deterministic path used by an operation-scoped handoff without creating or
+    /// reopening the one-use credential file. Recovery may use this only when it adopts an
+    /// already-created Rex block and must not issue another create.
+    pub fn operation_handoff_path(
+        &self,
+        state_root: &Path,
+        operation_id: &str,
+    ) -> Result<PathBuf, EnvironmentError> {
+        if operation_id.is_empty() || operation_id.len() > 128 || operation_id.contains('\0') {
+            return Err(EnvironmentError::Invalid(
+                "invalid launch operation identity",
+            ));
+        }
+        let identity = [
+            self.metadata.id.as_str().as_bytes(),
+            b"\0",
+            operation_id.as_bytes(),
+        ]
+        .concat();
+        Ok(state_root
+            .join("environment-handoffs")
+            .join(format!("{:x}.env", Sha256::digest(identity))))
+    }
+
+    /// Remove a launch handoff only after the caller has durably classified the matching
+    /// operation as rejected before Rex creation. A claimed handoff is never removed.
+    pub(crate) fn discard_unclaimed_operation_handoff(
+        &self,
+        state_root: &Path,
+        operation_id: &str,
+    ) -> Result<(), EnvironmentError> {
+        let path = self.operation_handoff_path(state_root, operation_id)?;
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(EnvironmentError::Handoff),
+            Ok(_) => {}
+        }
+        let _lock = lock_handoff(&path)?;
+        if path.with_extension("env.claim").exists() {
+            return Err(EnvironmentError::Handoff);
+        }
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                let bytes = read_handoff_bytes(&path)?;
+                let nonce = handoff_nonce(&bytes, &self.metadata.id, operation_id)?;
+                let _ = read_handoff(&path, &self.metadata.id, operation_id, &nonce)?;
+                std::fs::remove_file(&path).map_err(|_| EnvironmentError::Handoff)?;
+                sync_handoff_directory(&path)?;
+            }
+            Ok(_) => return Err(EnvironmentError::Handoff),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(EnvironmentError::Handoff),
+        }
+        Ok(())
     }
 
     /// Create a deterministic one-use handoff for a profile trial. The file remains available
