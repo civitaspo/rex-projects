@@ -6924,6 +6924,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn duplicate_agent_run_blocks_with_not_started_phase_are_ambiguous_and_held() {
+        published_publication_fixture(
+            true,
+            Some(MergeClaimRecoveryFixture::DuplicateObservedBlocks),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn mismatched_agent_run_block_metadata_with_not_started_phase_is_ambiguous_and_held() {
+        published_publication_fixture(
+            true,
+            Some(MergeClaimRecoveryFixture::MismatchedObservedBlockMetadata),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
     fn ticket_run_freshness_is_enforced_only_before_first_start_acknowledgement() {
         published_publication_fixture(
             true,
@@ -7443,6 +7469,8 @@ pub(crate) mod tests {
         StaleAtCreateCas,
         OldOwnerPrecreateCas,
         ContradictoryObservedBlock,
+        DuplicateObservedBlocks,
+        MismatchedObservedBlockMetadata,
         FirstStartAckFence,
         IntentLaunch,
         StaleCoordinatorConfig,
@@ -7480,6 +7508,8 @@ pub(crate) mod tests {
                     | MergeClaimRecoveryFixture::StaleAtCreateCas
                     | MergeClaimRecoveryFixture::OldOwnerPrecreateCas
                     | MergeClaimRecoveryFixture::ContradictoryObservedBlock
+                    | MergeClaimRecoveryFixture::DuplicateObservedBlocks
+                    | MergeClaimRecoveryFixture::MismatchedObservedBlockMetadata
             )
         );
         let exercise_stale_after_create_attempt = matches!(
@@ -7496,7 +7526,11 @@ pub(crate) mod tests {
         );
         let exercise_contradictory_observed_block = matches!(
             recovery_case,
-            Some(MergeClaimRecoveryFixture::ContradictoryObservedBlock)
+            Some(
+                MergeClaimRecoveryFixture::ContradictoryObservedBlock
+                    | MergeClaimRecoveryFixture::DuplicateObservedBlocks
+                    | MergeClaimRecoveryFixture::MismatchedObservedBlockMetadata
+            )
         );
         let exercise_stale_recovery_config = matches!(
             recovery_case,
@@ -7619,6 +7653,9 @@ pub(crate) mod tests {
             let window_state = temp.path().join("recovery-window-label");
             let split_state = temp.path().join("recovery-split-created");
             let block_label_state = temp.path().join("recovery-agent-block-label");
+            let duplicate_state = temp.path().join("recovery-agent-block-duplicate");
+            let metadata_state = temp.path().join("recovery-agent-block-metadata-mismatch");
+            let metadata_calls_state = temp.path().join("recovery-agent-block-metadata-calls");
             let split_calls_state = temp.path().join("recovery-split-calls");
             std::fs::write(
                 &window_state,
@@ -7629,10 +7666,13 @@ pub(crate) mod tests {
             write_executable(
                 &rex_cli,
                 &format!(
-                    "#!/bin/sh\ncase \"$*\" in\n  *\"whoami --json\"*) printf '%s\\n' '{{\"endpoint\":\"http://fixture\",\"instance_id\":\"fixture-rex\",\"host_id\":\"fixture-host\",\"rex_version\":\"test\"}}' ;;\n  *\"api list --json\"*) printf '%s\\n' '{{\"methods\":{{\"session.view\":{{}},\"session.new_window\":{{}},\"session.new_split\":{{}},\"session.focus_block\":{{}},\"session.zoom_block\":{{}},\"block.close\":{{}}}}}}' ;;\n  *\"api call session.view\"*) label=$(cat '{window_state}'); if [ -f '{split_state}' ]; then agent_label=$(cat '{block_label_state}'); printf '{{\"windows\":[{{\"window_id\":\"fixture-window\",\"label\":\"%s\",\"layers\":[{{\"blocks\":[{{\"block_id\":\"anchor-block\",\"label\":\"anchor\",\"flavor\":\"shell\"}},{{\"block_id\":\"recovery-merge-decision-block\",\"label\":\"%s\",\"flavor\":\"shell\"}}]}}]}}]}}\\n' \"$label\" \"$agent_label\"; else printf '{{\"windows\":[{{\"window_id\":\"fixture-window\",\"label\":\"%s\",\"layers\":[{{\"blocks\":[{{\"block_id\":\"anchor-block\",\"label\":\"anchor\",\"flavor\":\"shell\"}}]}}]}}]}}\\n' \"$label\"; fi ;;\n  *\"api call session.new_split\"*) printf 'called\\n' >> '{split_calls_state}'; for arg do payload=$arg; done; agent_label=$(printf '%s' \"$payload\" | sed -E 's/.*\\\"label\\\":\\\"([^\\\"]*)\\\".*/\\\\1/'); printf '%s' \"$agent_label\" > '{block_label_state}'; touch '{split_state}'; printf '%s\\n' '{{\"block_ids\":[\"recovery-merge-decision-block\"]}}' ;;\n  *\"api call session.new_window\"*) for arg do payload=$arg; done; label=$(printf '%s' \"$payload\" | sed -E 's/.*\\\"window_label\\\":\\\"([^\\\"]*)\\\".*/\\\\1/'); printf '%s' \"$label\" > '{window_state}'; printf '%s\\n' '{{\"window_id\":\"fixture-window\",\"block_ids\":[\"anchor-block\"]}}' ;;\n  *\"events -s fixture-session --json\"*) exit 0 ;;\n  *) exit 91 ;;\nesac\n",
+                    "#!/bin/sh\ncase \"$*\" in\n  *\"whoami --json\"*) printf '%s\\n' '{{\"endpoint\":\"http://fixture\",\"instance_id\":\"fixture-rex\",\"host_id\":\"fixture-host\",\"rex_version\":\"test\"}}' ;;\n  *\"api list --json\"*) printf '%s\\n' '{{\"methods\":{{\"session.view\":{{}},\"session.new_window\":{{}},\"session.new_split\":{{}},\"session.focus_block\":{{}},\"session.zoom_block\":{{}},\"block.close\":{{}}}}}}' ;;\n  *\"api call session.view\"*) label=$(cat '{window_state}'); window_id=fixture-window; if [ -f '{metadata_state}' ]; then calls=0; [ ! -f '{metadata_calls_state}' ] || calls=$(cat '{metadata_calls_state}'); calls=$((calls+1)); printf '%s' \"$calls\" > '{metadata_calls_state}'; if [ \"$calls\" -gt 1 ]; then window_id=contradictory-window; fi; fi; if [ -f '{split_state}' ]; then agent_label=$(cat '{block_label_state}'); if [ -f '{duplicate_state}' ]; then printf '{{\"windows\":[{{\"window_id\":\"%s\",\"label\":\"%s\",\"layers\":[{{\"blocks\":[{{\"block_id\":\"anchor-block\",\"label\":\"anchor\",\"flavor\":\"shell\"}},{{\"block_id\":\"recovery-merge-decision-block\",\"label\":\"%s\",\"flavor\":\"shell\"}},{{\"block_id\":\"recovery-merge-decision-block-duplicate\",\"label\":\"%s\",\"flavor\":\"shell\"}}]}}]}}]}}\\n' \"$window_id\" \"$label\" \"$agent_label\" \"$agent_label\"; else printf '{{\"windows\":[{{\"window_id\":\"%s\",\"label\":\"%s\",\"layers\":[{{\"blocks\":[{{\"block_id\":\"anchor-block\",\"label\":\"anchor\",\"flavor\":\"shell\"}},{{\"block_id\":\"recovery-merge-decision-block\",\"label\":\"%s\",\"flavor\":\"shell\"}}]}}]}}]}}\\n' \"$window_id\" \"$label\" \"$agent_label\"; fi; else printf '{{\"windows\":[{{\"window_id\":\"%s\",\"label\":\"%s\",\"layers\":[{{\"blocks\":[{{\"block_id\":\"anchor-block\",\"label\":\"anchor\",\"flavor\":\"shell\"}}]}}]}}]}}\\n' \"$window_id\" \"$label\"; fi ;;\n  *\"api call session.new_split\"*) printf 'called\\n' >> '{split_calls_state}'; for arg do payload=$arg; done; agent_label=$(printf '%s' \"$payload\" | sed -E 's/.*\\\"label\\\":\\\"([^\\\"]*)\\\".*/\\\\1/'); printf '%s' \"$agent_label\" > '{block_label_state}'; touch '{split_state}'; printf '%s\\n' '{{\"block_ids\":[\"recovery-merge-decision-block\"]}}' ;;\n  *\"api call session.new_window\"*) for arg do payload=$arg; done; label=$(printf '%s' \"$payload\" | sed -E 's/.*\\\"window_label\\\":\\\"([^\\\"]*)\\\".*/\\\\1/'); printf '%s' \"$label\" > '{window_state}'; printf '%s\\n' '{{\"window_id\":\"fixture-window\",\"block_ids\":[\"anchor-block\"]}}' ;;\n  *\"events -s fixture-session --json\"*) exit 0 ;;\n  *) exit 91 ;;\nesac\n",
                     window_state = window_state.display(),
                     split_state = split_state.display(),
                     block_label_state = block_label_state.display(),
+                    duplicate_state = duplicate_state.display(),
+                    metadata_state = metadata_state.display(),
+                    metadata_calls_state = metadata_calls_state.display(),
                     split_calls_state = split_calls_state.display(),
                 ),
             );
@@ -10255,6 +10295,23 @@ pub(crate) mod tests {
                                 .unwrap(),
                             )
                             .unwrap();
+                            match recovery_case.unwrap() {
+                                MergeClaimRecoveryFixture::DuplicateObservedBlocks => {
+                                    std::fs::write(
+                                        temp.path().join("recovery-agent-block-duplicate"),
+                                        "duplicate",
+                                    )
+                                    .unwrap();
+                                }
+                                MergeClaimRecoveryFixture::MismatchedObservedBlockMetadata => {
+                                    std::fs::write(
+                                        temp.path().join("recovery-agent-block-metadata-mismatch"),
+                                        "mismatch",
+                                    )
+                                    .unwrap();
+                                }
+                                _ => {}
+                            }
                             let error = services
                                 .ensure_parked_wrapper_for_test(
                                     &mut store,
@@ -10263,7 +10320,12 @@ pub(crate) mod tests {
                                     &temp.path().join("absolute-environment-handoff"),
                                 )
                                 .unwrap_err();
-                            assert!(error.contains("not_started"), "{error}");
+                            assert!(
+                                error.contains("not_started")
+                                    || error.contains("multiple Rex blocks")
+                                    || error.contains("does not match the AgentRun"),
+                                "{error}"
+                            );
                             assert_eq!(
                                 store.agent_launch_phase(&reservation).unwrap(),
                                 super::agent_launch_phase::Phase::Ambiguous
@@ -10339,6 +10401,74 @@ pub(crate) mod tests {
                         } else {
                             None
                         };
+
+                        if exercise_stale_at_create_cas {
+                            // Model a crash after the durable no-create marker but before
+                            // the handler can clean its one-use handoff. A later replay must
+                            // return the same rejection even after the Project changes.
+                            store
+                                .connection
+                                .execute(
+                                    "UPDATE projects SET desired_lifecycle='paused' WHERE project_id=?1",
+                                    [project_id.as_str()],
+                                )
+                                .unwrap();
+                            store
+                                .connection
+                                .execute(
+                                    "UPDATE project_runtimes SET desired_lifecycle='paused',observed_lifecycle='paused',project_epoch=project_epoch+1 WHERE project_id=?1",
+                                    [project_id.as_str()],
+                                )
+                                .unwrap();
+                            assert!(
+                                store
+                                    .pre_handoff_agent_launch_admission(
+                                        owner_generation + 1,
+                                        &reservation,
+                                    )
+                                    .is_err(),
+                                "replay still requires the active controller owner"
+                            );
+                            let mut substituted_reservation = reservation.clone();
+                            substituted_reservation.config_digest =
+                                Digest::parse("d".repeat(64)).unwrap();
+                            assert!(
+                                store
+                                    .pre_handoff_agent_launch_admission(
+                                        owner_generation,
+                                        &substituted_reservation,
+                                    )
+                                    .is_err(),
+                                "replay still requires the immutable reservation"
+                            );
+                            assert_eq!(
+                                store.agent_launch_phase(&reservation).unwrap(),
+                                super::agent_launch_phase::Phase::PrecreateRejected,
+                                "failed identity checks must leave the durable rejection intact"
+                            );
+                            assert!(
+                                services
+                                    .ensure_parked_wrapper_for_test(
+                                        &mut store,
+                                        20,
+                                        &reservation,
+                                        &temp.path().join("absolute-environment-handoff"),
+                                    )
+                                    .unwrap_err()
+                                    .contains("Project"),
+                                "live wrapper/create paths must still reject a changed Project"
+                            );
+                            assert!(
+                                environment
+                                    .operation_handoff_path(
+                                        &runtime_state,
+                                        reservation.operation_id.as_str(),
+                                    )
+                                    .unwrap()
+                                    .exists(),
+                                "the simulated interrupted handler has not cleaned the handoff yet"
+                            );
+                        }
 
                         let payload = crate::launch::StartAgentEffectPayload {
                             schema_version: crate::launch::LAUNCH_SCHEMA_VERSION,
@@ -10479,10 +10609,14 @@ pub(crate) mod tests {
                             &reservation,
                             &temp.path().join("absolute-environment-handoff"),
                         );
+                        let wrapper_error = wrapper_attempt.unwrap_err();
                         assert!(
-                            wrapper_attempt
-                                .unwrap_err()
-                                .contains("durable create boundary")
+                            if exercise_stale_at_create_cas {
+                                wrapper_error.contains("Project")
+                            } else {
+                                wrapper_error.contains("durable create boundary")
+                            },
+                            "{wrapper_error}"
                         );
                         assert!(!temp.path().join("recovery-split-created").exists());
 
@@ -10503,10 +10637,15 @@ pub(crate) mod tests {
                             &reservation,
                             &late_block,
                         );
+                        let package_error = late_package.unwrap_err();
                         assert!(
-                            late_package
-                                .unwrap_err()
-                                .contains("missing or terminal TicketRun")
+                            if exercise_stale_at_create_cas {
+                                package_error.contains("Project")
+                                    || package_error.contains("missing or terminal TicketRun")
+                            } else {
+                                package_error.contains("missing or terminal TicketRun")
+                            },
+                            "{package_error}"
                         );
                         return;
                     }

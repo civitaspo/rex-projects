@@ -58,7 +58,7 @@ fn rejection_receipt(reservation: &AgentLaunchReservation) -> Result<String, Str
     .map_err(|error| error.to_string())
 }
 
-fn validate_reservation_scope(
+fn validate_reservation_identity(
     tx: &Transaction<'_>,
     owner_generation: u64,
     reservation: &AgentLaunchReservation,
@@ -90,6 +90,15 @@ fn validate_reservation_scope(
     {
         return Err("launch reservation identity or lifecycle changed".into());
     }
+    Ok((digest.as_str().to_owned(), lifecycle))
+}
+
+fn validate_live_reservation_scope(
+    tx: &Transaction<'_>,
+    owner_generation: u64,
+    reservation: &AgentLaunchReservation,
+    lifecycle: &str,
+) -> Result<(), String> {
     crate::store::agent_runtime::validate_project_launch_identity(
         tx,
         &reservation.project_id,
@@ -188,7 +197,7 @@ fn validate_reservation_scope(
     {
         return Err("execution slot no longer matches its launch reservation".into());
     }
-    Ok((digest.as_str().to_owned(), lifecycle))
+    Ok(())
 }
 
 fn ticket_is_stale(
@@ -235,15 +244,19 @@ pub(crate) fn pre_handoff_admission(
     let tx = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
-    let (digest, lifecycle) = validate_reservation_scope(&tx, owner_generation, reservation)?;
+    let (digest, lifecycle) = validate_reservation_identity(&tx, owner_generation, reservation)?;
     let phase = phase_for(&tx, reservation, &digest)?;
-    if matches!(phase, Phase::NotStarted | Phase::PrecreateRejected) && lifecycle != "reserved" {
-        return Err("launch phase conflicts with reservation lifecycle".into());
-    }
     if phase == Phase::PrecreateRejected {
+        if lifecycle != "reserved" {
+            return Err("pre-create rejection conflicts with reservation lifecycle".into());
+        }
         let receipt = rejection_receipt(reservation)?;
         tx.commit().map_err(|error| error.to_string())?;
         return Ok(Admission::Rejected { receipt });
+    }
+    validate_live_reservation_scope(&tx, owner_generation, reservation, &lifecycle)?;
+    if phase == Phase::NotStarted && lifecycle != "reserved" {
+        return Err("launch phase conflicts with reservation lifecycle".into());
     }
     if phase != Phase::NotStarted
         && phase != Phase::CreateAttempted
@@ -283,7 +296,8 @@ pub(crate) fn mark_create_attempted(
     let tx = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
-    let (digest, lifecycle) = validate_reservation_scope(&tx, owner_generation, reservation)?;
+    let (digest, lifecycle) = validate_reservation_identity(&tx, owner_generation, reservation)?;
+    validate_live_reservation_scope(&tx, owner_generation, reservation, &lifecycle)?;
     if lifecycle != "reserved" {
         return Err("Rex create boundary requires a still-reserved launch".into());
     }
@@ -335,7 +349,7 @@ pub(crate) fn mark_ambiguous(
     let tx = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
-    let (digest, lifecycle) = validate_reservation_scope(&tx, owner_generation, reservation)?;
+    let (digest, lifecycle) = validate_reservation_identity(&tx, owner_generation, reservation)?;
     if lifecycle != "reserved" {
         return Err("contradictory block observation requires a still-reserved launch".into());
     }

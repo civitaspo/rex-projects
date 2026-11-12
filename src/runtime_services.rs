@@ -2313,6 +2313,11 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
             .filter(|block| block.label == expected_label)
             .collect::<Vec<_>>();
         if existing.len() > 1 {
+            if store.agent_launch_phase(reservation)?
+                == crate::store::agent_launch_phase::Phase::NotStarted
+            {
+                store.mark_agent_launch_ambiguous(owner_generation, reservation)?;
+            }
             return Err("multiple Rex blocks claim the same AgentRun".into());
         }
         if let Some(block) = existing.first() {
@@ -2325,6 +2330,11 @@ impl crate::start_agent::StartAgentMaterializer for RuntimeAgentMaterializer {
                 || observed.window_id != window.window_id
                 || observed.label != expected_label
             {
+                if store.agent_launch_phase(reservation)?
+                    == crate::store::agent_launch_phase::Phase::NotStarted
+                {
+                    store.mark_agent_launch_ambiguous(owner_generation, reservation)?;
+                }
                 return Err("existing Rex block does not match the AgentRun reservation".into());
             }
             match store.agent_launch_phase(reservation)? {
