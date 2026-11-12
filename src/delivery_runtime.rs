@@ -6471,6 +6471,27 @@ esac
 
     #[test]
     fn forked_pre_exec_child_temporarily_inherits_writer_lease() {
+        const CHILD_MODE: &str = "REX_PROJECTS_FORKED_LEASE_TEST_CHILD";
+        if std::env::var_os(CHILD_MODE).is_none() {
+            // Keep the parked fork from inheriting other tests' writable fixtures.
+            let test_name = std::thread::current()
+                .name()
+                .expect("the test harness names its test thread")
+                .to_owned();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(test_name)
+                .arg("--nocapture")
+                .env(CHILD_MODE, "1")
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "isolated writer-lease test failed: {status}"
+            );
+            return;
+        }
+
         use std::io::Read;
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::process::CommandExt;
