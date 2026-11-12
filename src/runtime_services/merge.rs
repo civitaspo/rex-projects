@@ -80,6 +80,9 @@ impl RuntimeMergeEvidenceSource {
         use crate::merge_policy::{MergeProcedureOperation as Operation, MergeProcedureStep};
 
         assessment.validate()?;
+        if assessment.policy.executor == MergeExecutor::Request {
+            return Err("configured Request executor has no verifiable execution contract".into());
+        }
         let observation = self
             .observe_publication_subject(subject, result)
             .map_err(|error| error.to_string())?;
@@ -689,6 +692,22 @@ impl RuntimeMergeEvidenceSource {
             || work_item.awaiting_merge_revision != step_request.awaiting_merge_revision
         {
             return Err("merge step does not match its immutable MergeWorkItem".into());
+        }
+        // A literal Request executor only proves that a comment was posted; it cannot
+        // prove or enforce what an external bot will do afterward. Reject the entire
+        // persisted procedure before selecting a step, observing the PR, or invoking Forge.
+        if work_item.document.policy.executor == crate::domain::types::MergeExecutor::Request {
+            return Ok(EffectObservation::Rejected {
+                receipt: serde_json::json!({
+                    "schema_version": 1,
+                    "work_id": work_item.work_id.as_str(),
+                    "reason": "request_executor_has_no_verifiable_execution_contract",
+                    "prior_external_outcome": if mode == crate::effects::EffectMode::Reconcile { "unknown" } else { "not_attempted_by_this_dispatch" },
+                    "new_mutation_attempted": false,
+                    "human_reconciliation_required": mode == crate::effects::EffectMode::Reconcile
+                })
+                .to_string(),
+            });
         }
         let mut offset = 0;
         let current = loop {
@@ -1485,6 +1504,12 @@ fn execution_time_base_guard(
     repo: &RepositoryConfig,
     observed: &ForgeObservation,
 ) -> EvidenceState {
+    // Branch protection is not evidence that a comment-triggered external bot will
+    // merge the same head/base/policy. Keep the generic Request executor blocked until
+    // an executor can enforce those predicates and return operation-bound evidence.
+    if repo.merge.executor == Some(MergeExecutor::Request) {
+        return EvidenceState::Fail;
+    }
     match &observed.branch_protection {
         crate::forge::Observed::Complete { value, .. }
             if value.supports_execution_base_guard(
@@ -1609,6 +1634,35 @@ pub(crate) mod tests {
             request,
             context,
         )
+    }
+
+    pub(crate) fn dispatch_merge_for_store_test_with_runner(
+        applied: AppliedConfig,
+        store: &mut crate::store::ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+        runner: std::sync::Arc<dyn crate::forge::github::GitHubCommandRunner>,
+    ) -> Result<crate::effects::DispatchTick, String> {
+        let source = std::sync::Arc::new(RuntimeMergeEvidenceSource::with_github_runner(
+            applied,
+            Vec::new(),
+            BTreeMap::new(),
+            runner,
+        ));
+        let handler = source.effect_handler();
+        crate::effects::EffectDispatcher::tick(
+            store,
+            owner_generation,
+            now_unix,
+            &[&handler],
+            crate::effects::EffectLimits {
+                max_attempts: 3,
+                max_age: Duration::from_secs(300),
+                retry_base: Duration::from_secs(1),
+                retry_max: Duration::from_secs(30),
+            },
+        )
+        .map_err(|error| error.to_string())
     }
 
     struct FixtureRunner {
@@ -2832,6 +2886,46 @@ pub(crate) mod tests {
         assert_eq!(
             observation.evidence.execution_time_base_guard,
             EvidenceState::Pass
+        );
+        let mut request_applied = applied.clone();
+        request_applied
+            .config
+            .repositories
+            .get_mut(&RepositoryId::parse("example").unwrap())
+            .unwrap()
+            .merge
+            .executor = Some(MergeExecutor::Request);
+        let request_runner = std::sync::Arc::new(FixtureRunner {
+            replies: Mutex::new(
+                responses
+                    .clone()
+                    .into_iter()
+                    .map(|response| serde_json::to_vec(&response).unwrap())
+                    .collect(),
+            ),
+            requests: Mutex::new(Vec::new()),
+        });
+        let request_observation = RuntimeMergeEvidenceSource::with_github_runner(
+            request_applied,
+            vec![binary_dir.clone()],
+            BTreeMap::new(),
+            request_runner,
+        )
+        .observe_publication_subject(&publication_subject, &result.ingested)
+        .unwrap();
+        assert_eq!(
+            request_observation.evidence.execution_time_base_guard,
+            EvidenceState::Fail,
+            "protected branches do not prove a generic Request executor's eventual action"
+        );
+        assert_eq!(
+            crate::merge_policy::evaluate_merge_policy(
+                &request_observation.policy,
+                &request_observation.evidence,
+            )
+            .unwrap()
+            .disposition,
+            crate::merge_policy::MergeDisposition::Blocked
         );
         assert_eq!(
             observation

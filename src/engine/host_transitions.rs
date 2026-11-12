@@ -1674,17 +1674,42 @@ pub(crate) mod tests {
 
     #[test]
     fn merge_work_receipt_consumer_enforces_approval_and_builds_postmortem_inbox() {
-        merge_review_approval_fixture(false, None);
+        merge_review_approval_fixture(false, None, false, false);
+    }
+
+    #[test]
+    fn legacy_request_submit_is_held_before_external_mutation() {
+        merge_review_approval_fixture(
+            false,
+            Some(PreparedBodyReceiptCase::PassingAppliedChangedBody),
+            true,
+            false,
+        );
+    }
+
+    #[test]
+    fn legacy_request_reconcile_is_held_without_repeating_external_mutation() {
+        merge_review_approval_fixture(
+            false,
+            Some(PreparedBodyReceiptCase::PassingAppliedChangedBody),
+            true,
+            true,
+        );
     }
 
     #[test]
     fn verified_merge_persists_required_operator_plan_and_launch_readiness() {
-        merge_review_approval_fixture(true, None);
+        merge_review_approval_fixture(true, None, false, false);
     }
 
     #[test]
     fn reconciled_prepared_body_reassesses_before_old_merge_step_is_queued() {
-        merge_review_approval_fixture(false, Some(PreparedBodyReceiptCase::UnknownRecovered));
+        merge_review_approval_fixture(
+            false,
+            Some(PreparedBodyReceiptCase::UnknownRecovered),
+            false,
+            false,
+        );
     }
 
     #[test]
@@ -1693,12 +1718,19 @@ pub(crate) mod tests {
         merge_review_approval_fixture(
             false,
             Some(PreparedBodyReceiptCase::PassingRecoveredChangedBody),
+            false,
+            false,
         );
     }
 
     #[test]
     fn recovered_noop_body_with_passing_base_guard_continues_approved_procedure() {
-        merge_review_approval_fixture(false, Some(PreparedBodyReceiptCase::PassingRecoveredNoop));
+        merge_review_approval_fixture(
+            false,
+            Some(PreparedBodyReceiptCase::PassingRecoveredNoop),
+            false,
+            false,
+        );
     }
 
     #[test]
@@ -1706,6 +1738,8 @@ pub(crate) mod tests {
         merge_review_approval_fixture(
             false,
             Some(PreparedBodyReceiptCase::PassingAppliedChangedBody),
+            false,
+            false,
         );
     }
 
@@ -1944,6 +1978,8 @@ pub(crate) mod tests {
     fn merge_review_approval_fixture(
         required_operations: bool,
         body_case: Option<PreparedBodyReceiptCase>,
+        request_guard_test: bool,
+        reconcile_request_guard_test: bool,
     ) {
         use crate::domain::ids::{
             Digest, HumanRequestId, OperationId, ProjectId, Revision, TicketRunId,
@@ -1979,6 +2015,20 @@ pub(crate) mod tests {
 
         struct VerificationForge {
             commit: CommitObservation,
+        }
+
+        struct UnexpectedGitHubCall(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+        impl crate::forge::github::GitHubCommandRunner for UnexpectedGitHubCall {
+            fn run(
+                &self,
+                _: crate::process::ProcessRequest,
+            ) -> Result<crate::process::ProcessOutput, crate::process::ProcessError> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(crate::process::ProcessError::Invalid(
+                    "Request guard fixture must reject before Forge".into(),
+                ))
+            }
         }
 
         impl Forge for VerificationForge {
@@ -2203,7 +2253,7 @@ pub(crate) mod tests {
         } else {
             "Prior body\n"
         };
-        let work_item = merge_work_fixture_item_with_body_case(
+        let mut work_item = merge_work_fixture_item_with_body_case(
             project_id.clone(),
             ticket_run_id.clone(),
             loaded.digest.clone(),
@@ -2211,6 +2261,71 @@ pub(crate) mod tests {
             body_case,
             &"a".repeat(40),
         );
+        if request_guard_test {
+            use crate::domain::types::MergeExecutor;
+            use crate::merge_executor::{RequestCommentProof, TrustedInstructionSource};
+            use crate::merge_policy::{
+                MergeProcedureOperation, build_merge_procedure, evaluate_merge_policy,
+            };
+
+            let mut document = work_item.document.clone();
+            document.policy.executor = MergeExecutor::Request;
+            document.evidence.execution_time_base_guard = crate::merge_policy::EvidenceState::Pass;
+            document.assessment =
+                evaluate_merge_policy(&document.policy, &document.evidence).unwrap();
+            let policy_digest = crate::forge::canonical_digest(&document.policy).unwrap();
+            document.intent.policy_digest = policy_digest.clone();
+            document.authority.policy_digest = policy_digest;
+            let source_key = "legacy:merge.instructions".to_owned();
+            let source_bytes = b"/merge\n".to_vec();
+            let source_digest =
+                Digest::parse(format!("{:x}", sha2::Sha256::digest(&source_bytes))).unwrap();
+            document.authority.sources.insert(
+                source_key.clone(),
+                TrustedInstructionSource {
+                    key: source_key.clone(),
+                    digest: source_digest.clone(),
+                    bytes: source_bytes,
+                },
+            );
+            document.authority.request_comment_proofs = vec![RequestCommentProof {
+                source_key,
+                source_digest,
+                byte_start: 0,
+                exact_comment: "/merge".into(),
+            }];
+            for step in &mut document.procedure.steps {
+                if matches!(step.operation, MergeProcedureOperation::ExecuteMerge { .. }) {
+                    step.operation = MergeProcedureOperation::RequestMerge {
+                        exact_comment: "/merge".into(),
+                    };
+                }
+            }
+            for step in &mut document.intent.steps {
+                if step.kind == crate::engine::orchestration::MergeProcedureStepKind::DirectMerge {
+                    step.kind = crate::engine::orchestration::MergeProcedureStepKind::RequestMerge;
+                }
+            }
+            document.procedure = build_merge_procedure(
+                document.policy.method,
+                MergeExecutor::Request,
+                document.procedure.steps.clone(),
+                &document.evidence.subject,
+            )
+            .unwrap();
+            work_item = crate::store::merge_work::MergeWorkItem::new(
+                work_item.project_id,
+                work_item.ticket_run_id,
+                work_item.assessed_revision,
+                work_item.awaiting_merge_revision,
+                work_item.configuration_digest,
+                work_item.accepted_plan_digest,
+                work_item.prepared_receipt_digest,
+                work_item.publication_set_digest,
+                document,
+            )
+            .unwrap();
+        }
         let work_json = crate::store::canonical_json(&serde_json::json!({
             "schema_version": 1,
             "project_id": project_id,
@@ -2339,6 +2454,115 @@ pub(crate) mod tests {
             if reassessment_case { "body" } else { "merge" }
         );
         assert_eq!(first.expected_revision, Some(6));
+
+        if request_guard_test {
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let runner = std::sync::Arc::new(UnexpectedGitHubCall(calls.clone()));
+            store
+                .test_connection()
+                .execute(
+                    "UPDATE projects SET desired_lifecycle='running' WHERE project_id=?1",
+                    [project_id.as_str()],
+                )
+                .unwrap();
+            store
+                .test_connection()
+                .execute(
+                    "UPDATE effects SET next_attempt_at_unix=13 WHERE operation_id=?1",
+                    [first.operation_id.as_str()],
+                )
+                .unwrap();
+            if reconcile_request_guard_test {
+                let claimed = store
+                    .claim_next_due_effect(
+                        generation,
+                        13,
+                        &[super::effect_name(EffectKind::Merge).to_owned()],
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(claimed.intent.operation_id, first.operation_id);
+                store
+                    .finish_effect(
+                        &first.operation_id,
+                        generation,
+                        EffectOutcome::Unknown,
+                        Some("{\"prior_attempt\":\"uncertain\"}"),
+                    )
+                    .unwrap();
+            }
+            let dispatch =
+                crate::runtime_services::merge::tests::dispatch_merge_for_store_test_with_runner(
+                    loaded.clone(),
+                    &mut store,
+                    generation,
+                    13,
+                    runner.clone(),
+                )
+                .unwrap();
+            assert_eq!(
+                dispatch,
+                crate::effects::DispatchTick::Completed {
+                    operation_id: first.operation_id.clone()
+                }
+            );
+            let (effect_status, receipt): (String, String) = store
+                .test_connection()
+                .query_row(
+                    "SELECT status,receipt_json FROM effects WHERE operation_id=?1",
+                    [first.operation_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(effect_status, "failed");
+            let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+            assert_eq!(
+                receipt["prior_external_outcome"],
+                if reconcile_request_guard_test {
+                    "unknown"
+                } else {
+                    "not_attempted_by_this_dispatch"
+                }
+            );
+            assert_eq!(receipt["new_mutation_attempted"], false);
+            assert_eq!(
+                receipt["human_reconciliation_required"],
+                reconcile_request_guard_test
+            );
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(
+                store
+                    .succeeded_effect_receipt(&first.operation_id)
+                    .unwrap()
+                    .is_none()
+            );
+            let held = store
+                .active_ticket_runs(generation, 10)
+                .unwrap()
+                .into_iter()
+                .find(|run| run.ticket_run_id == ticket_run_id)
+                .unwrap();
+            assert_eq!(held.phase, super::Phase::AwaitingMerge);
+            assert_eq!(held.activity, awaiting.activity);
+            assert_eq!(held.revision, 6);
+            let _ = super::consume_one_host_transition(
+                &mut store,
+                generation,
+                14,
+                &config,
+                &loaded.digest,
+            )
+            .unwrap();
+            let after_transition = store
+                .active_ticket_runs(generation, 10)
+                .unwrap()
+                .into_iter()
+                .find(|run| run.ticket_run_id == ticket_run_id)
+                .unwrap();
+            assert_eq!(after_transition.phase, super::Phase::AwaitingMerge);
+            assert_eq!(after_transition.revision, 6);
+            return;
+        }
 
         if reassessment_case {
             store

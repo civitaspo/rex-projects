@@ -3,10 +3,11 @@
 A Rex plugin with a Lua integration layer and a Rust core. Rust owns typed
 configuration, protocol and state boundaries; Lua is the Rex integration layer.
 
-The current Rust slice provides strict configuration/profile validation,
-generated JSON Schemas, read-only dependency discovery, protocol envelope
-validation, build metadata, and transactional configuration snapshots. The
-Agent runtime and ticket-processing controller are implemented in later slices.
+The prototype includes the Rust Agent runtime and ticket-processing controller,
+with persistent orchestration and configured ticket and repository adapters.
+One GitHub documentation ticket completed with human intervention and an
+explicit Operator skip. Full prototype acceptance, including goal projects and
+multiple repositories, remains incomplete.
 
 The default configuration path is `${XDG_CONFIG_HOME:-$HOME/.config}/rex-projects/config.toml`.
 Agent profiles live in sibling `profiles/<profile-id>/` directories. Validate
@@ -33,6 +34,14 @@ human-controlled recovery commands and their one-use limit.
 
 See [Reconcile an interrupted provider qualification](docs/provider-recovery.md)
 for exact-request recovery and retained execution-slot ownership.
+
+Generic comment-triggered `Request` merge execution is currently unsupported and
+is blocked before human approval or any merge-procedure mutation, even when a
+human approves the proposed procedure. `Direct` merge continues to use the
+repository's configured checks and execution guards. Legacy `Request` work with
+an uncertain external outcome is held for human reconciliation. See [issue
+#73](https://github.com/civitaspo/rex-projects/issues/73) and [issue
+#67](https://github.com/civitaspo/rex-projects/issues/67).
 
 ## Development
 
