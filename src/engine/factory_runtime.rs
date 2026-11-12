@@ -4496,6 +4496,7 @@ pub(crate) mod tests {
         merge_observation_replies: Option<(crate::config::AppliedConfig, Vec<serde_json::Value>)>,
         merge_body_proposal: Option<crate::store::merge_work::PreparedMergeBodyProposal>,
         merge_work_document: Option<crate::store::merge_work::MergeWorkDocument>,
+        runtime_services: Option<crate::runtime_services::RuntimeServices>,
     }
 
     impl super::FactoryRuntimeServices for WorkerPublicationFixtureServices {
@@ -4703,12 +4704,25 @@ pub(crate) mod tests {
 
         fn prepare_role_launch(
             &mut self,
-            _: &mut crate::store::ConfigStore,
-            _: u64,
-            _: &Config,
-            _: &crate::store::scheduler::PendingRoleWakeSession,
-            _: i64,
+            store: &mut crate::store::ConfigStore,
+            owner_generation: u64,
+            config: &Config,
+            candidate: &crate::store::scheduler::PendingRoleWakeSession,
+            now_unix: i64,
         ) -> Result<bool, String> {
+            if candidate.role != Role::Coordinator {
+                return Ok(false);
+            }
+            if let Some(runtime_services) = &mut self.runtime_services {
+                return super::FactoryRuntimeServices::prepare_role_launch(
+                    runtime_services,
+                    store,
+                    owner_generation,
+                    config,
+                    candidate,
+                    now_unix,
+                );
+            }
             Ok(false)
         }
 
@@ -4803,6 +4817,7 @@ pub(crate) mod tests {
             merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
+            runtime_services: None,
         };
         super::apply_agent_result(
             store,
@@ -4833,6 +4848,7 @@ pub(crate) mod tests {
             merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: Some(document),
+            runtime_services: None,
         };
         super::apply_agent_result(
             store,
@@ -4862,6 +4878,7 @@ pub(crate) mod tests {
             merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
+            runtime_services: None,
         };
         super::apply_coordinator_spawn_request(
             store,
@@ -4897,6 +4914,7 @@ pub(crate) mod tests {
             merge_observation_replies: None,
             merge_body_proposal: proposal,
             merge_work_document: None,
+            runtime_services: None,
         };
         super::apply_merge_assessment(
             store,
@@ -4927,6 +4945,7 @@ pub(crate) mod tests {
             merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
+            runtime_services: None,
         };
         super::FactoryRuntime::tick(store, owner_generation, now_unix, config, &mut services)
     }
@@ -4956,6 +4975,7 @@ pub(crate) mod tests {
             merge_observation_replies: Some((applied, replies)),
             merge_body_proposal: proposal,
             merge_work_document: None,
+            runtime_services: None,
         };
         super::FactoryRuntime::tick(store, owner_generation, now_unix, config, &mut services)
     }
@@ -4979,6 +4999,7 @@ pub(crate) mod tests {
             merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: Some(document),
+            runtime_services: None,
         };
         super::apply_merge_intent(
             store,
@@ -5102,6 +5123,7 @@ pub(crate) mod tests {
                 merge_observation_replies: None,
                 merge_body_proposal: None,
                 merge_work_document: None,
+                runtime_services: None,
             };
             let applied = super::apply_agent_result(
                 &mut fixture.store,
@@ -5205,6 +5227,7 @@ pub(crate) mod tests {
             merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
+            runtime_services: None,
         };
 
         let error = super::FactoryRuntime::tick(
@@ -5472,6 +5495,7 @@ pub(crate) mod tests {
             merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
+            runtime_services: None,
         };
         assert!(
             super::apply_agent_result(
@@ -5544,6 +5568,7 @@ pub(crate) mod tests {
             merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
+            runtime_services: None,
         };
         let absent_report = super::FactoryRuntime::tick(
             &mut fixture.store,
@@ -6198,6 +6223,7 @@ pub(crate) mod tests {
             merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
+            runtime_services: None,
         };
 
         let tick = super::FactoryRuntime::tick(
@@ -6322,6 +6348,7 @@ pub(crate) mod tests {
             merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
+            runtime_services: None,
         };
 
         assert!(
@@ -6453,6 +6480,7 @@ pub(crate) mod tests {
             merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
+            runtime_services: None,
         };
 
         assert!(
@@ -6550,6 +6578,7 @@ pub(crate) mod tests {
             merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
+            runtime_services: None,
         };
         let coordinator_session = "ticket_run:fixture-ticket-run:coordinator";
 
@@ -6896,6 +6925,7 @@ pub(crate) mod tests {
             merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
+            runtime_services: None,
         };
         for _ in 0..2 {
             assert!(
@@ -7201,6 +7231,7 @@ pub(crate) mod tests {
             merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
+            runtime_services: None,
         };
         for _ in 0..2 {
             assert!(
@@ -7372,6 +7403,7 @@ pub(crate) mod tests {
                 merge_observation_replies: None,
                 merge_body_proposal: None,
                 merge_work_document: None,
+                runtime_services: None,
             };
             let wake_count_before: u32 = fixture
                 .store
@@ -7413,6 +7445,727 @@ pub(crate) mod tests {
                 "{case} digest must not acknowledge the Coordinator result"
             );
         }
+    }
+
+    #[test]
+    fn scheduler_full_tick_reopens_and_prepares_supervisor_dispatch_wake() {
+        use crate::domain::ids::{Digest, TicketId, TicketNamespace};
+        use crate::domain::types::TicketStatus;
+        use crate::engine::orchestration::{AgentAssertion, RoleOutputKind};
+        use crate::roles::RoleResultMessage;
+        use crate::store::scheduler::{ObservedTicket, TicketScanKey, TicketScanPage};
+        use serde_json::json;
+        use std::os::unix::fs::PermissionsExt;
+
+        let structured_result = json!({
+            "ticket_reference": "T-1",
+            "expected_ticket_revision": "4",
+            "coordinator_profile": "fixture-profile",
+            "priority": 3,
+            "rationale": "resume the exact ticket after restart"
+        });
+        let result_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&structured_result).unwrap())
+        ))
+        .unwrap();
+        let mut fixture =
+            crate::store::agent_results::host_validation_fixture::host_validated_result(
+                Role::Supervisor,
+                RoleResultMessage {
+                    schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                    message_id: "issue83-supervisor-dispatch".into(),
+                    kind: RoleOutputKind::DispatchRequest,
+                    assertion: AgentAssertion::Succeeded,
+                    structured_result,
+                    result_digest: Some(result_digest),
+                    artifact_refs: Vec::new(),
+                },
+            )
+            .unwrap();
+        let current_digest = Digest::parse("b".repeat(64)).unwrap();
+        let mut snapshot = fixture
+            .store
+            .load_snapshot("fixture")
+            .unwrap()
+            .unwrap()
+            .config;
+        let mut config: Config = serde_json::from_value(json!({
+            "schema_version": 1,
+            "adapters": {"tickets": {"kind": "command", "command": ["ticket-cli"]}},
+            "operation_recipes": {"fixture-recipe": {
+                "not_required_reason": "The fixture has no operation targets"
+            }},
+            "projects": {"fixture-project": {
+                "mode": "goal",
+                "ticket_adapter": "tickets",
+                "goal": {"revision": 1, "statement": "fixture goal", "acceptance": ["resume the ticket"]},
+                "roles": {"supervisor": "fixture-profile", "coordinator": "fixture-profile"}
+            }}
+        }))
+        .unwrap();
+        let rex_cli = fixture._temp.path().join("rex-fixture");
+        let ticket_cli = fixture._temp.path().join("ticket-fixture");
+        config.runtime.rex_binary = rex_cli.display().to_string();
+        config.runtime.environment.source = crate::config::EnvironmentSource::Inherit;
+        config.adapters.tickets.command = vec![ticket_cli.display().to_string()];
+        let dispatch_project = config
+            .projects
+            .get_mut(&crate::domain::ids::ProjectId::parse("fixture-project").unwrap())
+            .unwrap();
+        dispatch_project.ticket_scope = BTreeMap::from([("workspace".into(), json!("fixture"))]);
+        dispatch_project.dispatch_states = vec![TicketStatus::Ready];
+        std::fs::write(
+            &ticket_cli,
+            r#"#!/bin/sh
+request=$(cat)
+request_id=$(printf '%s' "$request" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+case "$request" in
+  *adapter.describe*)
+    printf '%s\n' '{"schema_version":1,"request_id":"'"$request_id"'","result":{"ticket_namespace":"fixture","identity":{},"supported_schema_versions":[1],"native_value_convention":"fixture","status_values":{"triage":"Triage","backlog":"Backlog","ready":"Ready","in_progress":"In Progress","in_review":"In Review","done":"Done","canceled":"Canceled"},"capabilities":{"pagination":false,"filters":[],"revision_support":true,"conditional_revision_mutation":false,"atomic_scope_mutation":false,"remote_idempotency":[],"reconciliation":{},"visibility_grace_seconds":0,"supported_optional_methods":[]}}}'
+    ;;
+  *ticket.get*)
+    printf '%s\n' '{"schema_version":1,"request_id":"'"$request_id"'","result":{"ticket_namespace":"fixture","ticket":{"ticket_namespace":"fixture","scope":{"workspace":"fixture"},"id":"T-1","revision":"4","title":"Resume fixture ticket","body":"Resume the ticket after a controller restart.","status":{"value":"in_progress","native_value":"In Progress"}}}}'
+    ;;
+  *) exit 64 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&ticket_cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let rex_script = "#!/bin/sh\ncase \"$*\" in\n  *'whoami --json'*) printf '%s\\n' '{\"endpoint\":\"unix:///tmp/issue83-fixture.sock\",\"instance_id\":\"fixture-rex\",\"host_id\":\"fixture-host\",\"rex_version\":\"1.0\"}' ;;\n  *'api list --json'*) printf '%s\\n' '{\"methods\":{\"session.view\":{},\"session.new_window\":{},\"session.new_split\":{},\"session.focus_block\":{},\"session.zoom_block\":{},\"block.close\":{}}}' ;;\n  *'api call session.view'*) printf '%s\\n' '{\"session_id\":\"fixture-session\",\"label\":\"fixture-ticket\",\"windows\":[{\"window_id\":\"fixture-window\",\"label\":\"fixture-ticket-window\",\"layers\":[{\"blocks\":[]}]}]}' ;;\n  *'session ls --json'*) printf '%s\\n' '{\"sessions\":[{\"session_id\":\"fixture-session\",\"label\":\"fixture-ticket\"}]}' ;;\n  *) exit 64 ;;\nesac\n";
+        std::fs::write(&rex_cli, rex_script).unwrap();
+        std::fs::set_permissions(&rex_cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut profile: crate::config::Profile = serde_json::from_value(json!({
+            "adapter": "codex", "command": ["/bin/codex"], "model": "fixture",
+            "commit_mode": "native", "turn_timeout_seconds": 60
+        }))
+        .unwrap();
+        profile.command = vec![std::env::current_exe().unwrap().display().to_string()];
+        let profile_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(crate::store::canonical_json(&profile).unwrap().as_bytes())
+        ))
+        .unwrap();
+        let profile_runtime_identity = crate::run_step::profile_runtime_identity(&profile).unwrap();
+        snapshot.config = config.clone();
+        snapshot.profiles = std::collections::BTreeMap::from([(
+            crate::domain::ids::ProfileId::parse("fixture-profile").unwrap(),
+            profile,
+        )]);
+        for source in &mut snapshot.source_files {
+            source.contents = "config".into();
+            source.bytes = 6;
+            source.sha256 = Digest::parse(format!(
+                "{:x}",
+                sha2::Sha256::digest(source.contents.as_bytes())
+            ))
+            .unwrap();
+        }
+        let profile_dir = std::path::PathBuf::from(&snapshot.source_root)
+            .join("profiles")
+            .join("fixture-profile");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let canonical_profile_dir = std::fs::canonicalize(&profile_dir).unwrap();
+        snapshot.source_files.push(crate::config::SourceFile {
+            kind: crate::config::SourceKind::Directory,
+            path: profile_dir.display().to_string(),
+            canonical_path: canonical_profile_dir.display().to_string(),
+            sha256: Digest::parse(format!(
+                "{:x}",
+                sha2::Sha256::digest(canonical_profile_dir.display().to_string().as_bytes())
+            ))
+            .unwrap(),
+            bytes: 0,
+            contents: String::new(),
+        });
+        snapshot.digest = current_digest.clone();
+        let applied = fixture
+            .store
+            .apply_snapshot(
+                "fixture",
+                &snapshot,
+                crate::store::ExpectedRevision::Current(crate::domain::ids::Revision(1)),
+            )
+            .unwrap();
+        assert_eq!(applied.revision.0, 2);
+        let project_id = crate::domain::ids::ProjectId::parse("fixture-project").unwrap();
+        fixture
+            .store
+            .acknowledge_validated_agent_result(
+                fixture.owner_generation,
+                fixture.ingested.receipt.evidence_id(),
+                1,
+                crate::store::agent_results::ResultDisposition::Applied,
+            )
+            .unwrap();
+        fixture
+            .store
+            .set_project_lifecycle(fixture.owner_generation, &project_id, "running")
+            .unwrap();
+
+        let namespace = TicketNamespace::parse("fixture").unwrap();
+        let seed_ticket_run = crate::domain::ids::TicketRunId::parse("issue83-seed-run").unwrap();
+        fixture
+            .store
+            .create_ticket_run(
+                fixture.owner_generation,
+                &project_id,
+                &namespace,
+                &TicketId::parse("ISSUE83-SEED").unwrap(),
+                &seed_ticket_run,
+                1,
+                "done",
+                "done",
+            )
+            .unwrap();
+        let payload = json!({
+            "ticket_reference": "T-1",
+            "expected_ticket_revision": "4",
+            "coordinator_profile": "fixture-profile",
+            "priority": 3,
+            "rationale": "resume the exact ticket after restart"
+        });
+        let dispatch_message = RoleResultMessage {
+            schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+            message_id: "issue83-canonical-supervisor-dispatch".into(),
+            kind: RoleOutputKind::DispatchRequest,
+            assertion: AgentAssertion::Succeeded,
+            result_digest: Some(
+                Digest::parse(format!(
+                    "{:x}",
+                    sha2::Sha256::digest(serde_json::to_vec(&payload).unwrap())
+                ))
+                .unwrap(),
+            ),
+            structured_result: payload,
+            artifact_refs: Vec::new(),
+        };
+        let in_place =
+            crate::store::agent_results::host_validation_fixture::host_validated_result_in(
+                &mut fixture.store,
+                &std::fs::canonicalize(fixture._temp.path()).unwrap(),
+                fixture.owner_generation,
+                project_id.clone(),
+                seed_ticket_run,
+                crate::domain::types::Role::Supervisor,
+                dispatch_message,
+            )
+            .unwrap();
+        fixture.artifacts = in_place.artifacts;
+        fixture.ingested = in_place.ingested;
+        let project_config = config.projects.get(&project_id).unwrap();
+        let scan_key = TicketScanKey::for_project(
+            &project_id,
+            &project_config.ticket_adapter,
+            &namespace,
+            project_config,
+            TicketStatus::Ready,
+        )
+        .unwrap();
+        fixture
+            .store
+            .record_ticket_scan_page(
+                fixture.owner_generation,
+                TicketScanPage {
+                    key: &scan_key,
+                    expected_cursor: None,
+                    expected_generation: 0,
+                    expected_page_count: 0,
+                    next_cursor: None,
+                    tickets: &[ObservedTicket {
+                        id: TicketId::parse("T-1").unwrap(),
+                        revision: Some("4".into()),
+                        status: TicketStatus::Ready,
+                        title: "Resume fixture ticket".into(),
+                        labels: Vec::new(),
+                        created_at: None,
+                        observed_at_unix: 1,
+                    }],
+                    now_unix: 1,
+                    poll_seconds: 60,
+                },
+            )
+            .unwrap();
+        let supervisor_binding = &fixture.ingested.validated.binding;
+        fixture
+            .store
+            .test_connection()
+            .execute(
+                "INSERT INTO agent_launch_reservations(agent_run_id,project_id,operation_id,controller_generation,project_epoch,reservation_digest,reservation_json,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,1,?5,'{}','authorized',1,1)",
+                rusqlite::params![
+                    supervisor_binding.agent_run_id.as_str(),
+                    supervisor_binding.project_id.as_str(),
+                    supervisor_binding.operation_id.as_str(),
+                    fixture.owner_generation,
+                    "d".repeat(64),
+                ],
+            )
+            .unwrap();
+
+        for index in 0..33 {
+            let ticket_run_id =
+                crate::domain::ids::TicketRunId::parse(format!("terminal-starvation-{index:02}"))
+                    .unwrap();
+            fixture
+                .store
+                .create_ticket_run(
+                    fixture.owner_generation,
+                    &project_id,
+                    &crate::domain::ids::TicketNamespace::parse("fixture").unwrap(),
+                    &crate::domain::ids::TicketId::parse(format!("TERMINAL-{index:02}")).unwrap(),
+                    &ticket_run_id,
+                    1,
+                    if index == 32 { "canceled" } else { "done" },
+                    if index == 32 { "canceled" } else { "done" },
+                )
+                .unwrap();
+            let role_session_id = if index == 1 {
+                format!("ticket:{ticket_run_id}:worker:node-a")
+            } else {
+                format!("ticket_run:{ticket_run_id}:coordinator")
+            };
+            fixture
+                .store
+                .test_connection()
+                .execute(
+                    "INSERT INTO role_wake_inputs(project_id,role_session_id,source_type,source_id,source_revision,priority,payload_json,lifecycle,created_at_unix) VALUES (?1,?2,'ticket_run_transition',?3,1,100,'{}','pending',1)",
+                    rusqlite::params![project_id.as_str(), role_session_id, ticket_run_id.as_str()],
+                )
+                .unwrap();
+        }
+        let existing_qualification_json: String = fixture
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT receipt_json FROM provider_qualifications WHERE project_id='fixture-project' AND profile_id='fixture-profile' ORDER BY created_at_unix LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut qualification: crate::launch::ProviderQualification =
+            crate::protocol::parse_unique(existing_qualification_json.as_bytes()).unwrap();
+        qualification.profile_digest = profile_digest.clone();
+        qualification.adapter = profile_runtime_identity.adapter;
+        qualification.executable_path = profile_runtime_identity
+            .executable_path
+            .display()
+            .to_string();
+        qualification.executable_digest = profile_runtime_identity.executable_digest;
+        qualification.commit_mode = profile_runtime_identity.commit_mode;
+        qualification.invocation_options_digest =
+            profile_runtime_identity.invocation_options_digest;
+        qualification.permission_mode = profile_runtime_identity
+            .effective_permission_mode
+            .to_owned();
+        let qualification_digest = fixture
+            .store
+            .store_provider_qualification(fixture.owner_generation, &qualification)
+            .unwrap();
+        let mut services = WorkerPublicationFixtureServices {
+            configuration_digest: current_digest.clone(),
+            published_effect: None,
+            pending_artifacts: Some(fixture.artifacts.clone()),
+            ticket_page: None,
+            merge_observation: None,
+            merge_observation_timeout: None,
+            merge_observation_replies: None,
+            merge_body_proposal: None,
+            merge_work_document: None,
+            runtime_services: None,
+        };
+
+        let first_tick = super::FactoryRuntime::tick(
+            &mut fixture.store,
+            fixture.owner_generation,
+            10,
+            &config,
+            &mut services,
+        )
+        .unwrap();
+        assert!(first_tick.ingested_agent_result);
+        assert!(!first_tick.role_run_started);
+        assert!(services.published_effect.is_none());
+        let ack = crate::store::agent_results::host_validation_fixture::result_ack(
+            &fixture.store,
+            fixture.ingested.receipt.evidence_id(),
+        )
+        .unwrap();
+        assert_eq!(ack, Some((1, "applied".into())));
+
+        let ticket_run: String = fixture
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT ticket_run_id FROM ticket_runs WHERE project_id=?1 AND ticket_id='T-1' AND internal_phase NOT IN ('done','canceled')",
+                [project_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let ticket_run = crate::domain::ids::TicketRunId::parse(ticket_run).unwrap();
+        let ticket_id = TicketId::parse("T-1").unwrap();
+        let ticket_view = crate::launch::RexView {
+            view_id: crate::launch::RexView::derive_id(
+                &project_id,
+                crate::launch::RexViewKind::Ticket,
+                Some(namespace.as_str()),
+                Some(ticket_id.as_str()),
+                1,
+            )
+            .unwrap(),
+            project_id: project_id.clone(),
+            kind: crate::launch::RexViewKind::Ticket,
+            ticket_namespace: Some(namespace.as_str().to_owned()),
+            ticket_id: Some(ticket_id.as_str().to_owned()),
+            view_epoch: 1,
+            rex_server_identity: "fixture-rex".into(),
+            rex_session_id: "fixture-session".into(),
+            rex_window_id: "fixture-ticket-window".into(),
+        };
+        fixture
+            .store
+            .register_rex_view(fixture.owner_generation, &ticket_view)
+            .unwrap();
+        let coordinator_session = format!("ticket_run:{ticket_run}:coordinator");
+        let project = project_id.clone();
+        let pending_wakes = fixture
+            .store
+            .pending_role_wake_inputs(&project, &coordinator_session, 256)
+            .unwrap();
+        assert_eq!(pending_wakes.len(), 1);
+        assert_eq!(pending_wakes[0].source_type, "ticket_run_dispatch");
+        assert_eq!(pending_wakes[0].source_id, ticket_run.as_str());
+        let wake_id = pending_wakes[0].wake_input_id;
+        let terminal_wakes_before_restart: Vec<(i64, String)> = {
+            let mut statement = fixture
+                .store
+                .test_connection()
+                .prepare(
+                    "SELECT wake_input_id,lifecycle FROM role_wake_inputs WHERE source_type='ticket_run_transition' ORDER BY wake_input_id",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(terminal_wakes_before_restart.len(), 33);
+
+        // Drop and reopen the same file-backed DB, then acquire a new controller generation.
+        // This keeps the persisted wake as the only input to the next full tick.
+        let state_root = fixture._temp.path().to_path_buf();
+        let placeholder_root = tempfile::tempdir().unwrap();
+        let placeholder_store =
+            crate::store::ConfigStore::open_test(placeholder_root.path()).unwrap();
+        drop(std::mem::replace(&mut fixture.store, placeholder_store));
+        drop(std::mem::replace(
+            &mut fixture.store,
+            crate::store::ConfigStore::open_test(&state_root).unwrap(),
+        ));
+        fixture.owner_generation = fixture
+            .store
+            .start_owner(&crate::store::OwnerMetadata {
+                owner_nonce: "issue83-restarted-owner".into(),
+                state_root: state_root.display().to_string(),
+                config_source: "fixture".into(),
+                process_start_identity: crate::cli::observed_process_start_identity(
+                    std::process::id(),
+                )
+                .expect("test process has a start identity"),
+                executable_path: std::env::current_exe().unwrap().display().to_string(),
+                executable_digest: "c".repeat(64),
+                rex_endpoint: Some("unix:///tmp/issue83-fixture.sock".into()),
+                rex_server_identity: Some("fixture-rex".into()),
+                rex_session_id: Some("fixture-session".into()),
+                rex_block_id: None,
+            })
+            .unwrap();
+        assert_eq!(
+            {
+                let mut statement = fixture
+                    .store
+                    .test_connection()
+                    .prepare(
+                        "SELECT wake_input_id,lifecycle FROM role_wake_inputs WHERE source_type='ticket_run_transition' ORDER BY wake_input_id",
+                    )
+                    .unwrap();
+                statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .unwrap()
+                    .collect::<Result<Vec<(i64, String)>, _>>()
+                    .unwrap()
+            },
+            terminal_wakes_before_restart,
+            "terminal wake records and their current dispositions survive Store reopen unchanged"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .pending_role_wake_inputs(&project, &coordinator_session, 256)
+                .unwrap()
+                .iter()
+                .map(|wake| wake.wake_input_id)
+                .collect::<Vec<_>>(),
+            vec![wake_id],
+            "the event-produced Coordinator wake survives Store reopen unchanged"
+        );
+        std::fs::write(fixture._temp.path().join("config.toml"), "config").unwrap();
+
+        let ticket_view = fixture
+            .store
+            .rex_view_history(&project)
+            .unwrap()
+            .into_iter()
+            .find(|record| {
+                record.lifecycle == "active"
+                    && record.view.kind == crate::launch::RexViewKind::Ticket
+                    && record.view.ticket_id.as_deref() == Some("T-1")
+            })
+            .expect("the dispatched ticket view remains registered")
+            .view;
+        let window_label =
+            crate::adapters::rex::owned_ticket_window_label("fixture", "T-1").unwrap();
+        let session_view = json!({
+            "session_id": ticket_view.rex_session_id,
+            "label": "fixture-ticket",
+            "windows": [{
+                "window_id": ticket_view.rex_window_id,
+                "label": window_label,
+                "layers": [{"blocks": [{
+                    "block_id": "fixture-anchor",
+                    "label": "fixture-anchor",
+                    "flavor": "com.superlogical.terminal.shell"
+                }]}]
+            }]
+        });
+        let rex_calls = fixture._temp.path().join("issue83-rex-calls");
+        let rex_script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  *'whoami --json'*) printf '%s\\n' '{{\"endpoint\":\"unix:///tmp/issue83-fixture.sock\",\"instance_id\":\"fixture-rex\",\"host_id\":\"fixture-host\",\"rex_version\":\"1.0\"}}' ;;\n  *'api list --json'*) printf '%s\\n' '{{\"methods\":{{\"session.view\":{{}},\"session.new_window\":{{}},\"session.new_split\":{{}},\"session.focus_block\":{{}},\"session.zoom_block\":{{}},\"block.close\":{{}}}}}}' ;;\n  *'api call session.view'*) printf '%s\\n' '{}' ;;\n  *'api call session.new_split'*) printf '%s\\n' '{{\"block_ids\":[\"fixture-created-block\"]}}' ;;\n  *'session ls --json'*) printf '%s\\n' '{{\"sessions\":[{{\"session_id\":\"fixture-session\",\"label\":\"fixture-ticket\"}}]}}' ;;\n  *) exit 64 ;;\nesac\n",
+            rex_calls.display(),
+            serde_json::to_string(&session_view).unwrap()
+        );
+        std::fs::write(&rex_cli, rex_script).unwrap();
+
+        let environment = crate::environment::capture(&config.runtime.environment).unwrap();
+        let runtime_binary = std::env::current_exe().unwrap();
+        let runtime_services = crate::runtime_services::RuntimeServices::new(
+            &snapshot,
+            &environment,
+            &fixture._temp.path().join("config.toml"),
+            &state_root,
+            fixture.owner_generation,
+            &crate::adapters::rex::RexIdentity {
+                endpoint: "unix:///tmp/issue83-fixture.sock".into(),
+                instance_id: "fixture-rex".into(),
+                session_id: "fixture-session".into(),
+                block_id: None,
+            },
+            crate::runtime_services::RuntimeExecutable {
+                path: &runtime_binary,
+                digest: &current_digest,
+            },
+        )
+        .unwrap();
+        services.runtime_services = Some(runtime_services);
+        let resumed_tick = super::FactoryRuntime::tick(
+            &mut fixture.store,
+            fixture.owner_generation,
+            11,
+            &config,
+            &mut services,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "resumed tick failed: {error}; Rex calls: {}",
+                std::fs::read_to_string(&rex_calls).unwrap_or_default()
+            )
+        });
+        assert!(
+            resumed_tick.role_run_started,
+            "the restarted full tick prepares the durable Coordinator wake through RuntimeServices"
+        );
+        assert_eq!(
+            crate::store::agent_results::host_validation_fixture::result_ack(
+                &fixture.store,
+                fixture.ingested.receipt.evidence_id()
+            )
+            .unwrap(),
+            Some((1, "applied".into())),
+            "replaying a tick preserves the same dispatch acknowledgement"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .test_connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND source_type='ticket_run_dispatch' AND source_id=?3 AND lifecycle='assigned'",
+                    rusqlite::params![project.as_str(), coordinator_session, ticket_run.as_str()],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            1,
+            "the persisted result wake is assigned exactly once"
+        );
+        let (coordinator_run_id, reservation_count, reservation_digest): (String, u64, String) = fixture
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT r.agent_run_id,(SELECT COUNT(*) FROM agent_launch_reservations WHERE agent_run_id=r.agent_run_id),(SELECT reservation_digest FROM agent_launch_reservations WHERE agent_run_id=r.agent_run_id) FROM agent_runs r WHERE r.project_id=?1 AND r.role_session_id=?2 AND r.role='coordinator' AND r.state='launch_pending' ORDER BY r.rowid DESC LIMIT 1",
+                rusqlite::params![project.as_str(), coordinator_session],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            reservation_count, 1,
+            "RuntimeServices persisted one launch reservation"
+        );
+        let slot: (String, u32, u64, String, u64) = fixture
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT pool,slot_index,reservation_epoch,disposition,controller_generation FROM execution_slots WHERE owner_kind='agent_run' AND owner_id=?1",
+                [&coordinator_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (slot.3.as_str(), slot.4),
+            ("launch_pending", fixture.owner_generation)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .test_connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND source_type='ticket_run_dispatch' AND source_id=?3 AND consuming_agent_run_id=?4",
+                    rusqlite::params![project.as_str(), coordinator_session, ticket_run.as_str(), coordinator_run_id],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            1,
+            "the durable wake is owned by the Coordinator run"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .test_connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM role_wake_inputs WHERE source_type='ticket_run_transition' AND lifecycle='superseded'",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            33,
+            "terminal wake records remain auditable and excluded after the bounded drain"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .test_connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_runs WHERE project_id=?1 AND role_session_id=?2 AND role='coordinator'",
+                    rusqlite::params![project.as_str(), coordinator_session],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            1,
+            "the single Coordinator run prepared after restart is retained"
+        );
+        let terminal_wakes_after_resume: Vec<(i64, String)> = {
+            let mut statement = fixture
+                .store
+                .test_connection()
+                .prepare(
+                    "SELECT wake_input_id,lifecycle FROM role_wake_inputs WHERE source_type='ticket_run_transition' ORDER BY wake_input_id",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let final_tick = super::FactoryRuntime::tick(
+            &mut fixture.store,
+            fixture.owner_generation,
+            12,
+            &config,
+            &mut services,
+        )
+        .unwrap();
+        assert!(!final_tick.role_run_started);
+        assert_eq!(
+            fixture
+                .store
+                .test_connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_runs WHERE project_id=?1 AND role_session_id=?2 AND role='coordinator'",
+                    rusqlite::params![project.as_str(), coordinator_session],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            1,
+            "another full tick does not create a duplicate Coordinator run"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .test_connection()
+                .query_row(
+                    "SELECT pool,slot_index,reservation_epoch,disposition,controller_generation FROM execution_slots WHERE owner_kind='agent_run' AND owner_id=?1",
+                    [&coordinator_run_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?, row.get::<_, u64>(2)?, row.get::<_, String>(3)?, row.get::<_, u64>(4)?)),
+                )
+                .unwrap(),
+            slot,
+            "a replay tick preserves the exact slot owner and generation"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .test_connection()
+                .query_row(
+                    "SELECT reservation_digest FROM agent_launch_reservations WHERE agent_run_id=?1",
+                    [&coordinator_run_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            reservation_digest,
+            "a replay tick preserves the exact launch reservation"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .test_connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM role_wake_inputs WHERE project_id=?1 AND role_session_id=?2 AND source_type='ticket_run_dispatch' AND source_id=?3 AND lifecycle='assigned' AND consuming_agent_run_id=?4",
+                    rusqlite::params![project.as_str(), coordinator_session, ticket_run.as_str(), coordinator_run_id],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            1,
+            "a replay tick keeps the dispatch wake assigned to the same Coordinator run"
+        );
+        let terminal_wakes_after_final_tick: Vec<(i64, String)> = {
+            let mut statement = fixture
+                .store
+                .test_connection()
+                .prepare(
+                    "SELECT wake_input_id,lifecycle FROM role_wake_inputs WHERE source_type='ticket_run_transition' ORDER BY wake_input_id",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            terminal_wakes_after_final_tick, terminal_wakes_after_resume,
+            "a repeated full tick preserves exact terminal wake IDs and dispositions"
+        );
+        let _ = qualification_digest;
     }
 
     #[test]
@@ -7560,6 +8313,7 @@ pub(crate) mod tests {
             merge_observation_replies: None,
             merge_body_proposal: None,
             merge_work_document: None,
+            runtime_services: None,
         };
 
         assert!(
