@@ -2330,7 +2330,10 @@ mod tests {
         let debug = format!("{error:?}");
 
         for rendered in [display.as_str(), debug.as_str()] {
-            assert!(rendered.contains("api list"));
+            assert!(
+                rendered.contains("api list"),
+                "unexpected Rex diagnostic: {rendered}"
+            );
             assert!(rendered.contains("exit_code=Some(23)"));
             assert!(!rendered.contains("endpoint-secret-marker"));
             assert!(!rendered.contains("stderr-secret-marker"));
