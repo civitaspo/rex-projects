@@ -2227,6 +2227,8 @@ while (! -e $ARGV[0]) { select undef, undef, undef, 0.05; }
         let process_observation_file = root.path().join("process observation.json");
         let shell_path =
             |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+        let first_reader_pid_pending = first_reader_pid.with_extension("pid.pending");
+        let replacement_reader_pid_pending = replacement_reader_pid.with_extension("pid.pending");
         let endpoint = "unix:///tmp/rex-connected-recovery-fixture.sock";
         let instance = "rex-instance";
         let session = fixture.authority.rex_session_id.clone();
@@ -2239,7 +2241,7 @@ while (! -e $ARGV[0]) { select undef, undef, undef, 0.05; }
 case "$*" in
   *"whoami --json"*) printf '%s\n' '{{"endpoint":"{endpoint}","instance_id":"{instance}","host_id":"fixture","rex_version":"1"}}' ;;
   *"api list --json"*) printf '%s\n' '{{"methods":{{"session.view":{{}},"session.new_window":{{}},"session.new_split":{{}},"session.focus_block":{{}},"session.zoom_block":{{}},"block.close":{{}}}}}}' ;;
-  *"events -s {session} --json"*) n=0; [ ! -f {subscription_count} ] || n=$(cat {subscription_count}); n=$((n + 1)); printf '%s\n' "$n" > {subscription_count}; if [ "$n" -eq 1 ]; then printf '%s\n' "$$" > {first_reader_pid}; while [ ! -f {allow_first_eof} ]; do /bin/sleep 0.01; done; exit 0; fi; printf '%s\n' "$$" > {replacement_reader_pid}; exec /bin/sleep 30 ;;
+  *"events -s {session} --json"*) n=0; [ ! -f {subscription_count} ] || n=$(cat {subscription_count}); n=$((n + 1)); printf '%s\n' "$n" > {subscription_count}; if [ "$n" -eq 1 ]; then printf '%s\n' "$$" > {first_reader_pid_pending}; mv {first_reader_pid_pending} {first_reader_pid}; while [ ! -f {allow_first_eof} ]; do /bin/sleep 0.01; done; exit 0; fi; printf '%s\n' "$$" > {replacement_reader_pid_pending}; mv {replacement_reader_pid_pending} {replacement_reader_pid}; exec /bin/sleep 30 ;;
   *"api call session.view"*) if [ -f {closed} ]; then printf '%s\n' '{{"session_id":"{session}","windows":[{{"window_id":"{window}","layers":[]}}]}}'; else printf '%s\n' '{{"session_id":"{session}","windows":[{{"window_id":"{window}","layers":[{{"blocks":[{{"block_id":"{block}","label":"{label}","flavor":"com.superlogical.terminal.shell"}}]}}]}}]}}'; fi ;;
   *"api call com.superlogical.terminal.process"*) cat {process_observation_file} ;;
   *"api call block.close"*) touch {closed}; printf '%s\n' '{{}}' ;;
@@ -2254,8 +2256,10 @@ esac
             label = label,
             subscription_count = shell_path(&subscription_count),
             first_reader_pid = shell_path(&first_reader_pid),
+            first_reader_pid_pending = shell_path(&first_reader_pid_pending),
             allow_first_eof = shell_path(&allow_first_eof),
             replacement_reader_pid = shell_path(&replacement_reader_pid),
+            replacement_reader_pid_pending = shell_path(&replacement_reader_pid_pending),
             closed = shell_path(&closed),
             process_observation_file = shell_path(&process_observation_file),
         );
@@ -2414,6 +2418,28 @@ esac
         .unwrap()
         .unwrap();
 
+        let observing_family = wait_for_observing_family(&spool);
+        assert_eq!(
+            observing_family.provider_executable_path, fixture.qualification.executable_path,
+            "provider readiness must come from the exact qualified executable"
+        );
+        assert_eq!(
+            observing_family.provider_executable_digest,
+            fixture.qualification.executable_digest
+        );
+        assert_eq!(
+            crate::process::process_identity_for_pid(observing_family.provider_root.pid)
+                .unwrap()
+                .filter(|identity| {
+                    identity.start_identity == observing_family.provider_root.start_identity
+                        && identity.quality
+                            == crate::process::ProcessIdentityQuality::KernelBirthToken
+                })
+                .map(|identity| identity.pid),
+            Some(observing_family.provider_root.pid),
+            "the observed provider root must still be live before recovery"
+        );
+
         let ticket_window = crate::adapters::rex::TicketWindow {
             server_instance_id: instance.into(),
             session_id: session.clone(),
@@ -2422,6 +2448,19 @@ esac
             initial_block_id: Some(block.clone()),
             disposition: crate::adapters::rex::CreateDisposition::Existing,
         };
+        let rex_observation = rex_transport
+            .observe_process(&ticket_window, &run_id, &block)
+            .unwrap();
+        let launch_anchor = start
+            .request
+            .rex_launch_anchor
+            .as_ref()
+            .expect("anchored fixture must persist its Rex launch anchor");
+        assert_eq!(
+            rex_observation.child.as_ref().map(|process| process.pid),
+            Some(launch_anchor.pid),
+            "fixture Rex child must be the exact saved launch anchor"
+        );
         let first = FactoryRuntimeObservationServices::recover_agents(
             &mut services,
             &mut fixture.store,
@@ -2791,7 +2830,9 @@ esac
             .process_group(0)
             .spawn()
             .unwrap();
-        fs::write(marker, provider.id().to_string()).unwrap();
+        let pending_marker = marker.with_extension("pid.pending");
+        fs::write(&pending_marker, provider.id().to_string()).unwrap();
+        fs::rename(pending_marker, marker).unwrap();
         loop {
             if let Some(status) = provider.try_wait().unwrap() {
                 panic!("provider exited before the parent cleanup: {status}");
