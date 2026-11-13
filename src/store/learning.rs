@@ -4,6 +4,7 @@
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{ConfigStore, validate_active_generation};
 use crate::domain::ids::{Digest, HumanRequestId, OperationId, ProfileId, ProjectId, TicketRunId};
@@ -77,6 +78,141 @@ fn sorted_source_publication_digests(sources: &[crate::topic::TopicSourceProof])
         .collect::<Vec<_>>();
     digests.sort();
     digests
+}
+
+fn applied_config_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    project: &ProjectId,
+    revision: u64,
+    digest: &str,
+) -> Result<crate::config::AppliedConfig, String> {
+    let row: (String, String, String, String) = tx.query_row(
+        "SELECT p.config_source,s.effective_config_json,s.source_manifest_json,s.digest FROM projects p JOIN config_snapshots s ON s.source_identity=p.config_source AND s.revision=p.config_revision WHERE p.project_id=?1 AND p.config_revision=?2 AND p.config_digest=?3",
+        params![project.as_str(), revision, digest],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).map_err(|error| format!("issued Project config snapshot is unavailable: {error}"))?;
+    let (_source_identity, effective_json, manifest_json, stored_digest) = row;
+    if stored_digest != digest {
+        return Err("stored Project config digest differs from issued batch".into());
+    }
+    let effective: super::EffectiveConfig =
+        crate::protocol::parse_unique(effective_json.as_bytes())?;
+    let source_files: Vec<crate::config::SourceFile> =
+        crate::protocol::parse_unique(manifest_json.as_bytes())?;
+    for source in source_files
+        .iter()
+        .filter(|source| matches!(source.kind, crate::config::SourceKind::File))
+    {
+        let bytes = source.contents.as_bytes();
+        if bytes.len() as u64 != source.bytes
+            || format!("{:x}", Sha256::digest(bytes)) != source.sha256.as_str()
+        {
+            return Err(format!(
+                "stored applied source `{}` has invalid bytes",
+                source.path
+            ));
+        }
+    }
+    let calculated =
+        crate::config::digest_manifest(&effective.config, &effective.profiles, &source_files)?;
+    if calculated != digest {
+        return Err("stored applied config snapshot does not match its digest".into());
+    }
+    Ok(crate::config::AppliedConfig {
+        config: effective.config,
+        profiles: effective.profiles,
+        source_root: effective.source_root,
+        source_files,
+        digest: Digest::parse(stored_digest)?,
+    })
+}
+
+fn profile_source_digest(
+    snapshot: &crate::config::AppliedConfig,
+    profile_id: &ProfileId,
+) -> Result<Digest, String> {
+    let profile = snapshot
+        .profiles
+        .get(profile_id)
+        .ok_or("configured profile is missing")?;
+    crate::store::agent_profile_digest(profile)
+}
+
+fn supervisor_candidate_targets(
+    tx: &rusqlite::Transaction<'_>,
+    project: &ProjectId,
+) -> Result<Vec<crate::learning::SupervisorCandidateTarget>, String> {
+    let (revision, digest): (u64, String) = tx
+        .query_row(
+            "SELECT config_revision,config_digest FROM projects WHERE project_id=?1",
+            [project.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    let snapshot = applied_config_in_transaction(tx, project, revision, &digest)?;
+    let project_config = snapshot
+        .config
+        .projects
+        .get(project)
+        .ok_or("Project config is missing")?;
+    let mut bindings = crate::config::effective_project_roles(project, &snapshot.config.projects)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for operation in &project_config.operation_matches {
+        if let Some(recipe) = snapshot.config.operation_recipes.get(&operation.recipe) {
+            bindings.extend(
+                recipe
+                    .roles
+                    .iter()
+                    .map(|(role, profile)| (*role, profile.clone())),
+            );
+        }
+    }
+    let repositories = project_config
+        .repositories
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    bindings
+        .into_iter()
+        .map(|(role, profile_id)| {
+            let profile = snapshot
+                .profiles
+                .get(&profile_id)
+                .ok_or("configured profile is missing")?;
+            let profile_digest = profile_source_digest(&snapshot, &profile_id)?;
+            let logical_root = std::path::Path::new(&snapshot.source_root)
+                .join("profiles")
+                .join(profile_id.as_str());
+            let canonical_root = snapshot
+                .source_files
+                .iter()
+                .find(|source| {
+                    matches!(source.kind, crate::config::SourceKind::Directory)
+                        && std::path::Path::new(&source.path) == logical_root
+                })
+                .map(|source| std::path::PathBuf::from(&source.canonical_path));
+            let learned_guidance = profile.learned_guidance.as_ref().and_then(|learned| {
+                let path = canonical_root.as_ref()?.join(&learned.file);
+                snapshot
+                    .source_files
+                    .iter()
+                    .find(|source| {
+                        matches!(source.kind, crate::config::SourceKind::File)
+                            && std::path::Path::new(&source.path) == path
+                    })
+                    .map(|source| source.contents.clone())
+            });
+            Ok(crate::learning::SupervisorCandidateTarget {
+                role,
+                profile_id,
+                profile_digest,
+                description: profile.description.clone(),
+                learned_guidance,
+                repository_ids: repositories.clone(),
+            })
+        })
+        .collect()
 }
 
 fn resolve_topic_source(
@@ -217,7 +353,19 @@ fn supervisor_learning_snapshot_in_transaction(
         )?);
     }
     drop(revisions_stmt);
-    let expired_candidates = ledger.expire_due(now_utc).map_err(|e| e.to_string())?;
+    let mut pinned_candidates = BTreeSet::new();
+    for revision in ledger
+        .revisions
+        .iter()
+        .filter(|revision| revision.status == CandidateStatus::Proposed)
+    {
+        if candidate_revision_is_pinned(tx, project, &revision.candidate_id, &revision.digest)? {
+            pinned_candidates.insert((revision.candidate_id.clone(), revision.digest.clone()));
+        }
+    }
+    let expired_candidates = ledger
+        .expire_due_except(now_utc, &pinned_candidates)
+        .map_err(|e| e.to_string())?;
     for revision in ledger
         .revisions
         .iter()
@@ -399,8 +547,26 @@ fn supervisor_learning_snapshot_in_transaction(
         });
     }
     let omitted_topics = total_published_topics.saturating_sub(topics.len());
-    let mut candidates_stmt=tx.prepare("SELECT revision_json,profile_id,package_manifest_digest,expected_pairs,evidence_json FROM learning_candidates WHERE project_id=?1 AND status IN ('proposed','trialing','awaiting_approval') ORDER BY created_at_unix,candidate_id,digest LIMIT ?2").map_err(|e|e.to_string())?;
-    let candidate_rows = candidates_stmt
+    let candidates = current_supervisor_candidate_entries(tx, project)?;
+    let mut snapshot = ProjectSupervisorMaintenance {
+        project_id: project.clone(),
+        expired_candidates,
+        knowledge,
+        topics,
+        omitted_topics,
+        candidates,
+        candidate_targets: supervisor_candidate_targets(tx, project)?,
+    };
+    trim_supervisor_snapshot(&mut snapshot)?;
+    Ok(snapshot)
+}
+
+fn current_supervisor_candidate_entries(
+    tx: &rusqlite::Transaction<'_>,
+    project: &ProjectId,
+) -> Result<Vec<SupervisorCandidateEntry>, String> {
+    let mut statement = tx.prepare("SELECT revision_json,profile_id,package_manifest_digest,expected_pairs,evidence_json,package_files_json,package_json FROM learning_candidates WHERE project_id=?1 AND status IN ('proposed','trialing','awaiting_approval') ORDER BY created_at_unix,candidate_id,digest LIMIT ?2").map_err(|e|e.to_string())?;
+    let rows = statement
         .query_map(
             params![project.as_str(), MAX_SUPERVISOR_CANDIDATES as i64],
             |row| {
@@ -410,37 +576,59 @@ fn supervisor_learning_snapshot_in_transaction(
                     row.get::<_, String>(2)?,
                     row.get::<_, usize>(3)?,
                     row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             },
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
     let mut candidates = Vec::new();
-    for row in candidate_rows {
-        let (revision_json, profile_id, manifest_digest, expected_pairs, evidence_json) =
-            row.map_err(|e| e.to_string())?;
+    for row in rows {
+        let (
+            revision_json,
+            profile_id,
+            manifest_digest,
+            expected_pairs,
+            evidence_json,
+            files_json,
+            package_json,
+        ) = row.map_err(|error| error.to_string())?;
         let revision: CandidateRevision = crate::protocol::parse_unique(revision_json.as_bytes())?;
         let evidence = evidence_json
             .map(|json| crate::protocol::parse_unique(json.as_bytes()))
             .transpose()?;
+        let files: BTreeMap<String, Vec<u8>> =
+            crate::protocol::parse_unique(files_json.as_bytes())?;
+        let profile_id = ProfileId::parse(profile_id)?;
+        let manifest_digest = Digest::parse(manifest_digest)?;
+        let metadata = files
+            .get(crate::learning::PROFILE_CANDIDATE_METADATA_PATH)
+            .map(|bytes| crate::protocol::parse_unique(bytes))
+            .transpose()?;
+        if let Some(metadata) = &metadata {
+            validate_profile_candidate_metadata(
+                project,
+                &revision,
+                &profile_id,
+                &manifest_digest,
+                &files,
+                &package_json,
+                metadata,
+            )?;
+        }
         candidates.push(SupervisorCandidateEntry {
             revision,
-            profile_id: ProfileId::parse(profile_id)?,
-            package_manifest_digest: Digest::parse(manifest_digest)?,
+            profile_id,
+            package_manifest_digest: manifest_digest,
             expected_pairs,
             evidence,
+            metadata: metadata
+                .as_ref()
+                .map(crate::learning::ProfileCandidateSummary::from),
         });
     }
-    drop(candidates_stmt);
-    let mut snapshot = ProjectSupervisorMaintenance {
-        project_id: project.clone(),
-        expired_candidates,
-        knowledge,
-        topics,
-        omitted_topics,
-        candidates,
-    };
-    trim_supervisor_snapshot(&mut snapshot)?;
-    Ok(snapshot)
+    drop(statement);
+    Ok(candidates)
 }
 
 fn trim_supervisor_snapshot(snapshot: &mut ProjectSupervisorMaintenance) -> Result<(), String> {
@@ -501,6 +689,107 @@ fn latest_supervisor_checkpoint(
         })
         .transpose()
         .map(|checkpoint| checkpoint.unwrap_or_default())
+}
+
+struct PreparedLearningCandidate {
+    record: Option<LearningCandidateRecord>,
+    supersedes: Option<Digest>,
+}
+
+fn validate_profile_candidate_metadata(
+    project: &ProjectId,
+    revision: &crate::learning::CandidateRevision,
+    profile_id: &ProfileId,
+    manifest_digest: &Digest,
+    files: &BTreeMap<String, Vec<u8>>,
+    package_json: &str,
+    metadata: &crate::learning::ProfileCandidateMetadata,
+) -> Result<(), String> {
+    let rows = files
+        .iter()
+        .map(|(path, bytes)| {
+            (
+                path.clone(),
+                Digest::parse(format!("{:x}", Sha256::digest(bytes)))
+                    .expect("SHA-256 digest is valid"),
+            )
+        })
+        .collect::<Vec<_>>();
+    if serde_json::to_string(&rows).map_err(|error| error.to_string())? != package_json
+        || crate::learning::manifest_digest(files).map_err(|error| error.to_string())?
+            != *manifest_digest
+        || crate::learning::candidate_revision_digest(files).map_err(|error| error.to_string())?
+            != revision.digest
+    {
+        return Err(
+            "stored candidate package manifest or revision digest does not match its files".into(),
+        );
+    }
+    let base_profile: crate::config::Profile =
+        crate::protocol::parse_unique(metadata.base_profile_json.as_bytes())?;
+    let config_profile: crate::config::Profile = toml::from_str(
+        std::str::from_utf8(
+            files
+                .get("config.toml")
+                .ok_or("candidate package lacks config.toml")?,
+        )
+        .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("candidate config.toml is invalid: {error}"))?;
+    let base_config: crate::config::Profile = toml::from_str(&metadata.base_config_toml)
+        .map_err(|error| format!("candidate base config.toml is invalid: {error}"))?;
+    let expected_scope = metadata.repository_ids.clone();
+    let learned = config_profile
+        .learned_guidance
+        .as_ref()
+        .ok_or("candidate config lacks learned guidance binding")?;
+    if metadata.schema_version != 1
+        || metadata.project_id != *project
+        || revision.project_id != *project
+        || metadata.candidate_id != revision.candidate_id
+        || metadata.profile_id != *profile_id
+        || revision.role != metadata.role
+        || crate::learning::candidate_slot_id(
+            project,
+            metadata.role,
+            &metadata.base_profile_id,
+            &metadata.topic_key,
+        ) != (metadata.candidate_id.clone(), profile_id.clone())
+        || crate::store::agent_profile_digest(&base_profile)? != metadata.base_profile_digest
+        || super::canonical_json(&base_profile)? != super::canonical_json(&base_config)?
+        || config_profile.description.as_deref() != Some(metadata.description.as_str())
+        || config_profile
+            .learned_guidance
+            .as_ref()
+            .is_none_or(|binding| {
+                binding.file != metadata.learned_guidance_path
+                    || binding.project_id != *project
+                    || binding.role != metadata.role
+                    || binding.repository_ids != expected_scope
+            })
+        || learned.file != metadata.learned_guidance_path
+        || files
+            .get(&metadata.learned_guidance_path)
+            .map(Vec::as_slice)
+            != Some(metadata.learned_guidance.as_bytes())
+    {
+        return Err("stored candidate metadata is not bound to its Project, revision, profile, or learned layer".into());
+    }
+    let mut normalized = config_profile;
+    normalized.description = base_profile.description.clone();
+    normalized.learned_guidance = base_profile.learned_guidance.clone();
+    if super::canonical_json(&normalized)? != super::canonical_json(&base_profile)? {
+        return Err(
+            "candidate config changes execution settings beyond description and learned guidance"
+                .into(),
+        );
+    }
+    for (source, packaged) in &metadata.external_sources {
+        if source.is_empty() || files.get(packaged).is_none() {
+            return Err("candidate metadata references an absent external source file".into());
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn migrate_v19_learning_batches(connection: &Connection) -> Result<(), String> {
@@ -1022,6 +1311,8 @@ pub struct SupervisorCandidateEntry {
     pub package_manifest_digest: Digest,
     pub expected_pairs: usize,
     pub evidence: Option<TrialEvidence>,
+    #[serde(default)]
+    pub metadata: Option<crate::learning::ProfileCandidateSummary>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1032,6 +1323,8 @@ pub struct ProjectSupervisorMaintenance {
     pub topics: Vec<SupervisorTopicEntry>,
     pub omitted_topics: usize,
     pub candidates: Vec<SupervisorCandidateEntry>,
+    #[serde(default)]
+    pub candidate_targets: Vec<crate::learning::SupervisorCandidateTarget>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1078,8 +1371,554 @@ pub struct StoredApprovedProfilePackage {
     pub profile_material_digest: Digest,
 }
 
+fn prepare_learning_candidate(
+    tx: &rusqlite::Transaction<'_>,
+    project: &ProjectId,
+    payload: &crate::engine::orchestration::LearningDecisionPayload,
+    issued_snapshot: &serde_json::Value,
+    findings: &[LearningFinding],
+    now_unix: i64,
+) -> Result<PreparedLearningCandidate, String> {
+    let proposal = payload
+        .candidate_change
+        .as_ref()
+        .ok_or("candidate proposal is missing")?;
+    let topic_key = crate::topic::TopicKey::parse(&proposal.topic_key)?;
+    let revision = payload.config_revision.0;
+    let digest = issued_snapshot["config_digest"]
+        .as_str()
+        .ok_or("issued candidate input has no config digest")?;
+    let current_snapshot = applied_config_in_transaction(tx, project, revision, digest)?;
+    let current_targets = supervisor_candidate_targets(tx, project)?;
+    let issued_targets: Vec<crate::learning::SupervisorCandidateTarget> =
+        serde_json::from_value(issued_snapshot["maintenance"]["candidate_targets"].clone())
+            .map_err(|error| format!("issued candidate target catalog is invalid: {error}"))?;
+    if current_targets != issued_targets {
+        return Err("configured candidate target catalog changed after batch issuance".into());
+    }
+    if proposal.description.trim().is_empty()
+        || proposal.description.len() > crate::learning::MAX_CANDIDATE_TEXT_BYTES
+        || proposal.evaluation_criterion.trim().is_empty()
+        || proposal.evaluation_criterion.len() > crate::learning::MAX_CANDIDATE_TEXT_BYTES
+        || proposal.learned_guidance.trim().is_empty()
+        || proposal.learned_guidance.len() > crate::learning::MAX_CANDIDATE_GUIDANCE_BYTES
+        || proposal.repository_ids.is_empty()
+        || proposal
+            .repository_ids
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .len()
+            != proposal.repository_ids.len()
+        || proposal.source_finding_ids.len() < 2
+        || proposal.source_finding_ids.len() > 20
+        || proposal
+            .source_finding_ids
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .len()
+            != proposal.source_finding_ids.len()
+    {
+        return Err(
+            "candidate proposal is empty, oversized, or contains duplicate evidence or scope"
+                .into(),
+        );
+    }
+    let target = issued_targets
+        .iter()
+        .find(|target| {
+            target.role == proposal.role
+                && target.profile_id == proposal.base_profile_id
+                && target.profile_digest == proposal.base_profile_digest
+        })
+        .ok_or("candidate target is not a configured Project or selected recipe role/profile")?;
+    let repository_scope = proposal
+        .repository_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if !repository_scope.is_subset(&target.repository_ids) {
+        return Err(
+            "candidate repository scope exceeds the configured Project repositories".into(),
+        );
+    }
+    let base_profile = current_snapshot
+        .profiles
+        .get(&proposal.base_profile_id)
+        .ok_or("candidate base profile is missing")?;
+    if let Some(learned) = &base_profile.learned_guidance
+        && (learned.project_id != *project
+            || learned.role != proposal.role
+            || learned.repository_ids != repository_scope)
+    {
+        return Err(
+            "candidate scope must exactly replace the existing managed guidance scope".into(),
+        );
+    }
+    let finding_map = findings
+        .iter()
+        .map(|finding| (finding.id.clone(), finding))
+        .collect::<BTreeMap<_, _>>();
+    let mut source_runs = BTreeSet::new();
+    for source_id in &proposal.source_finding_ids {
+        if !finding_map.contains_key(source_id) {
+            return Err("candidate evidence must come from the exact issued Finding batch".into());
+        }
+        let proof = resolve_topic_source(tx, project, source_id)?
+            .ok_or("candidate evidence is not a published Finding in this Project")?;
+        source_runs.insert(TicketRunId::parse(proof.ticket_run_id)?);
+    }
+    if source_runs.len() < 2 {
+        return Err("candidate evidence must cover at least two distinct TicketRuns".into());
+    }
+    let (candidate_id, profile_id) = crate::learning::candidate_slot_id(
+        project,
+        proposal.role,
+        &proposal.base_profile_id,
+        &topic_key,
+    );
+    let active: Vec<(String, String, String, String)> = {
+        let mut statement = tx.prepare("SELECT digest,revision_json,package_files_json,package_manifest_digest FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND status IN ('proposed','trialing','awaiting_approval') ORDER BY digest").map_err(|error| error.to_string())?;
+        statement
+            .query_map(params![project.as_str(), candidate_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    if active.len() > 1 {
+        return Err("candidate slot contains multiple active revisions".into());
+    }
+    let current_prior = active
+        .first()
+        .map(|row| Digest::parse(row.0.clone()))
+        .transpose()?;
+    if current_prior != proposal.expected_prior_digest {
+        return Err("candidate predecessor digest is stale or missing".into());
+    }
+    let mut files = BTreeMap::<String, Vec<u8>>::new();
+    let logical_root = std::path::Path::new(&current_snapshot.source_root)
+        .join("profiles")
+        .join(proposal.base_profile_id.as_str());
+    let profile_directory = current_snapshot
+        .source_files
+        .iter()
+        .find(|source| {
+            matches!(source.kind, crate::config::SourceKind::Directory)
+                && std::path::Path::new(&source.path) == logical_root
+        })
+        .ok_or("candidate base profile directory is absent from the applied source manifest")?;
+    let canonical_root = std::path::PathBuf::from(&profile_directory.canonical_path);
+    let config_path = canonical_root.join("config.toml");
+    let base_config_toml = current_snapshot
+        .source_files
+        .iter()
+        .find(|source| {
+            matches!(source.kind, crate::config::SourceKind::File)
+                && std::path::Path::new(&source.path) == config_path
+        })
+        .ok_or("candidate base profile config.toml is absent from the applied source manifest")?
+        .contents
+        .clone();
+    let mut external_sources = BTreeMap::new();
+    let (skill_roots, skill_files) =
+        captured_skill_sources(&current_snapshot, base_profile, &canonical_root)?;
+    for source in current_snapshot
+        .source_files
+        .iter()
+        .filter(|source| matches!(source.kind, crate::config::SourceKind::File))
+    {
+        let source_path = std::path::Path::new(&source.path);
+        let canonical_source_path = std::path::Path::new(&source.canonical_path);
+        let package_path = if canonical_source_path.starts_with(&canonical_root) {
+            let relative = source_path
+                .strip_prefix(&canonical_root)
+                .map_err(|error| error.to_string())?;
+            let relative = relative.to_string_lossy().into_owned();
+            if relative == "config.toml" {
+                continue;
+            }
+            relative
+        } else if skill_roots
+            .iter()
+            .any(|root| canonical_source_path.starts_with(root))
+            || skill_files.iter().any(|path| canonical_source_path == path)
+        {
+            let relative = std::path::Path::new(&source.canonical_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("skill-data");
+            let path = format!("external/{}/{}", &source.sha256.as_str()[..16], relative);
+            external_sources.insert(source.canonical_path.clone(), path.clone());
+            path
+        } else {
+            continue;
+        };
+        let relative = std::path::Path::new(&package_path);
+        if relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err("candidate source path is unsafe to package".into());
+        }
+        let contents = source.contents.as_bytes().to_vec();
+        if let Some(existing) = files.get(&package_path) {
+            if !external_sources.contains_key(&source.canonical_path) || existing != &contents {
+                return Err("candidate package contains colliding source paths".into());
+            }
+        } else {
+            files.insert(package_path, contents);
+        }
+    }
+    let learned_guidance_path = base_profile
+        .learned_guidance
+        .as_ref()
+        .map(|learned| learned.file.clone())
+        .unwrap_or_else(|| ".rex-projects/learned-guidance.md".into());
+    let base_guidance = base_profile.learned_guidance.as_ref().and_then(|learned| {
+        let path = canonical_root.join(&learned.file);
+        current_snapshot
+            .source_files
+            .iter()
+            .find(|source| std::path::Path::new(&source.path) == path)
+            .map(|source| source.contents.clone())
+    });
+    let mut candidate_profile = base_profile.clone();
+    candidate_profile.description = Some(proposal.description.clone());
+    candidate_profile.learned_guidance = Some(crate::config::LearnedGuidance {
+        file: learned_guidance_path.clone(),
+        project_id: project.clone(),
+        role: proposal.role,
+        repository_ids: repository_scope.clone(),
+    });
+    if base_profile.learned_guidance.is_none() && files.contains_key(&learned_guidance_path) {
+        return Err(
+            "reserved candidate learned-guidance path collides with a base profile source".into(),
+        );
+    }
+    files.insert(
+        learned_guidance_path.clone(),
+        proposal.learned_guidance.as_bytes().to_vec(),
+    );
+    let candidate_config_toml =
+        toml::to_string(&candidate_profile).map_err(|error| error.to_string())?;
+    files.insert("config.toml".into(), candidate_config_toml.into_bytes());
+    let metadata = crate::learning::ProfileCandidateMetadata {
+        schema_version: 1,
+        project_id: project.clone(),
+        candidate_id: candidate_id.clone(),
+        profile_id: profile_id.clone(),
+        role: proposal.role,
+        base_profile_id: proposal.base_profile_id.clone(),
+        base_profile_digest: proposal.base_profile_digest.clone(),
+        base_profile_json: super::canonical_json(base_profile)?,
+        base_config_toml: base_config_toml.clone(),
+        base_guidance: base_guidance.clone(),
+        learned_guidance_path,
+        config_revision: crate::domain::ids::Revision(revision),
+        config_digest: current_snapshot.digest.clone(),
+        topic_key: topic_key.clone(),
+        repository_ids: repository_scope,
+        source_finding_ids: proposal.source_finding_ids.clone(),
+        source_ticket_run_ids: source_runs,
+        expected_prior_digest: proposal.expected_prior_digest.clone(),
+        evaluation_criterion: proposal.evaluation_criterion.clone(),
+        description: proposal.description.clone(),
+        learned_guidance: proposal.learned_guidance.clone(),
+        external_sources,
+    };
+    let metadata_bytes = serde_json::to_vec(&metadata).map_err(|error| error.to_string())?;
+    if files
+        .insert(
+            crate::learning::PROFILE_CANDIDATE_METADATA_PATH.into(),
+            metadata_bytes,
+        )
+        .is_some()
+    {
+        return Err("base profile collides with the reserved candidate metadata path".into());
+    }
+    let total_bytes = files.values().map(Vec::len).sum::<usize>();
+    if files.len() > crate::learning::MAX_PROFILE_PACKAGE_FILES
+        || total_bytes > crate::learning::MAX_PROFILE_PACKAGE_BYTES
+    {
+        return Err("candidate package exceeds the existing profile package limits".into());
+    }
+    let package_manifest_digest =
+        crate::learning::manifest_digest(&files).map_err(|error| error.to_string())?;
+    let package_rows = files
+        .iter()
+        .map(|(path, bytes)| {
+            (
+                path,
+                Digest::parse(format!("{:x}", Sha256::digest(bytes)))
+                    .expect("SHA-256 digest is valid"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let package_json = serde_json::to_string(&package_rows).map_err(|error| error.to_string())?;
+    let package_files_json = serde_json::to_string(&files).map_err(|error| error.to_string())?;
+    let revision_digest =
+        crate::learning::candidate_revision_digest(&files).map_err(|error| error.to_string())?;
+    let created_at =
+        crate::learning::unix_seconds_to_utc(now_unix as u64).map_err(|error| error.to_string())?;
+    let expires_at =
+        crate::learning::unix_seconds_to_utc((now_unix as u64).saturating_add(14 * 24 * 3600))
+            .map_err(|error| error.to_string())?;
+    let record = LearningCandidateRecord {
+        revision: CandidateRevision {
+            candidate_id,
+            project_id: project.clone(),
+            role: proposal.role,
+            digest: revision_digest,
+            created_at,
+            expires_at,
+            status: CandidateStatus::Proposed,
+        },
+        profile_id,
+        package_manifest_digest,
+        package_files_json,
+        package_json,
+        expected_pairs: crate::learning::MAX_TRIAL_PAIRS_PER_REVISION,
+    };
+    if record.package_json.len() > MAX_RECORD_BYTES
+        || record.package_files_json.len() > MAX_RECORD_BYTES
+    {
+        return Err("candidate package exceeds durable storage bounds".into());
+    }
+    let same_existing = if let Some((_, _, files_json, _)) = active.first() {
+        let old_files: BTreeMap<String, Vec<u8>> =
+            crate::protocol::parse_unique(files_json.as_bytes())?;
+        let old_metadata: crate::learning::ProfileCandidateMetadata =
+            crate::protocol::parse_unique(
+                old_files
+                    .get(crate::learning::PROFILE_CANDIDATE_METADATA_PATH)
+                    .ok_or("active candidate metadata is missing")?,
+            )?;
+        let old_non_metadata = old_files
+            .iter()
+            .filter(|(path, _)| path.as_str() != crate::learning::PROFILE_CANDIDATE_METADATA_PATH)
+            .collect::<Vec<_>>();
+        let new_non_metadata = files
+            .iter()
+            .filter(|(path, _)| path.as_str() != crate::learning::PROFILE_CANDIDATE_METADATA_PATH)
+            .collect::<Vec<_>>();
+        old_non_metadata == new_non_metadata
+            && old_metadata.base_profile_digest == proposal.base_profile_digest
+            && old_metadata.base_profile_json == super::canonical_json(base_profile)?
+            && old_metadata.base_config_toml == base_config_toml
+            && old_metadata.base_guidance == base_guidance
+            && old_metadata.topic_key == topic_key
+            && old_metadata.repository_ids == metadata.repository_ids
+            && old_metadata.description == proposal.description
+            && old_metadata.learned_guidance == proposal.learned_guidance
+            && old_metadata.evaluation_criterion == proposal.evaluation_criterion
+    } else {
+        false
+    };
+    let supersedes = current_prior;
+    if same_existing {
+        return Ok(PreparedLearningCandidate {
+            record: None,
+            supersedes,
+        });
+    }
+    let mut projected: ProjectSupervisorMaintenance =
+        serde_json::from_value(issued_snapshot["maintenance"].clone()).map_err(|error| {
+            format!("issued Supervisor maintenance context is invalid: {error}")
+        })?;
+    projected.candidates = current_supervisor_candidate_entries(tx, project)?;
+    projected
+        .candidates
+        .retain(|candidate| candidate.revision.candidate_id != record.revision.candidate_id);
+    projected.candidates.push(SupervisorCandidateEntry {
+        revision: record.revision.clone(),
+        profile_id: record.profile_id.clone(),
+        package_manifest_digest: record.package_manifest_digest.clone(),
+        expected_pairs: record.expected_pairs,
+        evidence: None,
+        metadata: Some(crate::learning::ProfileCandidateSummary::from(&metadata)),
+    });
+    trim_supervisor_snapshot(&mut projected).map_err(|error| {
+        format!("candidate would make the next Supervisor learning input unissuable: {error}")
+    })?;
+    if let Some(prior) = &supersedes
+        && candidate_revision_is_pinned(tx, project, &record.revision.candidate_id, prior)?
+    {
+        return Err("candidate slot is pinned by an unfinished trial or promotion".into());
+    }
+    let mut ledger = CandidateLedger::default();
+    {
+        let mut statement = tx
+            .prepare("SELECT revision_json FROM learning_candidates WHERE project_id=?1")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([project.as_str()], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            ledger.revisions.push(crate::protocol::parse_unique(
+                row.map_err(|error| error.to_string())?.as_bytes(),
+            )?);
+        }
+    }
+    if let Some(prior) = &supersedes {
+        ledger.supersede_slot(
+            project,
+            &record.revision.candidate_id,
+            &record.revision.digest,
+        );
+        if !ledger.revisions.iter().any(|old| {
+            old.project_id == *project
+                && old.candidate_id == record.revision.candidate_id
+                && old.digest == *prior
+                && old.status == CandidateStatus::Superseded
+        }) {
+            return Err("candidate predecessor is not available for replacement".into());
+        }
+    }
+    ledger
+        .register(record.revision.clone())
+        .map_err(|error| error.to_string())?;
+    Ok(PreparedLearningCandidate {
+        record: Some(record),
+        supersedes,
+    })
+}
+
+fn captured_skill_sources(
+    snapshot: &crate::config::AppliedConfig,
+    profile: &crate::config::Profile,
+    canonical_profile_root: &std::path::Path,
+) -> Result<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>), String> {
+    let mut roots = Vec::new();
+    let mut files = Vec::new();
+    for skill in &profile.skill_paths {
+        let configured = std::path::PathBuf::from(skill);
+        let configured = if configured.is_absolute() {
+            configured
+        } else {
+            canonical_profile_root.join(configured)
+        };
+        if let Some(directory) = snapshot.source_files.iter().find(|source| {
+            matches!(source.kind, crate::config::SourceKind::Directory)
+                && std::path::Path::new(&source.path) == configured
+        }) {
+            roots.push(std::path::PathBuf::from(&directory.canonical_path));
+            continue;
+        }
+        if let Some(file) = snapshot.source_files.iter().find(|source| {
+            matches!(source.kind, crate::config::SourceKind::File)
+                && std::path::Path::new(&source.path) == configured
+        }) {
+            files.push(std::path::PathBuf::from(&file.canonical_path));
+            continue;
+        }
+        if snapshot.source_files.iter().any(|source| {
+            matches!(source.kind, crate::config::SourceKind::File)
+                && std::path::Path::new(&source.path).starts_with(&configured)
+        }) {
+            roots.push(configured);
+            continue;
+        }
+        return Err(format!(
+            "captured source manifest cannot resolve configured skill path `{skill}`; reapply the Project config"
+        ));
+    }
+    Ok((roots, files))
+}
+
+fn candidate_revision_is_pinned(
+    tx: &rusqlite::Transaction<'_>,
+    project: &ProjectId,
+    candidate_id: &str,
+    digest: &Digest,
+) -> Result<bool, String> {
+    let pinned: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM profile_trial_authorizations a WHERE a.project_id=?1 AND a.candidate_id=?2 AND a.candidate_digest=?3 AND a.lifecycle IN ('pending','authorized')) OR EXISTS(SELECT 1 FROM profile_trial_launches l JOIN profile_trial_authorizations a USING(authorization_id) WHERE a.project_id=?1 AND a.candidate_id=?2 AND a.candidate_digest=?3 AND l.lifecycle IN ('prepared','running','uncertain')) OR EXISTS(SELECT 1 FROM profile_promotions p WHERE p.project_id=?1 AND p.candidate_id=?2 AND p.candidate_digest=?3 AND p.state IN ('approved','publication_pending','published','activation_pending','active')) OR EXISTS(SELECT 1 FROM profile_promotions p JOIN effects e USING(operation_id) WHERE p.project_id=?1 AND p.candidate_id=?2 AND p.candidate_digest=?3 AND e.kind='publish_profile' AND e.status IN ('pending','claimed','uncertain'))",
+        params![project.as_str(), candidate_id, digest.as_str()],
+        |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    Ok(pinned)
+}
+
+fn register_learning_candidate_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    generation: u64,
+    record: &LearningCandidateRecord,
+) -> Result<CandidateRegistration, String> {
+    if !(5..=MAX_TRIALS).contains(&record.expected_pairs)
+        || record.package_json.len() > MAX_RECORD_BYTES
+        || record.package_files_json.len() > MAX_RECORD_BYTES
+        || record.revision.status != CandidateStatus::Proposed
+    {
+        return Err("candidate package, identity, or trial count exceeds bounds".into());
+    }
+    verify_digest(&record.package_json, &record.package_manifest_digest)?;
+    let files: BTreeMap<String, Vec<u8>> =
+        crate::protocol::parse_unique(record.package_files_json.as_bytes())?;
+    if serde_json::to_string(&files).map_err(|e| e.to_string())? != record.package_files_json
+        || crate::learning::manifest_digest(&files).map_err(|e| e.to_string())?
+            != record.package_manifest_digest
+    {
+        return Err("candidate file bytes do not match their immutable manifest".into());
+    }
+    validate_active_generation(tx, generation)?;
+    let revision_json = serde_json::to_string(&record.revision).map_err(|e| e.to_string())?;
+    let role = serde_json::to_value(record.revision.role)
+        .map_err(|e| e.to_string())?
+        .as_str()
+        .ok_or("invalid role")?
+        .to_owned();
+    let status = serde_json::to_value(record.revision.status)
+        .map_err(|e| e.to_string())?
+        .as_str()
+        .ok_or("invalid candidate status")?
+        .to_owned();
+    let prior: Option<(String,String,String,String,usize)> = tx.query_row(
+        "SELECT revision_json,package_manifest_digest,package_files_json,package_json,expected_pairs FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",
+        params![record.revision.project_id.as_str(),record.revision.candidate_id,record.revision.digest.as_str()],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+    ).optional().map_err(|error| error.to_string())?;
+    if let Some(found) = prior {
+        if found
+            != (
+                revision_json,
+                record.package_manifest_digest.to_string(),
+                record.package_files_json.clone(),
+                record.package_json.clone(),
+                record.expected_pairs,
+            )
+        {
+            return Err("candidate identity has different immutable content".into());
+        }
+        return Ok(CandidateRegistration::AlreadyRegistered);
+    }
+    let mut ledger = CandidateLedger::default();
+    {
+        let mut statement = tx
+            .prepare("SELECT revision_json FROM learning_candidates WHERE project_id=?1")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([record.revision.project_id.as_str()], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            ledger.revisions.push(crate::protocol::parse_unique(
+                row.map_err(|error| error.to_string())?.as_bytes(),
+            )?);
+        }
+    }
+    ledger
+        .register(record.revision.clone())
+        .map_err(|error| error.to_string())?;
+    tx.execute(
+        "INSERT INTO learning_candidates(project_id,candidate_id,role,digest,profile_id,revision_json,package_manifest_digest,package_files_json,package_json,expected_pairs,status,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        params![record.revision.project_id.as_str(),record.revision.candidate_id,role,record.revision.digest.as_str(),record.profile_id.as_str(),revision_json,record.package_manifest_digest.as_str(),record.package_files_json,record.package_json,record.expected_pairs,status,super::now_unix()?],
+    ).map_err(|error| error.to_string())?;
+    Ok(CandidateRegistration::Registered)
+}
+
 /// Install v10 over a v9 database as part of the caller's backed-up migration transaction.
-#[allow(dead_code)] // Wired into the ordered v9 migration chain when PR3/4/5 land.
 pub(crate) fn migrate_v10(connection: &Connection) -> Result<(), String> {
     let tx = connection
         .unchecked_transaction()
@@ -3001,90 +3840,14 @@ impl ConfigStore {
         generation: u64,
         record: &LearningCandidateRecord,
     ) -> Result<CandidateRegistration, String> {
-        if !(5..=MAX_TRIALS).contains(&record.expected_pairs)
-            || record.package_json.len() > MAX_RECORD_BYTES
-            || record.package_files_json.len() > MAX_RECORD_BYTES
-            || record.revision.status != CandidateStatus::Proposed
-        {
-            return Err("candidate package, identity, or trial count exceeds bounds".into());
-        }
-        verify_digest(&record.package_json, &record.package_manifest_digest)?;
-        let files: std::collections::BTreeMap<String, Vec<u8>> =
-            crate::protocol::parse_unique(record.package_files_json.as_bytes())?;
-        if serde_json::to_string(&files).map_err(|e| e.to_string())? != record.package_files_json
-            || crate::learning::manifest_digest(&files).map_err(|e| e.to_string())?
-                != record.package_manifest_digest
-        {
-            return Err("candidate file bytes do not match their immutable manifest".into());
-        }
-        let revision_json = serde_json::to_string(&record.revision).map_err(|e| e.to_string())?;
-        let role = serde_json::to_value(record.revision.role)
-            .map_err(|e| e.to_string())?
-            .as_str()
-            .ok_or("invalid role")?
-            .to_owned();
-        let status = serde_json::to_value(record.revision.status)
-            .map_err(|e| e.to_string())?
-            .as_str()
-            .ok_or("invalid candidate status")?
-            .to_owned();
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         validate_active_generation(&tx, generation)?;
-        let prior:Option<(String,String,String,String,usize)>=tx.query_row("SELECT revision_json,package_manifest_digest,package_files_json,package_json,expected_pairs FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",params![record.revision.project_id.as_str(),record.revision.candidate_id,record.revision.digest.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(|e|e.to_string())?;
-        if let Some(found) = prior {
-            let expected = (
-                revision_json,
-                record.package_manifest_digest.to_string(),
-                record.package_files_json.clone(),
-                record.package_json.clone(),
-                record.expected_pairs,
-            );
-            if found != expected {
-                return Err("candidate identity has different immutable content".into());
-            }
-            tx.commit().map_err(|e| e.to_string())?;
-            return Ok(CandidateRegistration::AlreadyRegistered);
-        }
-        let mut ledger = CandidateLedger::default();
-        let mut statement = tx
-            .prepare("SELECT revision_json FROM learning_candidates WHERE project_id=?1")
-            .map_err(|e| e.to_string())?;
-        let rows = statement
-            .query_map([record.revision.project_id.as_str()], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(|e| e.to_string())?;
-        for row in rows {
-            ledger.revisions.push(
-                serde_json::from_str(&row.map_err(|e| e.to_string())?)
-                    .map_err(|e| format!("stored candidate revision is invalid: {e}"))?,
-            );
-        }
-        drop(statement);
-        let before = ledger.revisions.clone();
-        ledger
-            .register(record.revision.clone())
-            .map_err(|error| error.to_string())?;
-        let retained = ledger
-            .revisions
-            .iter()
-            .map(|revision| (revision.candidate_id.clone(), revision.digest.to_string()))
-            .collect::<std::collections::BTreeSet<_>>();
-        for old in before {
-            if !retained.contains(&(old.candidate_id.clone(), old.digest.to_string())) {
-                tx.execute(
-                    "DELETE FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",
-                    params![record.revision.project_id.as_str(), old.candidate_id, old.digest.as_str()],
-                )
-                .map_err(|e| e.to_string())?;
-            }
-        }
-        tx.execute("INSERT INTO learning_candidates(project_id,candidate_id,role,digest,profile_id,revision_json,package_manifest_digest,package_files_json,package_json,expected_pairs,status,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![record.revision.project_id.as_str(),record.revision.candidate_id,role,record.revision.digest.as_str(),record.profile_id.as_str(),revision_json,record.package_manifest_digest.as_str(),record.package_files_json,record.package_json,record.expected_pairs,status,super::now_unix()?]).map_err(|e|e.to_string())?;
+        let registration = register_learning_candidate_in_transaction(&tx, generation, record)?;
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(CandidateRegistration::Registered)
+        Ok(registration)
     }
 
     /// One bounded per-project maintenance snapshot for a Supervisor tick.
@@ -3457,13 +4220,13 @@ impl ConfigStore {
             AgentAssertion::Succeeded => None,
         };
         let mut topic_intents = Vec::new();
+        let mut prepared_candidate = None;
         let mut rendered_topic_bytes = 0usize;
         if let Some(payload) = payload {
             let topic_changes_valid =
                 crate::topic::validate_changes(&payload.topic_changes).is_ok();
             if !topic_changes_valid
                 || !payload.improvements.is_empty()
-                || payload.candidate_change.is_some()
                 || payload.observations.is_empty()
                 || payload.observations.len() > 20
                 || payload
@@ -3479,6 +4242,22 @@ impl ConfigStore {
                 rejection.get_or_insert_with(|| {
                     "Supervisor learning decision is unsupported or exceeds host bounds".into()
                 });
+            }
+            if rejection.is_none() && payload.candidate_change.is_some() {
+                match prepare_learning_candidate(
+                    &tx,
+                    &binding.project_id,
+                    payload,
+                    &snapshot_value,
+                    &findings,
+                    now_unix,
+                ) {
+                    Ok(candidate) => prepared_candidate = Some(candidate),
+                    Err(error) => {
+                        rejection
+                            .get_or_insert_with(|| format!("candidate proposal rejected: {error}"));
+                    }
+                }
             }
             if !payload.topic_changes.is_empty() && topic_changes_valid {
                 match topic_destination_root {
@@ -3758,6 +4537,20 @@ impl ConfigStore {
             tx.execute("UPDATE project_runtimes SET last_error=COALESCE(last_error,?2) WHERE project_id=?1",params![project,reason]).map_err(|error| error.to_string())?;
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(());
+        }
+        if let Some(prepared) = prepared_candidate {
+            if let (Some(prior), Some(record)) = (&prepared.supersedes, &prepared.record) {
+                let changed = tx.execute(
+                    "UPDATE learning_candidates SET status='superseded',revision_json=json_set(revision_json,'$.status','superseded') WHERE project_id=?1 AND candidate_id=?2 AND digest=?3 AND status IN ('proposed','trialing','awaiting_approval')",
+                    params![binding.project_id.as_str(),record.revision.candidate_id,prior.as_str()],
+                ).map_err(|error| error.to_string())?;
+                if changed != 1 {
+                    return Err("candidate predecessor changed after validation".into());
+                }
+            }
+            if let Some(record) = &prepared.record {
+                register_learning_candidate_in_transaction(&tx, owner_generation, record)?;
+            }
         }
         let payload =
             payload.ok_or("validated Supervisor result has no typed learning decision")?;
@@ -4609,7 +5402,7 @@ fn verify_digest(json: &str, digest: &Digest) -> Result<(), String> {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     use rusqlite::{Connection, params};
     use sha2::{Digest as _, Sha256};
@@ -4618,8 +5411,10 @@ mod tests {
     use super::{
         CandidateRegistration, KnowledgePublicationIntent, LEARNING_BATCH_MAX_FINDINGS,
         LearningCandidateRecord, LearningFinding, ProjectSupervisorMaintenance, StoredTrial,
-        SupervisorTopicEntry, learning_finding_id, migrate_v10, resolve_topic_source,
-        trim_supervisor_snapshot,
+        SupervisorTopicEntry, applied_config_in_transaction, captured_skill_sources,
+        learning_finding_id, migrate_v10, prepare_learning_candidate,
+        register_learning_candidate_in_transaction, resolve_topic_source,
+        supervisor_learning_snapshot_in_transaction, trim_supervisor_snapshot,
     };
     use crate::config::{AppliedConfig, SourceFile, SourceKind};
     use crate::domain::ids::{
@@ -4667,6 +5462,7 @@ mod tests {
                 .collect(),
             omitted_topics: 0,
             candidates: Vec::new(),
+            candidate_targets: Vec::new(),
         };
         trim_supervisor_snapshot(&mut snapshot).unwrap();
         assert_eq!(snapshot.topics.len(), 4);
@@ -5512,11 +6308,19 @@ mod tests {
     }
 
     fn test_snapshot() -> AppliedConfig {
-        AppliedConfig {
+        let mut snapshot = AppliedConfig {
             config: serde_json::from_value(serde_json::json!({
                 "schema_version": 1,
                 "adapters": {"tickets": {"kind":"command","command":["test"]}},
-                "projects": {}
+                "repositories": {"fixture-repo": {
+                    "clone_url":"https://example.invalid/fixture/repo.git",
+                    "base_branch":"main", "forge":"github"
+                }},
+                "projects": {
+                    "sample": {"mode":"goal","ticket_adapter":"tickets","goal":{"revision":1,"statement":"Fixture goal","acceptance":["Published findings remain available"]}},
+                    "sample-b": {"mode":"goal","ticket_adapter":"tickets","goal":{"revision":1,"statement":"Independent fixture goal","acceptance":["Maintain an independent learning cadence"]}},
+                    "sample-after-learning-rejection": {"mode":"goal","ticket_adapter":"tickets","goal":{"revision":1,"statement":"Continue after a rejected result","acceptance":["Another Project can still be maintained"]}}
+                }
             }))
             .unwrap(),
             profiles: BTreeMap::new(),
@@ -5525,12 +6329,43 @@ mod tests {
                 kind: SourceKind::File,
                 path: "/tmp/rex-projects-test-config/config.toml".into(),
                 canonical_path: "/tmp/rex-projects-test-config/config.toml".into(),
-                sha256: Digest::parse("a".repeat(64)).unwrap(),
+                sha256: Digest::parse(format!("{:x}", Sha256::digest(b"x"))).unwrap(),
                 bytes: 1,
                 contents: "x".into(),
             }],
             digest: Digest::parse("a".repeat(64)).unwrap(),
+        };
+        for project in snapshot.config.projects.values_mut() {
+            project.repositories =
+                vec![crate::domain::ids::RepositoryId::parse("fixture-repo").unwrap()];
+            project.roles = Role::ALL
+                .into_iter()
+                .map(|role| (role, ProfileId::parse("fixture-profile").unwrap()))
+                .collect();
         }
+        snapshot.profiles.insert(
+            ProfileId::parse("fixture-profile").unwrap(),
+            serde_json::from_value(serde_json::json!({
+                "adapter":"codex", "command":["/bin/codex"], "model":"fixture",
+                "commit_mode":"native", "turn_timeout_seconds":60
+            }))
+            .unwrap(),
+        );
+        let contents = toml::to_string(&snapshot.config).unwrap();
+        snapshot.source_files[0].bytes = contents.len() as u64;
+        snapshot.source_files[0].sha256 =
+            Digest::parse(format!("{:x}", Sha256::digest(contents.as_bytes()))).unwrap();
+        snapshot.source_files[0].contents = contents;
+        snapshot.digest = Digest::parse(
+            crate::config::digest_manifest(
+                &snapshot.config,
+                &snapshot.profiles,
+                &snapshot.source_files,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        snapshot
     }
 
     fn running_store() -> (TempDir, ConfigStore, ProjectId, u64, TicketRunId) {
@@ -5542,8 +6377,69 @@ mod tests {
     ) -> (TempDir, ConfigStore, ProjectId, u64, TicketRunId) {
         let temp = tempfile::tempdir().unwrap();
         let mut store = ConfigStore::open_test(temp.path()).unwrap();
+        let mut snapshot = snapshot.clone();
+        for source in &mut snapshot.source_files {
+            if matches!(source.kind, SourceKind::File) {
+                source.bytes = source.contents.len() as u64;
+                source.sha256 =
+                    Digest::parse(format!("{:x}", Sha256::digest(source.contents.as_bytes())))
+                        .unwrap();
+            }
+        }
+        for (profile_id, profile) in &snapshot.profiles {
+            let profile_root = std::path::Path::new(&snapshot.source_root)
+                .join("profiles")
+                .join(profile_id.as_str());
+            let profile_root_string = profile_root.to_string_lossy().into_owned();
+            if !snapshot.source_files.iter().any(|source| {
+                matches!(source.kind, SourceKind::Directory) && source.path == profile_root_string
+            }) {
+                snapshot.source_files.push(SourceFile {
+                    kind: SourceKind::Directory,
+                    path: profile_root_string.clone(),
+                    canonical_path: profile_root_string.clone(),
+                    sha256: Digest::parse(format!(
+                        "{:x}",
+                        Sha256::digest(profile_root_string.as_bytes())
+                    ))
+                    .unwrap(),
+                    bytes: 0,
+                    contents: String::new(),
+                });
+            }
+            let contents = toml::to_string(profile).unwrap();
+            let path = profile_root
+                .join("config.toml")
+                .to_string_lossy()
+                .into_owned();
+            snapshot.source_files.push(SourceFile {
+                kind: SourceKind::File,
+                path: path.clone(),
+                canonical_path: path,
+                sha256: Digest::parse(format!("{:x}", Sha256::digest(contents.as_bytes())))
+                    .unwrap(),
+                bytes: contents.len() as u64,
+                contents,
+            });
+        }
+        snapshot.digest = Digest::parse(
+            crate::config::digest_manifest(
+                &snapshot.config,
+                &snapshot.profiles,
+                &snapshot.source_files,
+            )
+            .unwrap(),
+        )
+        .unwrap();
         let applied = store
-            .apply_snapshot("factory", snapshot, ExpectedRevision::Bootstrap)
+            .apply_snapshot("factory", &snapshot, ExpectedRevision::Bootstrap)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE projects SET desired_lifecycle='running' WHERE project_id='sample'",
+                [],
+            )
             .unwrap();
         let project_id = ProjectId::parse("sample").unwrap();
         store
@@ -5591,6 +6487,90 @@ mod tests {
             .unwrap();
         assert_eq!(version, crate::store::SCHEMA_VERSION);
         (temp, store, project_id, generation, run)
+    }
+
+    fn load_symlinked_candidate_fixture(mut snapshot: AppliedConfig) -> AppliedConfig {
+        let temp = tempfile::tempdir().unwrap();
+        let config_root = temp.path().join("config");
+        let source_profile = temp.path().join("source-profiles/candidate-worker");
+        fs::create_dir_all(config_root.join("profiles")).unwrap();
+        fs::create_dir_all(source_profile.join("aliases")).unwrap();
+        let skill_a = temp.path().join("skills-a");
+        let skill_b = temp.path().join("skills-b");
+        let skill_file = temp.path().join("skill-file-target.md");
+        let skill_file_alias = temp.path().join("skill-file-alias.md");
+        fs::create_dir_all(&skill_a).unwrap();
+        fs::create_dir_all(&skill_b).unwrap();
+        fs::write(skill_a.join("README.md"), "shared skill guidance").unwrap();
+        fs::write(skill_b.join("README.md"), "shared skill guidance").unwrap();
+        fs::write(&skill_file, "captured absolute skill file").unwrap();
+        symlink(&skill_file, &skill_file_alias).unwrap();
+        fs::write(
+            source_profile.join("instruction-target.md"),
+            "captured instruction alias",
+        )
+        .unwrap();
+        fs::write(
+            source_profile.join("guidance-target.md"),
+            "captured base guidance",
+        )
+        .unwrap();
+        symlink(
+            source_profile.join("instruction-target.md"),
+            source_profile.join("aliases/instruction.md"),
+        )
+        .unwrap();
+        symlink(
+            source_profile.join("guidance-target.md"),
+            source_profile.join("aliases/guidance.md"),
+        )
+        .unwrap();
+
+        let candidate_id = ProfileId::parse("candidate-worker").unwrap();
+        let candidate_profile = snapshot.profiles.get_mut(&candidate_id).unwrap();
+        candidate_profile.instruction_files = vec!["aliases/instruction.md".into()];
+        candidate_profile.skill_paths = vec![
+            skill_a.to_string_lossy().into_owned(),
+            skill_b.to_string_lossy().into_owned(),
+            skill_file_alias.to_string_lossy().into_owned(),
+        ];
+        candidate_profile.learned_guidance = Some(crate::config::LearnedGuidance {
+            file: "aliases/guidance.md".into(),
+            project_id: ProjectId::parse("sample").unwrap(),
+            role: Role::Worker,
+            repository_ids: [crate::domain::ids::RepositoryId::parse("fixture-repo").unwrap()]
+                .into_iter()
+                .collect(),
+        });
+        fs::write(
+            source_profile.join("config.toml"),
+            toml::to_string(candidate_profile).unwrap(),
+        )
+        .unwrap();
+
+        for (profile_id, profile) in &snapshot.profiles {
+            if profile_id.as_str() == "candidate-worker" {
+                continue;
+            }
+            let profile_root = config_root.join("profiles").join(profile_id.as_str());
+            fs::create_dir_all(&profile_root).unwrap();
+            fs::write(
+                profile_root.join("config.toml"),
+                toml::to_string(profile).unwrap(),
+            )
+            .unwrap();
+        }
+        symlink(
+            &source_profile,
+            config_root.join("profiles/candidate-worker"),
+        )
+        .unwrap();
+        fs::write(
+            config_root.join("config.toml"),
+            toml::to_string(&snapshot.config).unwrap(),
+        )
+        .unwrap();
+        crate::config::load(&config_root.join("config.toml")).unwrap()
     }
 
     #[test]
@@ -5892,6 +6872,9 @@ mod tests {
                 state_revision: Revision(0),
             })
             .unwrap();
+        store
+            .set_project_lifecycle(generation, &second_project, "running")
+            .unwrap();
         store.connection.execute(
             "UPDATE project_runtimes SET observed_lifecycle='running',controller_generation=?2 WHERE project_id=?1",
             rusqlite::params![second_project.as_str(),generation],
@@ -6086,7 +7069,15 @@ mod tests {
             )
             .unwrap(),
         );
-        revised.digest = Digest::parse("b".repeat(64)).unwrap();
+        revised.digest = Digest::parse(
+            crate::config::digest_manifest(
+                &revised.config,
+                &revised.profiles,
+                &revised.source_files,
+            )
+            .unwrap(),
+        )
+        .unwrap();
         let applied = store
             .apply_snapshot("factory", &revised, ExpectedRevision::Current(Revision(1)))
             .unwrap();
@@ -6257,6 +7248,13 @@ mod tests {
         checkpoint: BTreeMap<String, String>,
     }
 
+    enum CandidateFixture {
+        Omitted,
+        Proposed,
+        StalePrior,
+        OversizedContext,
+    }
+
     fn learning_dispatch_fixture(
         assertion: crate::engine::orchestration::AgentAssertion,
         unsupported_proposal: bool,
@@ -6281,6 +7279,29 @@ mod tests {
         create_topic: bool,
         topic_source_override: Option<Digest>,
     ) -> LearningDispatchFixture {
+        learning_dispatch_fixture_with_options(
+            assertion,
+            unsupported_proposal,
+            maximum_finding,
+            claim_override,
+            create_topic,
+            topic_source_override,
+            CandidateFixture::Omitted,
+        )
+    }
+
+    fn learning_dispatch_fixture_with_options(
+        assertion: crate::engine::orchestration::AgentAssertion,
+        unsupported_proposal: bool,
+        maximum_finding: bool,
+        claim_override: Option<(bool, bool)>,
+        create_topic: bool,
+        topic_source_override: Option<Digest>,
+        candidate: CandidateFixture,
+    ) -> LearningDispatchFixture {
+        let include_candidate = !matches!(candidate, CandidateFixture::Omitted);
+        let stale_candidate_prior = matches!(candidate, CandidateFixture::StalePrior);
+        let large_candidate_target = matches!(candidate, CandidateFixture::OversizedContext);
         let mut config = test_snapshot();
         let profile_id = ProfileId::parse("fixture-profile").unwrap();
         config.config.projects.insert(
@@ -6288,7 +7309,9 @@ mod tests {
             serde_json::from_value(serde_json::json!({
                 "mode": "goal",
                 "ticket_adapter": "tickets",
-                "roles": {"supervisor": "fixture-profile"}
+                "goal":{"revision":1,"statement":"Fixture objective","acceptance":["Candidate dispatch is accepted."]},
+                "roles": if include_candidate { serde_json::json!({"supervisor": if large_candidate_target {"large-supervisor"} else {"fixture-profile"},"coordinator":"fixture-profile","planner":"fixture-profile","worker":"candidate-worker","reviewer":"fixture-profile","merge_decision":"fixture-profile","operator":"fixture-profile","postmortem":"fixture-profile"}) } else { serde_json::json!({"supervisor":"fixture-profile"}) },
+                "repositories": if include_candidate { vec!["fixture-repo".to_string()] } else { Vec::<String>::new() }
             }))
             .unwrap(),
         );
@@ -6303,6 +7326,36 @@ mod tests {
             }))
             .unwrap(),
         );
+        if large_candidate_target {
+            config.profiles.insert(
+                ProfileId::parse("large-supervisor").unwrap(),
+                serde_json::from_value(serde_json::json!({
+                    "adapter":"codex","command":["/bin/codex"],"model":"fixture",
+                    "description":"x".repeat(248_000),"commit_mode":"native","turn_timeout_seconds":60
+                })).unwrap(),
+            );
+        }
+        if include_candidate {
+            config.profiles.insert(
+                ProfileId::parse("candidate-worker").unwrap(),
+                serde_json::from_value(serde_json::json!({
+                    "adapter":"codex","command":["/bin/codex"],"model":"worker-model",
+                    "description":"Worker profile",
+                    "instruction_files":[],"skill_paths":["/fixture/skills-a","/fixture/skills-b"],
+                    "commit_mode":"native","turn_timeout_seconds":73
+                }))
+                .unwrap(),
+            );
+            config.config.repositories.insert(
+                crate::domain::ids::RepositoryId::parse("fixture-repo").unwrap(),
+                serde_json::from_value(serde_json::json!({
+                    "clone_url":"https://example.invalid/fixture/repo.git",
+                    "base_branch":"main","forge":"github"
+                }))
+                .unwrap(),
+            );
+            config = load_symlinked_candidate_fixture(config);
+        }
         let (temp, mut store, project, generation, run) = running_store_with_snapshot(&config);
         if create_topic {
             config.config.knowledge = Some(crate::config::KnowledgeConfig {
@@ -6376,6 +7429,56 @@ mod tests {
         KnowledgeEffectHandler::new(knowledge_root.clone())
             .execute(&mut store, generation, &effect)
             .unwrap();
+        if include_candidate {
+            let second_run = TicketRunId::parse("sample-2-g1").unwrap();
+            store
+                .create_ticket_run(
+                    generation,
+                    &project,
+                    &TicketNamespace::parse("github:org/repo").unwrap(),
+                    &TicketId::parse("2").unwrap(),
+                    &second_run,
+                    1,
+                    "postmortem",
+                    "In Progress",
+                )
+                .unwrap();
+            let second_input = PostmortemInput {
+                operation_id: OperationId::parse("learning-flow-publication-second").unwrap(),
+                project_id: project.clone(),
+                ticket_run_id: second_run.clone(),
+                title: "Second learning fixture".into(),
+                summary: summary.into(),
+                findings: vec![
+                    "A distinct TicketRun contributes independent published evidence.".into(),
+                ],
+                sources: vec![],
+                generated_at: "2026-11-07T00:01:00Z".into(),
+                max_source_bytes: 1024,
+            };
+            let request_json = serde_json::to_string(&second_input).unwrap();
+            let second_intent = KnowledgePublicationIntent {
+                operation_id: second_input.operation_id.clone(),
+                project_id: project.clone(),
+                ticket_run_id: second_run,
+                request_digest: Digest::parse(format!(
+                    "{:x}",
+                    Sha256::digest(request_json.as_bytes())
+                ))
+                .unwrap(),
+                request_json,
+            };
+            store
+                .prepare_knowledge_publication(generation, &second_intent)
+                .unwrap();
+            let second_effect = store
+                .next_due_effect(generation, i64::MAX)
+                .unwrap()
+                .unwrap();
+            KnowledgeEffectHandler::new(knowledge_root.clone())
+                .execute(&mut store, generation, &second_effect)
+                .unwrap();
+        }
         assert_eq!(
             store
                 .queue_due_supervisor_learning(
@@ -6402,9 +7505,21 @@ mod tests {
             .unwrap()
             .payload_json
             .clone();
+        if include_candidate {
+            let worker_target = batch_payload["maintenance"]["candidate_targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|target| target["profile_id"] == "candidate-worker")
+                .unwrap();
+            assert_eq!(worker_target["learned_guidance"], "captured base guidance");
+        }
         let batch_id = batch_payload["batch_id"].as_str().unwrap().to_owned();
         let batch_digest = Digest::parse(batch_payload["batch_digest"].as_str().unwrap()).unwrap();
-        assert_eq!(batch_payload["findings"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            batch_payload["findings"].as_array().unwrap().len(),
+            if include_candidate { 2 } else { 1 }
+        );
         let wake_inputs: Vec<crate::agent_api::AgentWakeItem> = pending
             .into_iter()
             .map(|wake| crate::agent_api::AgentWakeItem {
@@ -6474,6 +7589,40 @@ mod tests {
         } else {
             Vec::new()
         };
+        let candidate_change = if include_candidate {
+            let base_profile_id = ProfileId::parse("candidate-worker").unwrap();
+            Some(crate::learning::ProfileCandidateProposal {
+                role: crate::domain::types::Role::Worker,
+                base_profile_id: base_profile_id.clone(),
+                base_profile_digest: crate::store::agent_profile_digest(
+                    config.profiles.get(&base_profile_id).unwrap(),
+                )
+                .unwrap(),
+                topic_key: "reliable-test-commands".into(),
+                repository_ids: vec![
+                    crate::domain::ids::RepositoryId::parse("fixture-repo").unwrap(),
+                ],
+                source_finding_ids: batch_payload["findings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|finding| Digest::parse(finding["id"].as_str().unwrap()).unwrap())
+                    .collect(),
+                expected_prior_digest: stale_candidate_prior
+                    .then(|| Digest::parse("f".repeat(64)).unwrap()),
+                description: "Run focused acceptance checks first".into(),
+                learned_guidance: if large_candidate_target {
+                    "g".repeat(16_000)
+                } else {
+                    "Run the smallest relevant test before the full suite.".into()
+                },
+                evaluation_criterion:
+                    "Paired runs reduce avoidable full-suite retries without adding regressions."
+                        .into(),
+            })
+        } else {
+            None
+        };
         let decision_payload = crate::engine::orchestration::LearningDecisionPayload {
             batch_id: claimed_batch_id,
             batch_digest: claimed_batch_digest,
@@ -6482,7 +7631,7 @@ mod tests {
             topic_changes,
             checkpoint: checkpoint.clone(),
             improvements: Vec::new(),
-            candidate_change: None,
+            candidate_change,
         };
         let message = crate::roles::RoleResultMessage {
             schema_version: 1,
@@ -6493,7 +7642,7 @@ mod tests {
             result_digest: None,
             artifact_refs: Vec::new(),
         };
-        let message = if create_topic {
+        let message = if create_topic || include_candidate {
             let schema = crate::roles::result_schema(crate::domain::types::Role::Supervisor);
             let encoded_message = serde_json::to_string(&message).unwrap();
             let final_response = [
@@ -6511,7 +7660,7 @@ mod tests {
         } else {
             message
         };
-        if create_topic {
+        if create_topic || include_candidate {
             let inbox_root = temp.path().join("topic-inbox");
             fs::create_dir(&inbox_root).unwrap();
             let mut snapshot = crate::agent_api::AgentWakeSnapshot {
@@ -6553,6 +7702,620 @@ mod tests {
             config: config.config,
             config_digest,
             checkpoint,
+        }
+    }
+
+    #[test]
+    fn supervisor_candidate_dispatch_persists_and_reissues_verified_learning_input() {
+        let fixture = learning_dispatch_fixture_with_options(
+            crate::engine::orchestration::AgentAssertion::Succeeded,
+            false,
+            false,
+            None,
+            false,
+            None,
+            CandidateFixture::Proposed,
+        );
+        let LearningDispatchFixture {
+            _temp,
+            mut store,
+            project,
+            generation,
+            batch_id,
+            result,
+            config,
+            config_digest,
+            ..
+        } = fixture;
+        let config_revision = store.project(&project).unwrap().unwrap().config_revision;
+        let tx = store.connection.transaction().unwrap();
+        let applied_config =
+            applied_config_in_transaction(&tx, &project, config_revision.0, config_digest.as_str())
+                .unwrap();
+        tx.rollback().unwrap();
+        let base_profile = &applied_config.profiles[&ProfileId::parse("candidate-worker").unwrap()];
+        let profile_root =
+            std::path::Path::new(&applied_config.source_root).join("profiles/candidate-worker");
+        let canonical_profile_root = applied_config
+            .source_files
+            .iter()
+            .find(|source| {
+                matches!(source.kind, crate::config::SourceKind::Directory)
+                    && std::path::Path::new(&source.path) == profile_root
+            })
+            .map(|source| std::path::PathBuf::from(&source.canonical_path))
+            .unwrap();
+        let (skill_roots, skill_files) =
+            captured_skill_sources(&applied_config, base_profile, &canonical_profile_root).unwrap();
+        assert_eq!(skill_roots.len(), 2);
+        assert_eq!(skill_files.len(), 1);
+        let mut old_captured_manifest = applied_config.clone();
+        old_captured_manifest.source_files.retain(|source| {
+            !matches!(source.kind, crate::config::SourceKind::Directory)
+                || !base_profile
+                    .skill_paths
+                    .iter()
+                    .any(|skill| std::path::Path::new(skill) == std::path::Path::new(&source.path))
+        });
+        assert!(
+            captured_skill_sources(
+                &old_captured_manifest,
+                base_profile,
+                &canonical_profile_root
+            )
+            .is_err()
+        );
+        let mut other_slot = match &result.validated.typed_payload {
+            crate::engine::orchestration::RoleResultPayload::LearningDecision(payload) => {
+                payload.clone()
+            }
+            other => panic!("expected parsed learning decision, got {other:?}"),
+        };
+        other_slot.candidate_change.as_mut().unwrap().topic_key = "reliable-incident-checks".into();
+        let (snapshot_json, findings_json): (String, String) = store
+            .connection
+            .query_row(
+                "SELECT snapshot_json,findings_json FROM learning_batches WHERE batch_id=?1",
+                [&batch_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let issued_snapshot: serde_json::Value = serde_json::from_str(&snapshot_json).unwrap();
+        let findings: Vec<LearningFinding> = serde_json::from_str(&findings_json).unwrap();
+        let tx = store.connection.transaction().unwrap();
+        let other_record = prepare_learning_candidate(
+            &tx,
+            &project,
+            &other_slot,
+            &issued_snapshot,
+            &findings,
+            1_800_000_000,
+        )
+        .unwrap()
+        .record
+        .unwrap();
+        let other_candidate_id = other_record.revision.candidate_id.clone();
+        let other_candidate_digest = other_record.revision.digest.clone();
+        register_learning_candidate_in_transaction(&tx, generation, &other_record).unwrap();
+        tx.commit().unwrap();
+        crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+            &mut store,
+            generation,
+            101,
+            &config,
+            config_digest,
+            &result,
+        )
+        .unwrap();
+        let rejection: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT last_error FROM project_runtimes WHERE project_id=?1",
+                [project.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            rejection.is_none(),
+            "candidate dispatch rejected: {rejection:?}"
+        );
+        assert_eq!(
+            store.connection.query_row::<String, _, _>(
+                "SELECT status FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",
+                rusqlite::params![project.as_str(), other_candidate_id, other_candidate_digest.as_str()],
+                |row| row.get(0),
+            ).unwrap(),
+            "proposed",
+            "accepting another same-role Topic slot must preserve the existing candidate"
+        );
+        let (candidate_id, profile_id) = crate::learning::candidate_slot_id(
+            &project,
+            crate::domain::types::Role::Worker,
+            &ProfileId::parse("candidate-worker").unwrap(),
+            &crate::topic::TopicKey::parse("reliable-test-commands").unwrap(),
+        );
+        let (candidate_digest, profile_id_raw): (String,String) = store.connection.query_row(
+            "SELECT digest,profile_id FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND status='proposed'",
+            rusqlite::params![project.as_str(),candidate_id],
+            |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(ProfileId::parse(profile_id_raw).unwrap(), profile_id);
+        let payload = match &result.validated.typed_payload {
+            crate::engine::orchestration::RoleResultPayload::LearningDecision(payload) => {
+                payload.clone()
+            }
+            other => panic!("expected parsed learning decision, got {other:?}"),
+        };
+        let (snapshot_json, findings_json): (String, String) = store
+            .connection
+            .query_row(
+                "SELECT snapshot_json,findings_json FROM learning_batches WHERE batch_id=?1",
+                [&batch_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let issued_snapshot: serde_json::Value = serde_json::from_str(&snapshot_json).unwrap();
+        let findings: Vec<LearningFinding> = serde_json::from_str(&findings_json).unwrap();
+        let mut no_op = payload.clone();
+        no_op
+            .candidate_change
+            .as_mut()
+            .unwrap()
+            .expected_prior_digest = Some(Digest::parse(candidate_digest.clone()).unwrap());
+        let tx = store.connection.transaction().unwrap();
+        let prepared = prepare_learning_candidate(
+            &tx,
+            &project,
+            &no_op,
+            &issued_snapshot,
+            &findings,
+            1_800_000_000,
+        )
+        .unwrap();
+        assert!(
+            prepared.record.is_none(),
+            "a semantic no-op must reuse the current revision"
+        );
+        tx.rollback().unwrap();
+
+        let expires_at: String = store.connection.query_row(
+            "SELECT json_extract(revision_json,'$.expires_at') FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",
+            rusqlite::params![project.as_str(), candidate_id, candidate_digest],
+            |row| row.get(0),
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO profile_trial_authorizations(authorization_id,project_id,candidate_id,candidate_digest,human_request_id,request_json,rex_view_id,artifact_path,authorization_digest,authorization_json,lifecycle,created_at_unix,updated_at_unix) VALUES ('pending-pin',?1,?2,?3,'pending-pin-request','{}',?4,'/tmp/pin',?5,'{}','pending',1,1)",
+            rusqlite::params![project.as_str(),candidate_id,candidate_digest,"a".repeat(64),"b".repeat(64)],
+        ).unwrap();
+        let mut replacement = payload;
+        replacement
+            .candidate_change
+            .as_mut()
+            .unwrap()
+            .expected_prior_digest = Some(Digest::parse(candidate_digest.clone()).unwrap());
+        replacement
+            .candidate_change
+            .as_mut()
+            .unwrap()
+            .description
+            .push_str(" revised");
+        let tx = store.connection.transaction().unwrap();
+        assert!(
+            prepare_learning_candidate(
+                &tx,
+                &project,
+                &replacement,
+                &issued_snapshot,
+                &findings,
+                1_800_000_000,
+            )
+            .err()
+            .unwrap()
+            .contains("pinned")
+        );
+        let maintenance =
+            supervisor_learning_snapshot_in_transaction(&tx, &project, &expires_at, 50, None)
+                .unwrap();
+        assert!(maintenance.candidates.iter().any(|candidate| {
+            candidate.revision.candidate_id == candidate_id
+                && candidate.revision.digest.as_str() == candidate_digest
+                && candidate.revision.status == CandidateStatus::Proposed
+        }));
+        tx.rollback().unwrap();
+        let package = store
+            .learning_candidate_package(
+                &project,
+                &candidate_id,
+                &Digest::parse(candidate_digest.clone()).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        let metadata: crate::learning::ProfileCandidateMetadata = crate::protocol::parse_unique(
+            package
+                .files
+                .get(crate::learning::PROFILE_CANDIDATE_METADATA_PATH)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata.source_ticket_run_ids.len(), 2);
+        assert_eq!(
+            metadata.base_guidance.as_deref(),
+            Some("captured base guidance")
+        );
+        assert_eq!(
+            package.files.get("aliases/instruction.md").unwrap(),
+            b"captured instruction alias"
+        );
+        assert_eq!(metadata.external_sources.len(), 3);
+        assert_eq!(
+            metadata
+                .external_sources
+                .values()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            2
+        );
+        assert!(metadata.external_sources.values().any(|path| {
+            package
+                .files
+                .get(path)
+                .is_some_and(|bytes| bytes.as_slice() == b"captured absolute skill file")
+        }));
+        assert!(metadata.external_sources.values().any(|path| {
+            package
+                .files
+                .get(path)
+                .is_some_and(|bytes| bytes.as_slice() == b"shared skill guidance")
+        }));
+        let base_profile: crate::config::Profile =
+            crate::protocol::parse_unique(metadata.base_profile_json.as_bytes()).unwrap();
+        assert_eq!(base_profile.model.as_deref(), Some("worker-model"));
+        let candidate_profile: crate::config::Profile =
+            toml::from_str(std::str::from_utf8(package.files.get("config.toml").unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(
+            candidate_profile.description.as_deref(),
+            Some("Run focused acceptance checks first")
+        );
+        assert_eq!(candidate_profile.command, vec!["/bin/codex"]);
+        assert_eq!(candidate_profile.model.as_deref(), Some("worker-model"));
+        assert_eq!(candidate_profile.turn_timeout_seconds, 73);
+        assert_eq!(
+            candidate_profile.commit_mode,
+            crate::domain::types::CommitMode::Native
+        );
+        assert_eq!(
+            candidate_profile.learned_guidance.as_ref().unwrap().role,
+            crate::domain::types::Role::Worker
+        );
+        assert_eq!(
+            package.manifest_digest,
+            crate::learning::manifest_digest(&package.files).unwrap()
+        );
+        assert_ne!(package.manifest_digest, package.revision.digest);
+        assert_eq!(
+            store
+                .connection
+                .query_row::<String, _, _>(
+                    "SELECT status FROM learning_batches WHERE batch_id=?1",
+                    [batch_id],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            "completed"
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<String, _, _>(
+                    "SELECT disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                    [result.receipt.evidence_id()],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            "applied"
+        );
+        drop(store);
+        let mut reopened = ConfigStore::open_test(_temp.path()).unwrap();
+        assert_eq!(
+            reopened
+                .queue_due_supervisor_learning(
+                    generation,
+                    std::slice::from_ref(&project),
+                    10_000,
+                    3_600,
+                    None,
+                )
+                .unwrap(),
+            Some(project.clone())
+        );
+        let session = format!("project:{}:supervisor", project.as_str());
+        let next_batch = reopened
+            .pending_role_wake_inputs(&project, &session, 16)
+            .unwrap()
+            .into_iter()
+            .find(|wake| wake.source_type == "learning_batch")
+            .unwrap();
+        let card = next_batch.payload_json["maintenance"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["revision"]["digest"] == candidate_digest)
+            .unwrap();
+        assert_eq!(card["profile_id"], profile_id.as_str());
+        assert_eq!(
+            card["metadata"]["learned_guidance"],
+            "Run the smallest relevant test before the full suite."
+        );
+        assert_eq!(
+            card["metadata"]["source_ticket_run_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(card["metadata"]["base_profile_json"].is_null());
+        assert!(card["metadata"]["base_config_toml"].is_null());
+        assert!(card["metadata"]["external_sources"].is_null());
+        let inbox_root = _temp.path().join("next-batch-control");
+        fs::create_dir(&inbox_root).unwrap();
+        let next_snapshot = crate::agent_api::AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: project.clone(),
+            role_session_id: session,
+            agent_run_id: "candidate-next-batch".into(),
+            digest: Digest::parse("0".repeat(64)).unwrap(),
+            inputs: vec![crate::agent_api::AgentWakeItem {
+                wake_input_id: next_batch.wake_input_id,
+                source_type: next_batch.source_type,
+                source_id: next_batch.source_id,
+                source_revision: next_batch.source_revision,
+                priority: next_batch.priority,
+                payload_json: next_batch.payload_json,
+                host_artifact_source_evidence_ids: Vec::new(),
+                host_artifacts: Vec::new(),
+                host_completion_context: None,
+            }],
+            worker_correction_context: None,
+        };
+        crate::agent_api::publish_wake_snapshot(&inbox_root, next_snapshot.clone()).unwrap();
+        let issued_input =
+            crate::agent_api::read_inbox(&inbox_root, "candidate-next-batch", 0).unwrap();
+        assert_eq!(issued_input, next_snapshot.inputs);
+        let issued_cards = issued_input[0].payload_json["maintenance"]["candidates"]
+            .as_array()
+            .unwrap();
+        let issued_card = issued_cards
+            .iter()
+            .find(|candidate| candidate["revision"]["digest"] == candidate_digest)
+            .unwrap();
+        assert_eq!(issued_card["profile_id"], profile_id.as_str());
+        assert!(issued_cards.iter().any(|candidate| {
+            candidate["revision"]["candidate_id"] == other_candidate_id
+                && candidate["revision"]["digest"] == other_candidate_digest.as_str()
+        }));
+    }
+
+    #[test]
+    fn invalid_supervisor_candidate_is_rejected_without_partial_learning_writes() {
+        let fixture = learning_dispatch_fixture_with_options(
+            crate::engine::orchestration::AgentAssertion::Succeeded,
+            false,
+            false,
+            None,
+            false,
+            None,
+            CandidateFixture::StalePrior,
+        );
+        let LearningDispatchFixture {
+            mut store,
+            project,
+            generation,
+            batch_id,
+            result,
+            config,
+            config_digest,
+            ..
+        } = fixture;
+        crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+            &mut store,
+            generation,
+            101,
+            &config,
+            config_digest,
+            &result,
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM learning_candidates WHERE project_id=?1",
+                    [project.as_str()],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM learning_decisions WHERE batch_id=?1",
+                    [&batch_id],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<String, _, _>(
+                    "SELECT disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                    [result.receipt.evidence_id()],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            "rejected_by_host"
+        );
+        assert!(
+            store
+                .connection
+                .query_row::<Option<String>, _, _>(
+                    "SELECT last_error FROM project_runtimes WHERE project_id=?1",
+                    [project.as_str()],
+                    |row| row.get(0)
+                )
+                .unwrap()
+                .unwrap()
+                .contains("candidate predecessor digest is stale")
+        );
+    }
+
+    #[test]
+    fn candidate_that_would_overflow_next_learning_input_is_rejected_before_consumption() {
+        let fixture = learning_dispatch_fixture_with_options(
+            crate::engine::orchestration::AgentAssertion::Succeeded,
+            false,
+            false,
+            None,
+            false,
+            None,
+            CandidateFixture::OversizedContext,
+        );
+        let LearningDispatchFixture {
+            mut store,
+            project,
+            generation,
+            batch_id,
+            result,
+            config,
+            config_digest,
+            ..
+        } = fixture;
+        crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+            &mut store,
+            generation,
+            101,
+            &config,
+            config_digest,
+            &result,
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM learning_candidates WHERE project_id=?1",
+                    [project.as_str()],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM learning_decisions WHERE batch_id=?1",
+                    [&batch_id],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.connection.query_row::<i64,_,_>(
+            "SELECT count(*) FROM learning_findings WHERE project_id=?1 AND consumed_batch_id=?2",
+            rusqlite::params![project.as_str(), batch_id], |row| row.get(0)
+        ).unwrap(), 0);
+        let rejection: String = store
+            .connection
+            .query_row(
+                "SELECT last_error FROM project_runtimes WHERE project_id=?1",
+                [project.as_str()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            rejection.contains("next Supervisor learning input unissuable"),
+            "{rejection}"
+        );
+    }
+
+    #[test]
+    fn candidate_registration_rolls_back_when_result_ack_fails() {
+        let fixture = learning_dispatch_fixture_with_options(
+            crate::engine::orchestration::AgentAssertion::Succeeded,
+            false,
+            false,
+            None,
+            false,
+            None,
+            CandidateFixture::Proposed,
+        );
+        let LearningDispatchFixture {
+            mut store,
+            project,
+            generation,
+            batch_id,
+            result,
+            config,
+            config_digest,
+            ..
+        } = fixture;
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_candidate_ack BEFORE INSERT ON agent_result_reducer_ack
+             BEGIN SELECT RAISE(ABORT, 'fixture rejects result ACK'); END;",
+            )
+            .unwrap();
+        assert!(
+            crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+                &mut store,
+                generation,
+                101,
+                &config,
+                config_digest,
+                &result
+            )
+            .is_err()
+        );
+        for (table, query) in [
+            (
+                "candidate",
+                "SELECT count(*) FROM learning_candidates WHERE project_id=?1",
+            ),
+            (
+                "decision",
+                "SELECT count(*) FROM learning_decisions WHERE batch_id=?1",
+            ),
+            (
+                "finding consumption",
+                "SELECT count(*) FROM learning_findings WHERE project_id=?1 AND consumed_batch_id IS NOT NULL",
+            ),
+            (
+                "ACK",
+                "SELECT count(*) FROM agent_result_reducer_ack WHERE evidence_id=?1",
+            ),
+        ] {
+            let key = if table == "decision" {
+                batch_id.as_str()
+            } else if table == "ACK" {
+                result.receipt.evidence_id()
+            } else {
+                project.as_str()
+            };
+            assert_eq!(
+                store
+                    .connection
+                    .query_row::<i64, _, _>(query, [key], |row| row.get(0))
+                    .unwrap(),
+                0,
+                "{table} write must roll back"
+            );
         }
     }
 
@@ -8852,6 +10615,9 @@ mod tests {
                 desired_lifecycle: "running".into(),
                 state_revision: Revision(0),
             })
+            .unwrap();
+        store
+            .set_project_lifecycle(generation, &second_project, "running")
             .unwrap();
         store.connection.execute(
             "UPDATE project_runtimes SET observed_lifecycle='running',controller_generation=?2 WHERE project_id=?1",

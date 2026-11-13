@@ -85,6 +85,83 @@
         }
       ]
     },
+    "ProfileCandidateProposal": {
+      "additionalProperties": false,
+      "description": "Semantic learning request. The host supplies every execution setting and package byte.",
+      "properties": {
+        "base_profile_digest": {
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[a-f0-9]{64}$",
+          "type": "string"
+        },
+        "base_profile_id": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "evaluation_criterion": {
+          "type": "string"
+        },
+        "expected_prior_digest": {
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[a-f0-9]{64}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "learned_guidance": {
+          "type": "string"
+        },
+        "repository_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "role": {
+          "$ref": "#/$defs/Role"
+        },
+        "source_finding_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "topic_key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "role",
+        "base_profile_id",
+        "base_profile_digest",
+        "topic_key",
+        "repository_ids",
+        "source_finding_ids",
+        "expected_prior_digest",
+        "description",
+        "learned_guidance",
+        "evaluation_criterion"
+      ],
+      "type": "object"
+    },
+    "Role": {
+      "enum": [
+        "supervisor",
+        "coordinator",
+        "planner",
+        "worker",
+        "reviewer",
+        "merge_decision",
+        "operator",
+        "postmortem"
+      ],
+      "type": "string"
+    },
     "RoleArtifactKind": {
       "enum": [
         "learning",
@@ -634,12 +711,13 @@
                   "type": "string"
                 },
                 "candidate_change": {
-                  "additionalProperties": {
-                    "type": "string"
-                  },
-                  "type": [
-                    "object",
-                    "null"
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/ProfileCandidateProposal"
+                    },
+                    {
+                      "type": "null"
+                    }
                   ]
                 },
                 "checkpoint": {

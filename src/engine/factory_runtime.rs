@@ -5445,10 +5445,21 @@ pub(crate) mod tests {
         }
 
         let revision = "rev-43-stable";
+        let mut config: Config =
+            toml::from_str(include_str!("../../examples/fixture/config.toml")).unwrap();
+        let mut project = config
+            .projects
+            .remove(&ProjectId::parse("operations_project").unwrap())
+            .unwrap();
+        project.dispatch_states = vec![TicketStatus::Ready];
+        config
+            .projects
+            .insert(ProjectId::parse("fixture-project").unwrap(), project);
         let mut fixture =
-            crate::store::agent_results::host_validation_fixture::host_validated_result(
+            crate::store::agent_results::host_validation_fixture::host_validated_result_with_config(
                 Role::Supervisor,
                 dispatch_message("supervisor-dispatch-generation-one", revision),
+                config.clone(),
             )
             .unwrap();
         let project_id = ProjectId::parse("fixture-project").unwrap();
@@ -5458,14 +5469,6 @@ pub(crate) mod tests {
             .set_project_lifecycle(fixture.owner_generation, &project_id, "running")
             .unwrap();
 
-        let mut config: Config =
-            toml::from_str(include_str!("../../examples/fixture/config.toml")).unwrap();
-        let mut project = config
-            .projects
-            .remove(&ProjectId::parse("operations_project").unwrap())
-            .unwrap();
-        project.dispatch_states = vec![TicketStatus::Ready];
-        config.projects.insert(project_id.clone(), project);
         let project = config.projects.get(&project_id).unwrap();
         let key = TicketScanKey::for_project(
             &project_id,
@@ -5543,7 +5546,13 @@ pub(crate) mod tests {
             )
             .unwrap();
         let mut result_services = WorkerPublicationFixtureServices {
-            configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
+            configuration_digest: fixture
+                .store
+                .load_snapshot("fixture")
+                .unwrap()
+                .unwrap()
+                .config
+                .digest,
             topic_publication_root: None,
             published_effect: None,
             pending_artifacts: None,
@@ -6175,8 +6184,18 @@ pub(crate) mod tests {
             sha2::Sha256::digest(serde_json::to_vec(&payload).unwrap())
         ))
         .unwrap();
+        let mut config: Config =
+            toml::from_str(include_str!("../../examples/fixture/config.toml")).unwrap();
+        let mut project = config
+            .projects
+            .remove(&ProjectId::parse("goal_project").unwrap())
+            .unwrap();
+        project.dispatch_states = vec![TicketStatus::Ready];
+        config
+            .projects
+            .insert(ProjectId::parse("fixture-project").unwrap(), project);
         let mut fixture =
-            crate::store::agent_results::host_validation_fixture::host_validated_result(
+            crate::store::agent_results::host_validation_fixture::host_validated_result_with_config(
                 Role::Supervisor,
                 RoleResultMessage {
                     schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
@@ -6187,6 +6206,7 @@ pub(crate) mod tests {
                     result_digest: Some(result_digest),
                     artifact_refs: Vec::new(),
                 },
+                config.clone(),
             )
             .unwrap();
         let project_id = ProjectId::parse("fixture-project").unwrap();
@@ -6194,14 +6214,6 @@ pub(crate) mod tests {
             .store
             .set_project_lifecycle(fixture.owner_generation, &project_id, "running")
             .unwrap();
-        let mut config: Config =
-            toml::from_str(include_str!("../../examples/fixture/config.toml")).unwrap();
-        let mut project = config
-            .projects
-            .remove(&ProjectId::parse("goal_project").unwrap())
-            .unwrap();
-        project.dispatch_states = vec![TicketStatus::Ready];
-        config.projects.insert(project_id.clone(), project);
         let project = config.projects.get(&project_id).unwrap();
         let namespace = TicketNamespace::parse("github:civitaspo/rex-projects").unwrap();
         let key = TicketScanKey::for_project(
@@ -6273,7 +6285,13 @@ pub(crate) mod tests {
         assert_eq!(slot_disposition, "unknown");
         let artifacts = fixture.artifacts.clone();
         let mut services = WorkerPublicationFixtureServices {
-            configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
+            configuration_digest: fixture
+                .store
+                .load_snapshot("fixture")
+                .unwrap()
+                .unwrap()
+                .config
+                .digest,
             topic_publication_root: None,
             published_effect: None,
             pending_artifacts: Some(fixture.artifacts),
@@ -7549,7 +7567,6 @@ pub(crate) mod tests {
                 },
             )
             .unwrap();
-        let current_digest = Digest::parse("b".repeat(64)).unwrap();
         let mut snapshot = fixture
             .store
             .load_snapshot("fixture")
@@ -7645,6 +7662,11 @@ esac
             bytes: 0,
             contents: String::new(),
         });
+        let current_digest = Digest::parse(
+            crate::config::digest_manifest(&config, &snapshot.profiles, &snapshot.source_files)
+                .unwrap(),
+        )
+        .unwrap();
         snapshot.digest = current_digest.clone();
         let applied = fixture
             .store

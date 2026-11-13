@@ -1384,7 +1384,7 @@ fn collect_skill_files(
     let metadata = fs::metadata(&canonical).map_err(|e| format!("{}: {e}", canonical.display()))?;
     if metadata.is_file() {
         read_source(
-            &canonical,
+            path,
             if path.is_absolute() {
                 &canonical
             } else {
@@ -1400,6 +1400,7 @@ fn collect_skill_files(
             canonical.display()
         ));
     }
+    record_directory_identity(path, &canonical, files)?;
     let mut entries = fs::read_dir(&canonical)
         .map_err(|e| format!("{}: {e}", canonical.display()))?
         .collect::<Result<Vec<_>, _>>()
@@ -1536,7 +1537,7 @@ fn reread_sources(sources: &[SourceFile]) -> Result<Vec<SourceFile>, String> {
         .collect()
 }
 
-fn digest_manifest(
+pub(crate) fn digest_manifest(
     config: &Config,
     profiles: &BTreeMap<ProfileId, Profile>,
     files: &[SourceFile],
@@ -1631,6 +1632,102 @@ mod tests {
         assert_eq!(loaded.config.projects.len(), 2);
         assert_eq!(loaded.profiles.len(), 2);
         assert_eq!(loaded.source_files.len(), 7);
+    }
+
+    #[test]
+    fn loader_preserves_profile_relative_names_through_symlinked_roots_and_file_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_root = temp.path().join("config");
+        let profile_root = temp.path().join("source-profiles").join("worker_codex");
+        std::fs::create_dir_all(config_root.join("profiles")).unwrap();
+        std::fs::create_dir_all(&profile_root).unwrap();
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture");
+        std::fs::copy(
+            fixture_root.join("config.toml"),
+            config_root.join("config.toml"),
+        )
+        .unwrap();
+        let worker_root = fixture_root.join("profiles/worker_codex");
+        std::fs::copy(
+            worker_root.join("instructions.md"),
+            profile_root.join("instructions.md"),
+        )
+        .unwrap();
+        let worker_config = std::fs::read_to_string(worker_root.join("config.toml")).unwrap();
+        let worker_config = worker_config.replace(
+            "model = \"configured-supported-model\"\n",
+            "model = \"configured-supported-model\"\ninstruction_files = [\"aliases/instruction.md\"]\n[learned_guidance]\nfile = \"aliases/guidance.md\"\nproject_id = \"goal_project\"\nrole = \"worker\"\nrepository_ids = [\"example\"]\n",
+        );
+        std::fs::write(profile_root.join("config.toml"), worker_config).unwrap();
+        std::fs::create_dir(profile_root.join("aliases")).unwrap();
+        std::fs::write(
+            profile_root.join("instruction-target.md"),
+            "instruction bytes",
+        )
+        .unwrap();
+        std::fs::write(profile_root.join("guidance-target.md"), "guidance bytes").unwrap();
+        symlink(
+            profile_root.join("instruction-target.md"),
+            profile_root.join("aliases/instruction.md"),
+        )
+        .unwrap();
+        symlink(
+            profile_root.join("guidance-target.md"),
+            profile_root.join("aliases/guidance.md"),
+        )
+        .unwrap();
+        let canonical_profile_root = profile_root.canonicalize().unwrap();
+        symlink(
+            &canonical_profile_root,
+            config_root.join("profiles/worker_codex"),
+        )
+        .unwrap();
+        symlink(
+            fixture_root.join("profiles/judgment_claude"),
+            config_root.join("profiles/judgment_claude"),
+        )
+        .unwrap();
+
+        let loaded = super::load(&config_root.join("config.toml")).unwrap();
+        let worker =
+            &loaded.profiles[&crate::domain::ids::ProfileId::parse("worker_codex").unwrap()];
+        assert_eq!(worker.instruction_files, vec!["aliases/instruction.md"]);
+        assert_eq!(
+            worker.learned_guidance.as_ref().unwrap().file,
+            "aliases/guidance.md"
+        );
+        let instruction_path = canonical_profile_root.join("aliases/instruction.md");
+        let guidance_path = canonical_profile_root.join("aliases/guidance.md");
+        let instruction = loaded
+            .source_files
+            .iter()
+            .find(|source| source.path == instruction_path.to_string_lossy())
+            .unwrap();
+        let guidance = loaded
+            .source_files
+            .iter()
+            .find(|source| source.path == guidance_path.to_string_lossy())
+            .unwrap();
+        assert_eq!(instruction.contents, "instruction bytes");
+        assert_eq!(
+            instruction.canonical_path,
+            profile_root
+                .join("instruction-target.md")
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+        );
+        assert_eq!(guidance.contents, "guidance bytes");
+        assert_eq!(
+            guidance.canonical_path,
+            profile_root
+                .join("guidance-target.md")
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+        );
     }
 
     #[test]

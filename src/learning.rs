@@ -5,11 +5,170 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::domain::ids::{Digest, HumanRequestId, ProfileId, ProjectId, Revision};
+use crate::domain::ids::{Digest, HumanRequestId, ProfileId, ProjectId, RepositoryId, Revision};
 use crate::domain::types::Role;
+
+pub const PROFILE_CANDIDATE_METADATA_PATH: &str = ".rex-projects/candidate-v1.json";
+pub const MAX_CANDIDATE_GUIDANCE_BYTES: usize = 16 * 1024;
+pub const MAX_CANDIDATE_TEXT_BYTES: usize = 4 * 1024;
+pub const MAX_RETAINED_CANDIDATE_REVISIONS: usize = 20;
+
+fn nullable_digest_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    Option::<Digest>::json_schema(generator)
+}
+
+/// Semantic learning request. The host supplies every execution setting and package byte.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileCandidateProposal {
+    pub role: Role,
+    pub base_profile_id: ProfileId,
+    pub base_profile_digest: Digest,
+    pub topic_key: String,
+    pub repository_ids: Vec<RepositoryId>,
+    pub source_finding_ids: Vec<Digest>,
+    #[serde(deserialize_with = "deserialize_nullable_digest")]
+    #[schemars(required, schema_with = "nullable_digest_schema")]
+    pub expected_prior_digest: Option<Digest>,
+    pub description: String,
+    pub learned_guidance: String,
+    pub evaluation_criterion: String,
+}
+
+fn deserialize_nullable_digest<'de, D>(deserializer: D) -> Result<Option<Digest>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<Digest>::deserialize(deserializer)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileCandidateMetadata {
+    pub schema_version: u32,
+    pub project_id: ProjectId,
+    pub candidate_id: String,
+    pub profile_id: ProfileId,
+    pub role: Role,
+    pub base_profile_id: ProfileId,
+    pub base_profile_digest: Digest,
+    pub base_profile_json: String,
+    pub base_config_toml: String,
+    pub base_guidance: Option<String>,
+    pub learned_guidance_path: String,
+    pub config_revision: Revision,
+    pub config_digest: Digest,
+    pub topic_key: crate::topic::TopicKey,
+    pub repository_ids: BTreeSet<RepositoryId>,
+    pub source_finding_ids: Vec<Digest>,
+    pub source_ticket_run_ids: BTreeSet<crate::domain::ids::TicketRunId>,
+    pub expected_prior_digest: Option<Digest>,
+    pub evaluation_criterion: String,
+    pub description: String,
+    pub learned_guidance: String,
+    pub external_sources: BTreeMap<String, String>,
+}
+
+/// Bounded, non-executable summary sent to later Supervisor turns.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileCandidateSummary {
+    pub role: Role,
+    pub base_profile_id: ProfileId,
+    pub base_profile_digest: Digest,
+    pub config_revision: Revision,
+    pub config_digest: Digest,
+    pub topic_key: crate::topic::TopicKey,
+    pub repository_ids: BTreeSet<RepositoryId>,
+    pub source_finding_ids: Vec<Digest>,
+    pub source_ticket_run_ids: BTreeSet<crate::domain::ids::TicketRunId>,
+    pub expected_prior_digest: Option<Digest>,
+    pub evaluation_criterion: String,
+    pub description: String,
+    pub learned_guidance: String,
+}
+
+impl From<&ProfileCandidateMetadata> for ProfileCandidateSummary {
+    fn from(metadata: &ProfileCandidateMetadata) -> Self {
+        Self {
+            role: metadata.role,
+            base_profile_id: metadata.base_profile_id.clone(),
+            base_profile_digest: metadata.base_profile_digest.clone(),
+            config_revision: metadata.config_revision,
+            config_digest: metadata.config_digest.clone(),
+            topic_key: metadata.topic_key.clone(),
+            repository_ids: metadata.repository_ids.clone(),
+            source_finding_ids: metadata.source_finding_ids.clone(),
+            source_ticket_run_ids: metadata.source_ticket_run_ids.clone(),
+            expected_prior_digest: metadata.expected_prior_digest.clone(),
+            evaluation_criterion: metadata.evaluation_criterion.clone(),
+            description: metadata.description.clone(),
+            learned_guidance: metadata.learned_guidance.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SupervisorCandidateTarget {
+    pub role: Role,
+    pub profile_id: ProfileId,
+    pub profile_digest: Digest,
+    pub description: Option<String>,
+    pub learned_guidance: Option<String>,
+    pub repository_ids: BTreeSet<RepositoryId>,
+}
+
+pub fn candidate_slot_id(
+    project: &ProjectId,
+    role: Role,
+    base_profile_id: &ProfileId,
+    topic_key: &crate::topic::TopicKey,
+) -> (String, ProfileId) {
+    let slot = format!(
+        "{}\0{}\0{}\0{}",
+        project,
+        role_key(role),
+        base_profile_id,
+        topic_key.as_str()
+    );
+    let digest = format!("{:x}", Sha256::digest(slot.as_bytes()));
+    let prefix = &digest[..32];
+    (
+        format!("candidate-{prefix}"),
+        ProfileId::parse(format!("learned-{prefix}")).expect("fixed candidate profile ID"),
+    )
+}
+
+fn role_key(role: Role) -> &'static str {
+    match role {
+        Role::Supervisor => "supervisor",
+        Role::Coordinator => "coordinator",
+        Role::Planner => "planner",
+        Role::Worker => "worker",
+        Role::Reviewer => "reviewer",
+        Role::MergeDecision => "merge_decision",
+        Role::Operator => "operator",
+        Role::Postmortem => "postmortem",
+    }
+}
+
+pub fn candidate_revision_digest(
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Result<Digest, LearningError> {
+    let bytes =
+        serde_json::to_vec(files).map_err(|error| LearningError::Invalid(error.to_string()))?;
+    Ok(as_digest(&Sha256::digest(
+        [
+            b"rex-projects-profile-candidate-v1\0".as_slice(),
+            bytes.as_slice(),
+        ]
+        .concat(),
+    )))
+}
 
 pub const MAX_TRIAL_PAIRS_PER_REVISION: usize = 10;
 pub const MIN_DISTINCT_INPUTS: usize = 5;
@@ -171,12 +330,6 @@ impl CandidateStatus {
             Self::Proposed | Self::Trialing | Self::AwaitingApproval
         )
     }
-    fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Promoted | Self::Superseded | Self::Expired | Self::Rejected
-        )
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -236,30 +389,24 @@ impl CandidateLedger {
                 "project has reached the active candidate limit".into(),
             ));
         }
-        if retained >= 20 {
-            let oldest_terminal = self
-                .revisions
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| r.project_id == revision.project_id && r.status.is_terminal())
-                .min_by_key(|(_, r)| r.created_at.clone())
-                .map(|(index, _)| index);
-            match oldest_terminal {
-                Some(index) => {
-                    self.revisions.remove(index);
-                }
-                None => {
-                    return Err(LearningError::Conflict(
-                        "project has reached the retained candidate revision limit".into(),
-                    ));
-                }
-            }
+        if retained >= MAX_RETAINED_CANDIDATE_REVISIONS {
+            return Err(LearningError::Conflict(
+                "project has reached the retained candidate revision limit".into(),
+            ));
         }
         self.revisions.push(revision);
         Ok(())
     }
 
     pub fn expire_due(&mut self, now_rfc3339_utc: &str) -> Result<usize, LearningError> {
+        self.expire_due_except(now_rfc3339_utc, &BTreeSet::new())
+    }
+
+    pub fn expire_due_except(
+        &mut self,
+        now_rfc3339_utc: &str,
+        pinned: &BTreeSet<(String, Digest)>,
+    ) -> Result<usize, LearningError> {
         if !sortable_utc(now_rfc3339_utc) {
             return Err(LearningError::Invalid(
                 "expiry comparison requires canonical UTC timestamps".into(),
@@ -268,6 +415,7 @@ impl CandidateLedger {
         let mut expired = 0;
         for revision in &mut self.revisions {
             if revision.status == CandidateStatus::Proposed
+                && !pinned.contains(&(revision.candidate_id.clone(), revision.digest.clone()))
                 && revision.expires_at.as_str() <= now_rfc3339_utc
             {
                 revision.status = CandidateStatus::Expired;
@@ -277,11 +425,16 @@ impl CandidateLedger {
         Ok(expired)
     }
 
-    pub fn supersede(&mut self, project: &ProjectId, role: Role, except_digest: &Digest) -> usize {
+    pub fn supersede_slot(
+        &mut self,
+        project: &ProjectId,
+        candidate_id: &str,
+        except_digest: &Digest,
+    ) -> usize {
         let mut count = 0;
         for revision in &mut self.revisions {
             if revision.project_id == *project
-                && revision.role == role
+                && revision.candidate_id == candidate_id
                 && revision.status.consumes_slot()
                 && revision.digest != *except_digest
             {
@@ -1438,6 +1591,122 @@ mod tests {
         invalid.candidate_id = "../escape".into();
         assert!(ledger.register(invalid).is_err());
         assert_eq!(ledger, before);
+    }
+
+    #[test]
+    fn retained_revision_limit_rejects_without_evicting_existing_history() {
+        let project = ProjectId::parse("proj").unwrap();
+        let mut ledger = CandidateLedger {
+            revisions: (0..MAX_RETAINED_CANDIDATE_REVISIONS)
+                .map(|n| CandidateRevision {
+                    candidate_id: format!("candidate-{n}"),
+                    project_id: project.clone(),
+                    role: Role::Worker,
+                    digest: hash(format!("candidate-{n}").as_bytes()),
+                    created_at: "2026-11-01T00:00:00Z".into(),
+                    expires_at: "2026-11-02T00:00:00Z".into(),
+                    status: CandidateStatus::Expired,
+                })
+                .collect(),
+        };
+        let before = ledger.clone();
+        let new_revision = CandidateRevision {
+            candidate_id: "new-candidate".into(),
+            project_id: project,
+            role: Role::Worker,
+            digest: hash(b"new-candidate"),
+            created_at: "2026-11-03T00:00:00Z".into(),
+            expires_at: "2026-11-17T00:00:00Z".into(),
+            status: CandidateStatus::Proposed,
+        };
+
+        assert!(ledger.register(new_revision).is_err());
+        assert_eq!(ledger, before);
+    }
+
+    #[test]
+    fn pinned_proposed_candidate_does_not_expire_but_unpinned_candidate_does() {
+        let project = ProjectId::parse("proj").unwrap();
+        let pinned = CandidateRevision {
+            candidate_id: "candidate-pinned".into(),
+            project_id: project.clone(),
+            role: Role::Worker,
+            digest: hash(b"pinned"),
+            created_at: "2026-11-01T00:00:00Z".into(),
+            expires_at: "2026-11-02T00:00:00Z".into(),
+            status: CandidateStatus::Proposed,
+        };
+        let unpinned = CandidateRevision {
+            candidate_id: "candidate-unpinned".into(),
+            project_id: project,
+            role: Role::Worker,
+            digest: hash(b"unpinned"),
+            ..pinned.clone()
+        };
+        let mut ledger = CandidateLedger {
+            revisions: vec![pinned.clone(), unpinned],
+        };
+        let pins = BTreeSet::from([(pinned.candidate_id.clone(), pinned.digest.clone())]);
+
+        assert_eq!(
+            ledger
+                .expire_due_except("2026-11-02T00:00:00Z", &pins)
+                .unwrap(),
+            1
+        );
+        assert_eq!(ledger.revisions[0].status, CandidateStatus::Proposed);
+        assert_eq!(ledger.revisions[1].status, CandidateStatus::Expired);
+    }
+
+    #[test]
+    fn replacing_one_candidate_slot_preserves_an_unrelated_same_role_slot() {
+        let project = ProjectId::parse("proj").unwrap();
+        let old_digest = hash(b"old slot revision");
+        let replacement_digest = hash(b"replacement slot revision");
+        let unrelated_digest = hash(b"unrelated topic slot");
+        let mut ledger = CandidateLedger {
+            revisions: vec![
+                CandidateRevision {
+                    candidate_id: "slot-one".into(),
+                    project_id: project.clone(),
+                    role: Role::Worker,
+                    digest: old_digest,
+                    created_at: "2026-11-01T00:00:00Z".into(),
+                    expires_at: "2026-11-15T00:00:00Z".into(),
+                    status: CandidateStatus::Proposed,
+                },
+                CandidateRevision {
+                    candidate_id: "slot-two".into(),
+                    project_id: project.clone(),
+                    role: Role::Worker,
+                    digest: unrelated_digest.clone(),
+                    created_at: "2026-11-01T00:00:00Z".into(),
+                    expires_at: "2026-11-15T00:00:00Z".into(),
+                    status: CandidateStatus::Proposed,
+                },
+            ],
+        };
+
+        assert_eq!(
+            ledger.supersede_slot(&project, "slot-one", &replacement_digest),
+            1
+        );
+        ledger
+            .register(CandidateRevision {
+                candidate_id: "slot-one".into(),
+                project_id: project,
+                role: Role::Worker,
+                digest: replacement_digest,
+                created_at: "2026-11-02T00:00:00Z".into(),
+                expires_at: "2026-11-16T00:00:00Z".into(),
+                status: CandidateStatus::Proposed,
+            })
+            .unwrap();
+
+        assert_eq!(ledger.revisions[0].status, CandidateStatus::Superseded);
+        assert_eq!(ledger.revisions[1].digest, unrelated_digest);
+        assert_eq!(ledger.revisions[1].status, CandidateStatus::Proposed);
+        assert_eq!(ledger.revisions[2].candidate_id, "slot-one");
     }
 
     #[test]
