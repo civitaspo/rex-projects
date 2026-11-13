@@ -119,6 +119,10 @@ pub struct SupervisorCandidateTarget {
     pub profile_digest: Digest,
     pub description: Option<String>,
     pub learned_guidance: Option<String>,
+    #[serde(default)]
+    pub omitted_description_bytes: usize,
+    #[serde(default)]
+    pub omitted_learned_guidance_bytes: usize,
     pub repository_ids: BTreeSet<RepositoryId>,
 }
 

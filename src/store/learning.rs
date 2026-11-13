@@ -27,6 +27,7 @@ const MAX_TRIALS: usize = 10;
 const MAX_SUPERVISOR_KNOWLEDGE_ITEMS: usize = 12;
 const MAX_SUPERVISOR_CANDIDATES: usize = 20;
 const MAX_SUPERVISOR_CONTEXT_BYTES: usize = 256 * 1024;
+const MAX_SUPERVISOR_TARGET_BYTES: usize = 64 * 1024;
 const MAX_SUPERVISOR_BATCH_BYTES: usize = 768 * 1024;
 const LEARNING_BATCH_TRIGGER_FINDINGS: usize = 5;
 const LEARNING_BATCH_MAX_FINDINGS: usize = 20;
@@ -141,7 +142,7 @@ fn profile_source_digest(
 fn supervisor_candidate_targets(
     tx: &rusqlite::Transaction<'_>,
     project: &ProjectId,
-) -> Result<Vec<crate::learning::SupervisorCandidateTarget>, String> {
+) -> Result<(Vec<crate::learning::SupervisorCandidateTarget>, usize), String> {
     let (revision, digest): (u64, String) = tx
         .query_row(
             "SELECT config_revision,config_digest FROM projects WHERE project_id=?1",
@@ -173,46 +174,67 @@ fn supervisor_candidate_targets(
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
-    bindings
-        .into_iter()
-        .map(|(role, profile_id)| {
-            let profile = snapshot
-                .profiles
-                .get(&profile_id)
-                .ok_or("configured profile is missing")?;
-            let profile_digest = profile_source_digest(&snapshot, &profile_id)?;
-            let logical_root = std::path::Path::new(&snapshot.source_root)
-                .join("profiles")
-                .join(profile_id.as_str());
-            let canonical_root = snapshot
+    let mut targets = Vec::new();
+    let mut omitted = 0;
+    let catalog_bytes = |targets: &[crate::learning::SupervisorCandidateTarget]| {
+        serde_json::to_vec(targets)
+            .map(|bytes| bytes.len())
+            .map_err(|error| error.to_string())
+    };
+    for (role, profile_id) in bindings {
+        let profile = snapshot
+            .profiles
+            .get(&profile_id)
+            .ok_or("configured profile is missing")?;
+        let profile_digest = profile_source_digest(&snapshot, &profile_id)?;
+        let logical_root = std::path::Path::new(&snapshot.source_root)
+            .join("profiles")
+            .join(profile_id.as_str());
+        let canonical_root = snapshot
+            .source_files
+            .iter()
+            .find(|source| {
+                matches!(source.kind, crate::config::SourceKind::Directory)
+                    && std::path::Path::new(&source.path) == logical_root
+            })
+            .map(|source| std::path::PathBuf::from(&source.canonical_path));
+        let learned_guidance = profile.learned_guidance.as_ref().and_then(|learned| {
+            let path = canonical_root.as_ref()?.join(&learned.file);
+            snapshot
                 .source_files
                 .iter()
                 .find(|source| {
-                    matches!(source.kind, crate::config::SourceKind::Directory)
-                        && std::path::Path::new(&source.path) == logical_root
+                    matches!(source.kind, crate::config::SourceKind::File)
+                        && std::path::Path::new(&source.path) == path
                 })
-                .map(|source| std::path::PathBuf::from(&source.canonical_path));
-            let learned_guidance = profile.learned_guidance.as_ref().and_then(|learned| {
-                let path = canonical_root.as_ref()?.join(&learned.file);
-                snapshot
-                    .source_files
-                    .iter()
-                    .find(|source| {
-                        matches!(source.kind, crate::config::SourceKind::File)
-                            && std::path::Path::new(&source.path) == path
-                    })
-                    .map(|source| source.contents.clone())
-            });
-            Ok(crate::learning::SupervisorCandidateTarget {
-                role,
-                profile_id,
-                profile_digest,
-                description: profile.description.clone(),
-                learned_guidance,
-                repository_ids: repositories.clone(),
-            })
-        })
-        .collect()
+                .map(|source| source.contents.clone())
+        });
+        targets.push(crate::learning::SupervisorCandidateTarget {
+            role,
+            profile_id,
+            profile_digest,
+            description: profile.description.clone(),
+            learned_guidance,
+            omitted_description_bytes: 0,
+            omitted_learned_guidance_bytes: 0,
+            repository_ids: repositories.clone(),
+        });
+        if catalog_bytes(&targets)? > MAX_SUPERVISOR_TARGET_BYTES {
+            let target = targets.last_mut().expect("just appended a target");
+            target.omitted_learned_guidance_bytes =
+                target.learned_guidance.take().map_or(0, |text| text.len());
+        }
+        if catalog_bytes(&targets)? > MAX_SUPERVISOR_TARGET_BYTES {
+            let target = targets.last_mut().expect("just appended a target");
+            target.omitted_description_bytes =
+                target.description.take().map_or(0, |text| text.len());
+        }
+        if catalog_bytes(&targets)? > MAX_SUPERVISOR_TARGET_BYTES {
+            targets.pop();
+            omitted += 1;
+        }
+    }
+    Ok((targets, omitted))
 }
 
 fn resolve_topic_source(
@@ -548,6 +570,7 @@ fn supervisor_learning_snapshot_in_transaction(
     }
     let omitted_topics = total_published_topics.saturating_sub(topics.len());
     let candidates = current_supervisor_candidate_entries(tx, project)?;
+    let (candidate_targets, omitted_candidate_targets) = supervisor_candidate_targets(tx, project)?;
     let mut snapshot = ProjectSupervisorMaintenance {
         project_id: project.clone(),
         expired_candidates,
@@ -555,7 +578,8 @@ fn supervisor_learning_snapshot_in_transaction(
         topics,
         omitted_topics,
         candidates,
-        candidate_targets: supervisor_candidate_targets(tx, project)?,
+        candidate_targets,
+        omitted_candidate_targets,
     };
     trim_supervisor_snapshot(&mut snapshot)?;
     Ok(snapshot)
@@ -1325,6 +1349,8 @@ pub struct ProjectSupervisorMaintenance {
     pub candidates: Vec<SupervisorCandidateEntry>,
     #[serde(default)]
     pub candidate_targets: Vec<crate::learning::SupervisorCandidateTarget>,
+    #[serde(default)]
+    pub omitted_candidate_targets: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1389,11 +1415,14 @@ fn prepare_learning_candidate(
         .as_str()
         .ok_or("issued candidate input has no config digest")?;
     let current_snapshot = applied_config_in_transaction(tx, project, revision, digest)?;
-    let current_targets = supervisor_candidate_targets(tx, project)?;
-    let issued_targets: Vec<crate::learning::SupervisorCandidateTarget> =
-        serde_json::from_value(issued_snapshot["maintenance"]["candidate_targets"].clone())
-            .map_err(|error| format!("issued candidate target catalog is invalid: {error}"))?;
-    if current_targets != issued_targets {
+    let (current_targets, omitted_targets) = supervisor_candidate_targets(tx, project)?;
+    let mut projected: ProjectSupervisorMaintenance =
+        serde_json::from_value(issued_snapshot["maintenance"].clone()).map_err(|error| {
+            format!("issued Supervisor maintenance context is invalid: {error}")
+        })?;
+    if current_targets != projected.candidate_targets
+        || omitted_targets != projected.omitted_candidate_targets
+    {
         return Err("configured candidate target catalog changed after batch issuance".into());
     }
     if proposal.description.trim().is_empty()
@@ -1423,7 +1452,8 @@ fn prepare_learning_candidate(
                 .into(),
         );
     }
-    let target = issued_targets
+    let target = projected
+        .candidate_targets
         .iter()
         .find(|target| {
             target.role == proposal.role
@@ -1431,6 +1461,11 @@ fn prepare_learning_candidate(
                 && target.profile_digest == proposal.base_profile_digest
         })
         .ok_or("candidate target is not a configured Project or selected recipe role/profile")?;
+    if target.omitted_learned_guidance_bytes != 0 {
+        return Err(
+            "candidate target guidance was omitted from the issued learning context".into(),
+        );
+    }
     let repository_scope = proposal
         .repository_ids
         .iter()
@@ -1722,10 +1757,6 @@ fn prepare_learning_candidate(
             supersedes,
         });
     }
-    let mut projected: ProjectSupervisorMaintenance =
-        serde_json::from_value(issued_snapshot["maintenance"].clone()).map_err(|error| {
-            format!("issued Supervisor maintenance context is invalid: {error}")
-        })?;
     projected.candidates = current_supervisor_candidate_entries(tx, project)?;
     projected
         .candidates
@@ -5463,6 +5494,7 @@ mod tests {
             omitted_topics: 0,
             candidates: Vec::new(),
             candidate_targets: Vec::new(),
+            omitted_candidate_targets: 0,
         };
         trim_supervisor_snapshot(&mut snapshot).unwrap();
         assert_eq!(snapshot.topics.len(), 4);
@@ -6489,17 +6521,22 @@ mod tests {
         (temp, store, project_id, generation, run)
     }
 
-    fn load_symlinked_candidate_fixture(mut snapshot: AppliedConfig) -> AppliedConfig {
+    fn load_symlinked_candidate_fixture(
+        mut snapshot: AppliedConfig,
+        base_guidance: &str,
+    ) -> AppliedConfig {
         let temp = tempfile::tempdir().unwrap();
         let config_root = temp.path().join("config");
         let source_profile = temp.path().join("source-profiles/candidate-worker");
         fs::create_dir_all(config_root.join("profiles")).unwrap();
         fs::create_dir_all(source_profile.join("aliases")).unwrap();
         let skill_a = temp.path().join("skills-a");
+        let skill_a_target = temp.path().join("skills-a-target");
         let skill_b = temp.path().join("skills-b");
         let skill_file = temp.path().join("skill-file-target.md");
         let skill_file_alias = temp.path().join("skill-file-alias.md");
-        fs::create_dir_all(&skill_a).unwrap();
+        fs::create_dir_all(&skill_a_target).unwrap();
+        symlink(&skill_a_target, &skill_a).unwrap();
         fs::create_dir_all(&skill_b).unwrap();
         fs::write(skill_a.join("README.md"), "shared skill guidance").unwrap();
         fs::write(skill_b.join("README.md"), "shared skill guidance").unwrap();
@@ -6510,11 +6547,7 @@ mod tests {
             "captured instruction alias",
         )
         .unwrap();
-        fs::write(
-            source_profile.join("guidance-target.md"),
-            "captured base guidance",
-        )
-        .unwrap();
+        fs::write(source_profile.join("guidance-target.md"), base_guidance).unwrap();
         symlink(
             source_profile.join("instruction-target.md"),
             source_profile.join("aliases/instruction.md"),
@@ -7253,6 +7286,7 @@ mod tests {
         Proposed,
         StalePrior,
         OversizedContext,
+        OversizedGuidance,
     }
 
     fn learning_dispatch_fixture(
@@ -7301,7 +7335,8 @@ mod tests {
     ) -> LearningDispatchFixture {
         let include_candidate = !matches!(candidate, CandidateFixture::Omitted);
         let stale_candidate_prior = matches!(candidate, CandidateFixture::StalePrior);
-        let large_candidate_target = matches!(candidate, CandidateFixture::OversizedContext);
+        let large_candidate_context = matches!(candidate, CandidateFixture::OversizedContext);
+        let oversized_guidance = matches!(candidate, CandidateFixture::OversizedGuidance);
         let mut config = test_snapshot();
         let profile_id = ProfileId::parse("fixture-profile").unwrap();
         config.config.projects.insert(
@@ -7310,13 +7345,13 @@ mod tests {
                 "mode": "goal",
                 "ticket_adapter": "tickets",
                 "goal":{"revision":1,"statement":"Fixture objective","acceptance":["Candidate dispatch is accepted."]},
-                "roles": if include_candidate { serde_json::json!({"supervisor": if large_candidate_target {"large-supervisor"} else {"fixture-profile"},"coordinator":"fixture-profile","planner":"fixture-profile","worker":"candidate-worker","reviewer":"fixture-profile","merge_decision":"fixture-profile","operator":"fixture-profile","postmortem":"fixture-profile"}) } else { serde_json::json!({"supervisor":"fixture-profile"}) },
+                "roles": if include_candidate { serde_json::json!({"supervisor":"fixture-profile","coordinator":"fixture-profile","planner":"fixture-profile","worker":"candidate-worker","reviewer":"fixture-profile","merge_decision":"fixture-profile","operator":"fixture-profile","postmortem":"fixture-profile"}) } else { serde_json::json!({"supervisor":"fixture-profile"}) },
                 "repositories": if include_candidate { vec!["fixture-repo".to_string()] } else { Vec::<String>::new() }
             }))
             .unwrap(),
         );
         config.profiles.insert(
-            profile_id,
+            profile_id.clone(),
             serde_json::from_value(serde_json::json!({
                 "adapter": "codex",
                 "command": ["/bin/codex"],
@@ -7326,14 +7361,8 @@ mod tests {
             }))
             .unwrap(),
         );
-        if large_candidate_target {
-            config.profiles.insert(
-                ProfileId::parse("large-supervisor").unwrap(),
-                serde_json::from_value(serde_json::json!({
-                    "adapter":"codex","command":["/bin/codex"],"model":"fixture",
-                    "description":"x".repeat(248_000),"commit_mode":"native","turn_timeout_seconds":60
-                })).unwrap(),
-            );
+        if oversized_guidance {
+            config.profiles.get_mut(&profile_id).unwrap().description = Some("d".repeat(20_000));
         }
         if include_candidate {
             config.profiles.insert(
@@ -7354,7 +7383,14 @@ mod tests {
                 }))
                 .unwrap(),
             );
-            config = load_symlinked_candidate_fixture(config);
+            config = load_symlinked_candidate_fixture(
+                config,
+                &if oversized_guidance {
+                    "g".repeat(super::MAX_SUPERVISOR_CONTEXT_BYTES + 1)
+                } else {
+                    "captured base guidance".into()
+                },
+            );
         }
         let (temp, mut store, project, generation, run) = running_store_with_snapshot(&config);
         if create_topic {
@@ -7512,7 +7548,15 @@ mod tests {
                 .iter()
                 .find(|target| target["profile_id"] == "candidate-worker")
                 .unwrap();
-            assert_eq!(worker_target["learned_guidance"], "captured base guidance");
+            if oversized_guidance {
+                assert!(worker_target["learned_guidance"].is_null());
+                assert_eq!(
+                    worker_target["omitted_learned_guidance_bytes"],
+                    super::MAX_SUPERVISOR_CONTEXT_BYTES + 1
+                );
+            } else {
+                assert_eq!(worker_target["learned_guidance"], "captured base guidance");
+            }
         }
         let batch_id = batch_payload["batch_id"].as_str().unwrap().to_owned();
         let batch_digest = Digest::parse(batch_payload["batch_digest"].as_str().unwrap()).unwrap();
@@ -7610,15 +7654,22 @@ mod tests {
                     .collect(),
                 expected_prior_digest: stale_candidate_prior
                     .then(|| Digest::parse("f".repeat(64)).unwrap()),
-                description: "Run focused acceptance checks first".into(),
-                learned_guidance: if large_candidate_target {
-                    "g".repeat(16_000)
+                description: if large_candidate_context {
+                    "\u{1}".repeat(crate::learning::MAX_CANDIDATE_TEXT_BYTES)
+                } else {
+                    "Run focused acceptance checks first".into()
+                },
+                learned_guidance: if large_candidate_context {
+                    "\u{1}".repeat(crate::learning::MAX_CANDIDATE_GUIDANCE_BYTES)
                 } else {
                     "Run the smallest relevant test before the full suite.".into()
                 },
-                evaluation_criterion:
+                evaluation_criterion: if large_candidate_context {
+                    "\u{1}".repeat(crate::learning::MAX_CANDIDATE_TEXT_BYTES)
+                } else {
                     "Paired runs reduce avoidable full-suite retries without adding regressions."
-                        .into(),
+                        .into()
+                },
             })
         } else {
             None
@@ -8174,6 +8225,108 @@ mod tests {
     }
 
     #[test]
+    fn oversized_configured_guidance_still_issues_supervisor_batch() {
+        let fixture = learning_dispatch_fixture_with_options(
+            crate::engine::orchestration::AgentAssertion::Succeeded,
+            false,
+            false,
+            None,
+            false,
+            None,
+            CandidateFixture::OversizedGuidance,
+        );
+        let mut store = fixture.store;
+        let input_json: String = store
+            .connection
+            .query_row(
+                "SELECT snapshot_json FROM learning_batches WHERE batch_id=?1",
+                [&fixture.batch_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let input: serde_json::Value = serde_json::from_str(&input_json).unwrap();
+        let targets = &input["maintenance"]["candidate_targets"];
+        assert!(serde_json::to_vec(targets).unwrap().len() <= super::MAX_SUPERVISOR_TARGET_BYTES);
+        assert!(targets.as_array().unwrap().iter().any(|target| {
+            target["omitted_description_bytes"].as_u64().unwrap() > 0
+                && target["description"].is_null()
+        }));
+        assert!(input_json.len() <= super::MAX_SUPERVISOR_BATCH_BYTES);
+        let snapshot = store.load_snapshot("factory").unwrap().unwrap();
+        assert_eq!(
+            snapshot.config.profiles[&ProfileId::parse("fixture-profile").unwrap()]
+                .description
+                .as_ref()
+                .unwrap()
+                .len(),
+            20_000
+        );
+        let source = snapshot
+            .config
+            .source_files
+            .iter()
+            .find(|source| source.path.ends_with("aliases/guidance.md"))
+            .unwrap();
+        assert_eq!(
+            source.contents.len(),
+            super::MAX_SUPERVISOR_CONTEXT_BYTES + 1
+        );
+        assert_eq!(
+            source.sha256.as_str(),
+            format!("{:x}", Sha256::digest(source.contents.as_bytes()))
+        );
+        let next_project = ProjectId::parse("sample-b").unwrap();
+        store
+            .set_project_lifecycle(fixture.generation, &next_project, "running")
+            .unwrap();
+        store.connection.execute(
+            "UPDATE project_runtimes SET observed_lifecycle='running',controller_generation=?2 WHERE project_id=?1",
+            params![next_project.as_str(), fixture.generation],
+        ).unwrap();
+        assert_eq!(
+            store
+                .queue_due_supervisor_learning(
+                    fixture.generation,
+                    &[fixture.project.clone(), next_project.clone()],
+                    101,
+                    3600,
+                    None,
+                )
+                .unwrap(),
+            Some(next_project)
+        );
+        crate::engine::factory_runtime::tests::apply_agent_result_for_test(
+            &mut store,
+            fixture.generation,
+            102,
+            &fixture.config,
+            fixture.config_digest,
+            &fixture.result,
+        )
+        .unwrap();
+        let rejection: String = store
+            .connection
+            .query_row(
+                "SELECT last_error FROM project_runtimes WHERE project_id=?1",
+                [fixture.project.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(rejection.contains("candidate target guidance was omitted"));
+        assert_eq!(
+            store
+                .connection
+                .query_row::<usize, _, _>(
+                    "SELECT count(*) FROM learning_candidates WHERE project_id=?1",
+                    [fixture.project.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn candidate_that_would_overflow_next_learning_input_is_rejected_before_consumption() {
         let fixture = learning_dispatch_fixture_with_options(
             crate::engine::orchestration::AgentAssertion::Succeeded,
@@ -8194,6 +8347,40 @@ mod tests {
             config_digest,
             ..
         } = fixture;
+        let mut existing_proposal = match &result.validated.typed_payload {
+            crate::engine::orchestration::RoleResultPayload::LearningDecision(payload) => {
+                payload.clone()
+            }
+            other => panic!("expected learning decision, got {other:?}"),
+        };
+        existing_proposal
+            .candidate_change
+            .as_mut()
+            .unwrap()
+            .topic_key = "existing-escaped-guidance".into();
+        let (snapshot_json, findings_json): (String, String) = store
+            .connection
+            .query_row(
+                "SELECT snapshot_json,findings_json FROM learning_batches WHERE batch_id=?1",
+                [&batch_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let tx = store.connection.transaction().unwrap();
+        let existing = prepare_learning_candidate(
+            &tx,
+            &project,
+            &existing_proposal,
+            &serde_json::from_str(&snapshot_json).unwrap(),
+            &serde_json::from_str::<Vec<LearningFinding>>(&findings_json).unwrap(),
+            100,
+        )
+        .unwrap()
+        .record
+        .unwrap();
+        let existing_revision = existing.revision.clone();
+        register_learning_candidate_in_transaction(&tx, generation, &existing).unwrap();
+        tx.commit().unwrap();
         crate::engine::factory_runtime::tests::apply_agent_result_for_test(
             &mut store,
             generation,
@@ -8212,7 +8399,19 @@ mod tests {
                     |row| row.get(0)
                 )
                 .unwrap(),
-            0
+            1
+        );
+        assert_eq!(
+            store
+                .learning_candidate_package(
+                    &project,
+                    &existing_revision.candidate_id,
+                    &existing_revision.digest,
+                )
+                .unwrap()
+                .unwrap()
+                .revision,
+            existing_revision
         );
         assert_eq!(
             store
