@@ -45,6 +45,19 @@ pub struct ProviderQualificationRequest {
     pub profile_digest: Digest,
     pub config_revision: u64,
     pub config_digest: Digest,
+    #[serde(default)]
+    pub target: ProviderQualificationTarget,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProviderQualificationTarget {
+    #[default]
+    AppliedProfile,
+    Candidate {
+        candidate_id: String,
+        candidate_digest: Digest,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -149,7 +162,34 @@ pub fn request_digest(request: &ProviderQualificationRequest) -> Result<Digest, 
         config_revision: request.config_revision,
         config_digest: &request.config_digest,
     };
-    let bytes = serde_json::to_vec(&identity).map_err(|error| error.to_string())?;
+    let bytes = match &request.target {
+        ProviderQualificationTarget::AppliedProfile => {
+            serde_json::to_vec(&identity).map_err(|error| error.to_string())?
+        }
+        ProviderQualificationTarget::Candidate {
+            candidate_id,
+            candidate_digest,
+        } => {
+            #[derive(Serialize)]
+            struct CandidateIdentity<'a> {
+                identity: RequestIdentity<'a>,
+                target: &'static str,
+                candidate_id: &'a str,
+                candidate_digest: &'a Digest,
+            }
+            let candidate_identity = CandidateIdentity {
+                identity,
+                target: "candidate_v1",
+                candidate_id,
+                candidate_digest,
+            };
+            let mut bytes = b"rex-projects/provider-qualification/candidate/v1\0".to_vec();
+            bytes.extend(
+                serde_json::to_vec(&candidate_identity).map_err(|error| error.to_string())?,
+            );
+            bytes
+        }
+    };
     Digest::parse(format!("{:x}", Sha256::digest(bytes)))
 }
 
@@ -161,6 +201,19 @@ impl ProviderQualificationRequest {
             || self.config_revision == 0
         {
             return Err("provider qualification request identity is invalid".into());
+        }
+        if let ProviderQualificationTarget::Candidate { candidate_id, .. } = &self.target
+            && (candidate_id.is_empty()
+                || candidate_id.len() > 255
+                || !candidate_id
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| b.is_ascii_alphanumeric())
+                || !candidate_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')))
+        {
+            return Err("provider qualification candidate identity is invalid".into());
         }
         Ok(())
     }
@@ -514,12 +567,48 @@ impl ConfigStore {
                     .into(),
             );
         }
+        if let ProviderQualificationTarget::Candidate {
+            candidate_id,
+            candidate_digest,
+        } = &request.target
+        {
+            if let Some(stored) = read_job(&tx, &request.request_id)? {
+                if stored.request == *request && stored.request_digest == digest {
+                    tx.commit().map_err(|error| error.to_string())?;
+                    return Ok(stored.request_digest);
+                }
+                return Err(
+                    "provider qualification request ID was reused with different content".into(),
+                );
+            }
+            let status: Option<String> = tx
+                .query_row(
+                    "SELECT status FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",
+                    params![request.project_id.as_str(), candidate_id, candidate_digest.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if status.as_deref() != Some("proposed") {
+                return Err("provider qualification candidate revision is not proposed".into());
+            }
+        }
         let now = now_unix()?;
         tx.execute(
             "INSERT INTO provider_qualification_jobs(request_id,project_id,role,profile_id,profile_digest,config_revision,config_digest,request_digest,status,controller_generation,launch_phase,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'queued',?9,'not_started',?10,?10) ON CONFLICT(request_id) DO NOTHING",
             params![request.request_id, request.project_id.as_str(), serde_json::to_value(request.role).map_err(|error| error.to_string())?.as_str().unwrap_or_default(), request.profile_id.as_str(), request.profile_digest.as_str(), request.config_revision, request.config_digest.as_str(), digest.as_str(), owner_generation, now],
         )
         .map_err(|error| error.to_string())?;
+        if let ProviderQualificationTarget::Candidate {
+            candidate_id,
+            candidate_digest,
+        } = &request.target
+        {
+            tx.execute(
+                "INSERT INTO provider_qualification_candidate_targets(request_id,project_id,candidate_id,candidate_digest) VALUES (?1,?2,?3,?4) ON CONFLICT(request_id) DO NOTHING",
+                params![request.request_id, request.project_id.as_str(), candidate_id, candidate_digest.as_str()],
+            ).map_err(|error| error.to_string())?;
+        }
         let stored = read_job(&tx, &request.request_id)?
             .ok_or("provider qualification request was not stored")?;
         if stored.request != *request || stored.request_digest != digest {
@@ -884,15 +973,29 @@ fn read_job(
             environment_snapshot_id,
             reconcile_requested_generation,
         )| {
+            let target: Option<(String, String, String)> = connection.query_row(
+                "SELECT project_id,candidate_id,candidate_digest FROM provider_qualification_candidate_targets WHERE request_id=?1",
+                [&request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).optional().map_err(|error| error.to_string())?;
+            let project_id = ProjectId::parse(project)?;
             let request = ProviderQualificationRequest {
                 request_id,
-                project_id: ProjectId::parse(project)?,
+                project_id: project_id.clone(),
                 role: serde_json::from_value(serde_json::Value::String(role))
                     .map_err(|error| error.to_string())?,
                 profile_id: ProfileId::parse(profile_id)?,
                 profile_digest: Digest::parse(profile_digest)?,
                 config_revision,
                 config_digest: Digest::parse(config_digest)?,
+                target: match target {
+                    Some((target_project, candidate_id, candidate_digest)) if target_project == project_id.as_str() => ProviderQualificationTarget::Candidate {
+                        candidate_id,
+                        candidate_digest: Digest::parse(candidate_digest)?,
+                    },
+                    Some(_) => return Err("provider qualification candidate target Project mismatch".into()),
+                    None => ProviderQualificationTarget::AppliedProfile,
+                },
             };
             request.validate()?;
             let stored_request_digest = Digest::parse(stored_request_digest)?;
@@ -970,5 +1073,65 @@ fn read_provider_qualification_slot(
             }))
         }
         _ => Err("provider qualification execution slot owner is ambiguous or invalid".into()),
+    }
+}
+
+#[cfg(test)]
+mod candidate_request_tests {
+    use super::*;
+
+    fn request(target: ProviderQualificationTarget) -> ProviderQualificationRequest {
+        ProviderQualificationRequest {
+            request_id: "legacy-vector".into(),
+            project_id: ProjectId::parse("project-a").unwrap(),
+            role: Role::Coordinator,
+            profile_id: ProfileId::parse("default-codex").unwrap(),
+            profile_digest: Digest::parse("a".repeat(64)).unwrap(),
+            config_revision: 3,
+            config_digest: Digest::parse("b".repeat(64)).unwrap(),
+            target,
+        }
+    }
+
+    #[test]
+    fn applied_profile_digest_preserves_legacy_bytes() {
+        assert_eq!(
+            request_digest(&request(ProviderQualificationTarget::AppliedProfile))
+                .unwrap()
+                .as_str(),
+            "7f4e6085953900316e5c1382c76091377f3124ba64f379975241dcdd5b331efa"
+        );
+    }
+
+    #[test]
+    fn legacy_request_json_without_target_decodes_as_applied_profile() {
+        let request = request(ProviderQualificationTarget::AppliedProfile);
+        let mut value = serde_json::to_value(request.clone()).unwrap();
+        value.as_object_mut().unwrap().remove("target");
+        assert_eq!(
+            serde_json::from_value::<ProviderQualificationRequest>(value).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn candidate_identity_has_a_separate_digest_domain() {
+        let applied = request(ProviderQualificationTarget::AppliedProfile);
+        let candidate = request(ProviderQualificationTarget::Candidate {
+            candidate_id: "candidate-a".into(),
+            candidate_digest: Digest::parse("c".repeat(64)).unwrap(),
+        });
+        assert_ne!(
+            request_digest(&applied).unwrap(),
+            request_digest(&candidate).unwrap()
+        );
+        assert_ne!(
+            request_digest(&candidate).unwrap(),
+            request_digest(&request(ProviderQualificationTarget::Candidate {
+                candidate_id: "candidate-b".into(),
+                candidate_digest: Digest::parse("c".repeat(64)).unwrap(),
+            }))
+            .unwrap()
+        );
     }
 }

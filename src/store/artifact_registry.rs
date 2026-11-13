@@ -1759,6 +1759,8 @@ mod tests {
                  DELETE FROM schema_migrations WHERE version=20;
                  DELETE FROM schema_migrations WHERE version=19;
                  DROP TRIGGER agent_launch_phase_transitions;
+                 DROP TABLE provider_qualification_candidate_targets;
+                 DELETE FROM schema_migrations WHERE version=22;
                  CREATE TEMP TABLE saved_agent_launch_reservations AS
                      SELECT agent_run_id,project_id,operation_id,controller_generation,project_epoch,
                             reservation_digest,reservation_json,lifecycle,created_at_unix,updated_at_unix

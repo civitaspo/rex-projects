@@ -259,6 +259,17 @@ enum ProviderCommand {
         #[arg(long)]
         request_id: Option<String>,
     },
+    /// Queue an isolated qualification run for one exact proposed candidate revision.
+    QualifyCandidate {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        candidate: String,
+        #[arg(long)]
+        candidate_digest: String,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
     /// Read the durable state of a provider qualification request.
     Status {
         #[arg(long)]
@@ -2406,6 +2417,7 @@ fn provider_command(
                     profile_digest,
                     config_revision: snapshot.revision.0,
                     config_digest: snapshot.config.digest.clone(),
+                    target: crate::store::provider_qualification_runtime::ProviderQualificationTarget::AppliedProfile,
                 };
             let request_digest = store
                 .enqueue_provider_qualification(owner_generation, &request)
@@ -2432,6 +2444,117 @@ fn provider_command(
                 println!(
                     "The foreground Rex controller will run and record the bounded qualification."
                 );
+                Ok(())
+            }
+        }
+        ProviderCommand::QualifyCandidate {
+            project,
+            candidate,
+            candidate_digest,
+            request_id,
+        } => {
+            use crate::store::provider_qualification_runtime::{
+                ProviderQualificationRequest, ProviderQualificationTarget,
+            };
+            let project_id = ProjectId::parse(project).map_err(CliError::usage)?;
+            let candidate_digest =
+                crate::domain::ids::Digest::parse(candidate_digest).map_err(CliError::usage)?;
+            let (source_path, _) = load_config(config_path)?;
+            let source_identity = source_path
+                .canonicalize()
+                .map_err(|error| CliError::usage(format!("{}: {error}", source_path.display())))?
+                .display()
+                .to_string();
+            let state_root = selected_state_root(Some(&source_path), explicit_state_root)?;
+            let status = ConfigStore::status(&state_root).map_err(CliError::unavailable)?;
+            let owner_generation = status.owner_generation.ok_or_else(|| CliError::unavailable("no foreground machine controller is running; start `rex-projects runtime run` first"))?;
+            if !status.owner_is_live() {
+                return Err(CliError::unavailable(
+                    "controller ownership is stale or ambiguous; cannot queue provider qualification",
+                ));
+            }
+            let mut store =
+                ConfigStore::open_control(&state_root).map_err(CliError::unavailable)?;
+            let current_revision = store
+                .current_revision(&source_identity)
+                .map_err(CliError::unavailable)?
+                .ok_or_else(|| CliError::conflict("configuration has not been applied"))?;
+            let snapshot = store
+                .load_snapshot(&source_identity)
+                .map_err(CliError::unavailable)?
+                .ok_or_else(|| CliError::conflict("applied configuration snapshot is missing"))?;
+            if snapshot.revision != current_revision {
+                return Err(CliError::conflict(
+                    "applied configuration revision changed while queuing qualification",
+                ));
+            }
+            let package = store
+                .learning_candidate_package(&project_id, &candidate, &candidate_digest)
+                .map_err(CliError::conflict)?
+                .ok_or_else(|| CliError::not_found("exact candidate revision was not found"))?;
+            let profile: crate::config::Profile = toml::from_str(
+                std::str::from_utf8(
+                    package
+                        .files
+                        .get("config.toml")
+                        .ok_or_else(|| CliError::conflict("candidate config.toml is missing"))?,
+                )
+                .map_err(|error| CliError::conflict(error.to_string()))?,
+            )
+            .map_err(|error| CliError::conflict(error.to_string()))?;
+            let request = ProviderQualificationRequest {
+                request_id: request_id.unwrap_or(generated_request_id()?),
+                project_id: project_id.clone(),
+                role: package.revision.role,
+                profile_id: package.profile_id.clone(),
+                profile_digest: crate::store::agent_profile_digest(&profile)
+                    .map_err(CliError::unexpected)?,
+                config_revision: snapshot.revision.0,
+                config_digest: snapshot.config.digest.clone(),
+                target: ProviderQualificationTarget::Candidate {
+                    candidate_id: candidate.clone(),
+                    candidate_digest: candidate_digest.clone(),
+                },
+            };
+            let replayed_job = store
+                .provider_qualification_job(&request.request_id)
+                .map_err(CliError::conflict)?;
+            if replayed_job.is_none() {
+                store
+                    .resolve_provider_qualification_candidate(&request, &snapshot.config)
+                    .map_err(CliError::conflict)?;
+            }
+            let request_digest = store
+                .enqueue_provider_qualification(owner_generation, &request)
+                .map_err(CliError::conflict)?;
+            let state = replayed_job
+                .as_ref()
+                .map(|job| job.status.as_str())
+                .unwrap_or("queued");
+            let report = serde_json::json!({
+                "accepted": true, "request_id": request.request_id, "request_digest": request_digest,
+                "project_id": project_id, "candidate_id": candidate, "candidate_digest": candidate_digest,
+                "profile_id": request.profile_id, "profile_digest": request.profile_digest,
+                "config_revision": snapshot.revision.0, "config_digest": snapshot.config.digest,
+                "state": state, "owner_generation": owner_generation,
+            });
+            if json {
+                print_json(&report)
+            } else {
+                if replayed_job.is_some() {
+                    println!(
+                        "Provider qualification {} for candidate {} is {}.",
+                        request.request_id, candidate, state
+                    );
+                } else {
+                    println!(
+                        "Queued provider qualification {} for candidate {}.",
+                        request.request_id, candidate
+                    );
+                    println!(
+                        "The foreground Rex controller will run and record the bounded qualification."
+                    );
+                }
                 Ok(())
             }
         }
@@ -4323,6 +4446,416 @@ mod tests {
     use crate::store::{ConfigStore, ExpectedRevision};
 
     #[test]
+    fn candidate_qualification_cli_requires_exact_target_and_has_no_execution_overrides() {
+        let cli = Cli::try_parse_from([
+            "rex-projects",
+            "provider",
+            "qualify-candidate",
+            "--project",
+            "project-a",
+            "--candidate",
+            "candidate-a",
+            "--candidate-digest",
+            &"a".repeat(64),
+            "--request-id",
+            "request-a",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Provider {
+                command: ProviderCommand::QualifyCandidate { .. }
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "rex-projects",
+                "provider",
+                "qualify-candidate",
+                "--project",
+                "project-a",
+                "--candidate",
+                "candidate-a",
+                "--candidate-digest",
+                &"a".repeat(64),
+                "--profile",
+                "anything",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn public_candidate_qualification_cli_round_trips_exact_candidate_and_receipt() {
+        use crate::domain::ids::{Digest, ProfileId, ProjectId, Revision};
+        use crate::domain::types::Role;
+        use crate::learning::{CandidateRevision, CandidateStatus, ProfileCandidateMetadata};
+        use crate::store::provider_qualification_runtime::{
+            ProviderQualificationJobStatus as JobStatus, ProviderQualificationTarget as Target,
+            QualificationClaim,
+        };
+        use crate::store::{ExpectedRevision, LearningCandidateRecord, OwnerMetadata};
+        use sha2::{Digest as _, Sha256};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("state");
+        let config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/fixture/config.toml")
+            .canonicalize()
+            .unwrap();
+        let source_identity = config_path.display().to_string();
+        let applied = config::load(&config_path).unwrap();
+        let project_id = ProjectId::parse("goal_project").unwrap();
+        let role = Role::Coordinator;
+        let base_profile_id =
+            crate::config::effective_project_roles(&project_id, &applied.config.projects).unwrap()
+                [&role]
+                .clone();
+        let base_profile = applied.profiles[&base_profile_id].clone();
+        let base_profile_digest = crate::store::agent_profile_digest(&base_profile).unwrap();
+        let (candidate_id, profile_id) = crate::learning::candidate_slot_id(
+            &project_id,
+            role,
+            &base_profile_id,
+            &crate::topic::TopicKey::parse("qualification-fixture").unwrap(),
+        );
+        let repository_ids = BTreeSet::new();
+        let mut candidate_profile = base_profile.clone();
+        candidate_profile.description = Some("Fixture candidate description".into());
+        candidate_profile.learned_guidance = Some(crate::config::LearnedGuidance {
+            file: "learned/guidance.md".into(),
+            project_id: project_id.clone(),
+            role,
+            repository_ids: repository_ids.clone(),
+        });
+        let mut files = BTreeMap::from([
+            (
+                "config.toml".to_owned(),
+                toml::to_string(&candidate_profile).unwrap().into_bytes(),
+            ),
+            (
+                "learned/guidance.md".to_owned(),
+                b"Use focused checks.".to_vec(),
+            ),
+        ]);
+        let metadata = ProfileCandidateMetadata {
+            schema_version: 1,
+            project_id: project_id.clone(),
+            candidate_id: candidate_id.clone(),
+            profile_id: profile_id.clone(),
+            role,
+            base_profile_id: base_profile_id.clone(),
+            base_profile_digest,
+            base_profile_json: serde_json::to_string(&base_profile).unwrap(),
+            base_config_toml: toml::to_string(&base_profile).unwrap(),
+            base_guidance: None,
+            learned_guidance_path: "learned/guidance.md".into(),
+            config_revision: Revision(1),
+            config_digest: applied.digest.clone(),
+            topic_key: crate::topic::TopicKey::parse("qualification-fixture").unwrap(),
+            repository_ids,
+            source_finding_ids: Vec::new(),
+            source_ticket_run_ids: BTreeSet::new(),
+            expected_prior_digest: None,
+            evaluation_criterion: "The candidate profile resolves to the exact package.".into(),
+            description: "Fixture candidate description".into(),
+            learned_guidance: "Use focused checks.".into(),
+            external_sources: BTreeMap::new(),
+        };
+        files.insert(
+            crate::learning::PROFILE_CANDIDATE_METADATA_PATH.into(),
+            serde_json::to_vec(&metadata).unwrap(),
+        );
+        let package_manifest_digest = crate::learning::manifest_digest(&files).unwrap();
+        let manifest_rows = files
+            .iter()
+            .map(|(path, bytes)| {
+                (
+                    path.clone(),
+                    Digest::parse(format!("{:x}", Sha256::digest(bytes))).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let package_json = serde_json::to_string(&manifest_rows).unwrap();
+        let package_files_json = serde_json::to_string(&files).unwrap();
+        let candidate_digest = crate::learning::candidate_revision_digest(&files).unwrap();
+        let record = LearningCandidateRecord {
+            revision: CandidateRevision {
+                candidate_id: candidate_id.clone(),
+                project_id: project_id.clone(),
+                role,
+                digest: candidate_digest.clone(),
+                created_at: "2026-11-12T00:00:00Z".into(),
+                expires_at: "2027-11-12T00:00:00Z".into(),
+                status: CandidateStatus::Proposed,
+            },
+            profile_id: profile_id.clone(),
+            package_manifest_digest,
+            package_files_json,
+            package_json,
+            expected_pairs: 5,
+        };
+        let mut store = ConfigStore::open_test(&state_root).unwrap();
+        let revision = store
+            .apply_snapshot(&source_identity, &applied, ExpectedRevision::Bootstrap)
+            .unwrap()
+            .revision;
+        assert_eq!(revision, Revision(1));
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "candidate-qualification-cli-fixture".into(),
+                state_root: state_root.display().to_string(),
+                config_source: source_identity.clone(),
+                process_start_identity: super::process_start_identity().unwrap(),
+                executable_path: std::env::current_exe().unwrap().display().to_string(),
+                executable_digest: "f".repeat(64),
+                rex_endpoint: Some("fixture://rex".into()),
+                rex_server_identity: Some("fixture-server".into()),
+                rex_session_id: Some("fixture-session".into()),
+                rex_block_id: Some("fixture-block".into()),
+            })
+            .unwrap();
+        store
+            .register_learning_candidate(generation, &record)
+            .unwrap();
+        drop(store);
+
+        super::dispatch_provider_command_for_test(&[
+            "rex-projects",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--state-root",
+            state_root.to_str().unwrap(),
+            "--json",
+            "provider",
+            "qualify-candidate",
+            "--project",
+            project_id.as_str(),
+            "--candidate",
+            &candidate_id,
+            "--candidate-digest",
+            candidate_digest.as_str(),
+            "--request-id",
+            "candidate-cli-roundtrip",
+        ])
+        .unwrap();
+
+        let store = ConfigStore::open_test(&state_root).unwrap();
+        let job = store
+            .provider_qualification_job("candidate-cli-roundtrip")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            job.request.target,
+            Target::Candidate {
+                candidate_id: candidate_id.clone(),
+                candidate_digest: candidate_digest.clone(),
+            }
+        );
+        assert_eq!(job.request.profile_id, profile_id);
+        drop(store);
+        let db = rusqlite::Connection::open(state_root.join("state.sqlite3")).unwrap();
+        let revision_json: String = db
+            .query_row(
+                "SELECT revision_json FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",
+                rusqlite::params![project_id.as_str(), candidate_id, candidate_digest.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut revision: CandidateRevision = serde_json::from_str(&revision_json).unwrap();
+        revision.status = CandidateStatus::Trialing;
+        db
+            .execute(
+                "UPDATE learning_candidates SET status='trialing',revision_json=?4 WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",
+                rusqlite::params![project_id.as_str(), candidate_id, candidate_digest.as_str(), serde_json::to_string(&revision).unwrap()],
+            )
+            .unwrap();
+        drop(db);
+        super::dispatch_provider_command_for_test(&[
+            "rex-projects",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--state-root",
+            state_root.to_str().unwrap(),
+            "--json",
+            "provider",
+            "qualify-candidate",
+            "--project",
+            project_id.as_str(),
+            "--candidate",
+            &candidate_id,
+            "--candidate-digest",
+            candidate_digest.as_str(),
+            "--request-id",
+            "candidate-cli-roundtrip",
+        ])
+        .unwrap();
+        let store = ConfigStore::open_test(&state_root).unwrap();
+        let replayed_job = store
+            .provider_qualification_job("candidate-cli-roundtrip")
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed_job, job);
+        drop(store);
+        let db = rusqlite::Connection::open(state_root.join("state.sqlite3")).unwrap();
+        let revision_json: String = db
+            .query_row(
+                "SELECT revision_json FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",
+                rusqlite::params![project_id.as_str(), candidate_id, candidate_digest.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut revision: CandidateRevision = serde_json::from_str(&revision_json).unwrap();
+        revision.status = CandidateStatus::Proposed;
+        db
+            .execute(
+                "UPDATE learning_candidates SET status='proposed',revision_json=?4 WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",
+                rusqlite::params![project_id.as_str(), candidate_id, candidate_digest.as_str(), serde_json::to_string(&revision).unwrap()],
+            )
+            .unwrap();
+        drop(db);
+        let mut store = ConfigStore::open_test(&state_root).unwrap();
+        let replay_digest = store
+            .enqueue_provider_qualification(generation, &job.request)
+            .unwrap();
+        assert_eq!(replay_digest, job.request_digest);
+        let mut changed_target = job.request.clone();
+        changed_target.target = Target::Candidate {
+            candidate_id: candidate_id.clone(),
+            candidate_digest: Digest::parse("e".repeat(64)).unwrap(),
+        };
+        assert!(
+            store
+                .enqueue_provider_qualification(generation, &changed_target)
+                .unwrap_err()
+                .contains("reused with different content")
+        );
+        let QualificationClaim::Claimed { job, .. } = store
+            .claim_provider_qualification(generation, 4, 4)
+            .unwrap()
+        else {
+            panic!("candidate CLI request must use the normal qualification claim path");
+        };
+        let resolved = store
+            .resolve_provider_qualification_candidate(&job.request, &applied)
+            .unwrap();
+        assert_eq!(
+            crate::store::agent_profile_digest(&resolved).unwrap(),
+            job.request.profile_digest
+        );
+
+        let proof = crate::launch::QualificationProof {
+            schema_version: crate::launch::QUALIFICATION_SCHEMA_VERSION,
+            probe_id: "fixture-only-candidate-qualification".into(),
+            fixture_digest: Digest::parse("a".repeat(64)).unwrap(),
+            rex_instance_id: "fixture-only".into(),
+            tool_shell_marker_digest: Digest::parse("b".repeat(64)).unwrap(),
+            tool_shell_markers_present: [
+                "REX_PROJECTS_AGENT",
+                "REX_PROJECTS_CONTEXT",
+                "REX_PROJECTS_PROJECT_ID",
+                "REX_PROJECTS_ROLE",
+                "REX_PROJECTS_RUN_ID",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            descendant_marker_digest: Digest::parse("c".repeat(64)).unwrap(),
+            descendant_markers_present: [
+                "REX_PROJECTS_AGENT",
+                "REX_PROJECTS_CONTEXT",
+                "REX_PROJECTS_PROJECT_ID",
+                "REX_PROJECTS_ROLE",
+                "REX_PROJECTS_RUN_ID",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            automatic_turn_result_digest: Digest::parse("d".repeat(64)).unwrap(),
+            automatic_turn_completed: true,
+            structured_result_valid: true,
+            observed_permission_mode: "fixture-only".into(),
+            permission_prompt_count: 0,
+            cleanup_process_tree_digest: Digest::parse("e".repeat(64)).unwrap(),
+            process_tree_absent: true,
+            cleanup_confirmed: true,
+        };
+        let make_receipt = |receipt_profile_id: ProfileId, receipt_profile_digest: Digest| {
+            crate::launch::ProviderQualification {
+                schema_version: crate::launch::QUALIFICATION_SCHEMA_VERSION,
+                project_id: project_id.clone(),
+                profile_id: receipt_profile_id,
+                profile_digest: receipt_profile_digest,
+                adapter: resolved.adapter,
+                executable_path: "/fixture/provider".into(),
+                executable_digest: Digest::parse("f".repeat(64)).unwrap(),
+                provider_version: "fixture-only".into(),
+                permission_mode: "fixture-only".into(),
+                invocation_options_digest: Digest::parse("1".repeat(64)).unwrap(),
+                commit_mode: resolved.commit_mode,
+                proof: proof.clone(),
+                status: crate::launch::QualificationStatus::Verified,
+            }
+        };
+        let baseline_digest = crate::store::agent_profile_digest(&base_profile).unwrap();
+        let baseline = make_receipt(base_profile_id, baseline_digest);
+        store
+            .store_provider_qualification(generation, &baseline)
+            .unwrap();
+        let baseline_json = serde_json::to_string(&baseline).unwrap();
+        assert!(
+            store
+                .finish_provider_qualification_job(
+                    generation,
+                    &job.request.request_id,
+                    JobStatus::Verified,
+                    &baseline_json,
+                    &Digest::parse(format!("{:x}", Sha256::digest(baseline_json.as_bytes())))
+                        .unwrap(),
+                    true,
+                )
+                .is_err()
+        );
+
+        let candidate_receipt = make_receipt(
+            job.request.profile_id.clone(),
+            job.request.profile_digest.clone(),
+        );
+        let receipt_digest = store
+            .store_provider_qualification(generation, &candidate_receipt)
+            .unwrap();
+        let receipt_json = serde_json::to_string(&candidate_receipt).unwrap();
+        store
+            .finish_provider_qualification_job(
+                generation,
+                &job.request.request_id,
+                JobStatus::Verified,
+                &receipt_json,
+                &Digest::parse(format!("{:x}", Sha256::digest(receipt_json.as_bytes()))).unwrap(),
+                true,
+            )
+            .unwrap();
+        drop(store);
+        let reopened = ConfigStore::open_test(&state_root).unwrap();
+        assert_eq!(
+            reopened
+                .provider_qualification_job(&job.request.request_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            JobStatus::Verified,
+        );
+        assert_eq!(
+            reopened
+                .provider_qualification(&receipt_digest)
+                .unwrap()
+                .unwrap(),
+            candidate_receipt
+        );
+    }
+
+    #[test]
     fn doctor_resolves_a_path_with_spaces_without_splitting_it() {
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("agent with spaces");
@@ -4503,6 +5036,7 @@ mod tests {
             profile_digest: crate::store::agent_profile_digest(profile).unwrap(),
             config_revision: revision.0,
             config_digest: applied.digest.clone(),
+            target: crate::store::provider_qualification_runtime::ProviderQualificationTarget::AppliedProfile,
         };
         store
             .enqueue_provider_qualification(generation, &request)

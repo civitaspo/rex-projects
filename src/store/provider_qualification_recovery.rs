@@ -179,6 +179,7 @@ mod tests {
             profile_digest: crate::store::agent_profile_digest(profile).unwrap(),
             config_revision: revision.0,
             config_digest: applied.digest,
+            target: crate::store::provider_qualification_runtime::ProviderQualificationTarget::AppliedProfile,
         };
         store
             .enqueue_provider_qualification(owner_generation, &request)
@@ -201,6 +202,7 @@ mod tests {
             profile_digest: request.profile_digest.clone(),
             config_revision: request.config_revision,
             config_digest: request.config_digest.clone(),
+            target: crate::store::provider_qualification_runtime::ProviderQualificationTarget::AppliedProfile,
         };
         store
             .enqueue_provider_qualification(owner_generation, &queued_request)
@@ -230,6 +232,8 @@ mod tests {
         legacy
             .execute_batch(
                 "DROP TABLE learning_decisions;
+                 DROP TABLE provider_qualification_candidate_targets;
+                 DELETE FROM schema_migrations WHERE version=22;
                  DROP TABLE learning_findings;
                  DROP TABLE learning_batches;
                  DROP TABLE supervisor_topic_publications;
@@ -283,6 +287,14 @@ mod tests {
             .provider_qualification_job(&request.request_id)
             .unwrap()
             .unwrap();
+        assert_eq!(
+            job.request.target,
+            crate::store::provider_qualification_runtime::ProviderQualificationTarget::AppliedProfile
+        );
+        assert_eq!(
+            job.request_digest,
+            crate::store::provider_qualification_runtime::request_digest(&request).unwrap()
+        );
         assert_eq!(
             job.status,
             crate::store::provider_qualification_runtime::ProviderQualificationJobStatus::Unknown

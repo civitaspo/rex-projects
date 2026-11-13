@@ -1864,7 +1864,7 @@ fn candidate_revision_is_pinned(
     digest: &Digest,
 ) -> Result<bool, String> {
     let pinned: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM profile_trial_authorizations a WHERE a.project_id=?1 AND a.candidate_id=?2 AND a.candidate_digest=?3 AND a.lifecycle IN ('pending','authorized')) OR EXISTS(SELECT 1 FROM profile_trial_launches l JOIN profile_trial_authorizations a USING(authorization_id) WHERE a.project_id=?1 AND a.candidate_id=?2 AND a.candidate_digest=?3 AND l.lifecycle IN ('prepared','running','uncertain')) OR EXISTS(SELECT 1 FROM profile_promotions p WHERE p.project_id=?1 AND p.candidate_id=?2 AND p.candidate_digest=?3 AND p.state IN ('approved','publication_pending','published','activation_pending','active')) OR EXISTS(SELECT 1 FROM profile_promotions p JOIN effects e USING(operation_id) WHERE p.project_id=?1 AND p.candidate_id=?2 AND p.candidate_digest=?3 AND e.kind='publish_profile' AND e.status IN ('pending','claimed','uncertain'))",
+        "SELECT EXISTS(SELECT 1 FROM profile_trial_authorizations a WHERE a.project_id=?1 AND a.candidate_id=?2 AND a.candidate_digest=?3 AND a.lifecycle IN ('pending','authorized')) OR EXISTS(SELECT 1 FROM profile_trial_launches l JOIN profile_trial_authorizations a USING(authorization_id) WHERE a.project_id=?1 AND a.candidate_id=?2 AND a.candidate_digest=?3 AND l.lifecycle IN ('prepared','running','uncertain')) OR EXISTS(SELECT 1 FROM profile_promotions p WHERE p.project_id=?1 AND p.candidate_id=?2 AND p.candidate_digest=?3 AND p.state IN ('approved','publication_pending','published','activation_pending','active')) OR EXISTS(SELECT 1 FROM profile_promotions p JOIN effects e USING(operation_id) WHERE p.project_id=?1 AND p.candidate_id=?2 AND p.candidate_digest=?3 AND e.kind='publish_profile' AND e.status IN ('pending','claimed','uncertain')) OR EXISTS(SELECT 1 FROM provider_qualification_candidate_targets t JOIN provider_qualification_jobs q USING(request_id) WHERE t.project_id=?1 AND t.candidate_id=?2 AND t.candidate_digest=?3 AND q.status IN ('queued','running','unknown'))",
         params![project.as_str(), candidate_id, digest.as_str()],
         |row| row.get(0),
     ).map_err(|error| error.to_string())?;
@@ -3836,6 +3836,134 @@ impl ConfigStore {
         }))
     }
 
+    pub(crate) fn resolve_provider_qualification_candidate(
+        &self,
+        request: &crate::store::provider_qualification_runtime::ProviderQualificationRequest,
+        applied: &crate::config::AppliedConfig,
+    ) -> Result<crate::config::Profile, String> {
+        use crate::store::provider_qualification_runtime::ProviderQualificationTarget;
+        let ProviderQualificationTarget::Candidate {
+            candidate_id,
+            candidate_digest,
+        } = &request.target
+        else {
+            return Err("provider qualification request does not target a candidate".into());
+        };
+        if applied.digest != request.config_digest {
+            return Err("candidate qualification config changed after request".into());
+        }
+        let current: Option<(u64, String)> = self
+            .connection
+            .query_row(
+                "SELECT config_revision,config_digest FROM projects WHERE project_id=?1",
+                [request.project_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if current != Some((request.config_revision, request.config_digest.to_string())) {
+            return Err(
+                "candidate qualification request is stale for the current Project config".into(),
+            );
+        }
+        let status: Option<String> = self.connection.query_row(
+            "SELECT status FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",
+            params![request.project_id.as_str(), candidate_id, candidate_digest.as_str()],
+            |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        if status.as_deref() != Some("proposed") {
+            return Err("candidate is no longer eligible for provider qualification".into());
+        }
+        let package = self
+            .learning_candidate_package(&request.project_id, candidate_id, candidate_digest)?
+            .ok_or("exact candidate package is missing")?;
+        if package.revision.status != CandidateStatus::Proposed
+            || package.revision.digest != *candidate_digest
+        {
+            return Err("candidate revision is not the exact proposed target".into());
+        }
+        let metadata: crate::learning::ProfileCandidateMetadata = crate::protocol::parse_unique(
+            package
+                .files
+                .get(crate::learning::PROFILE_CANDIDATE_METADATA_PATH)
+                .ok_or("candidate metadata is missing")?,
+        )?;
+        let rows = package
+            .files
+            .iter()
+            .map(|(path, bytes)| {
+                (
+                    path.clone(),
+                    Digest::parse(format!("{:x}", Sha256::digest(bytes)))
+                        .expect("SHA-256 digest is valid"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let package_json = serde_json::to_string(&rows).map_err(|error| error.to_string())?;
+        validate_profile_candidate_metadata(
+            &request.project_id,
+            &package.revision,
+            &package.profile_id,
+            &package.manifest_digest,
+            &package.files,
+            &package_json,
+            &metadata,
+        )?;
+        let projects = &applied.config.projects;
+        let project = projects
+            .get(&request.project_id)
+            .ok_or("candidate Project is absent from applied config")?;
+        let mut bindings = crate::config::effective_project_roles(&request.project_id, projects)?
+            .into_iter()
+            .collect::<Vec<_>>();
+        for matched in &project.operation_matches {
+            if let Some(recipe) = applied.config.operation_recipes.get(&matched.recipe) {
+                bindings.extend(
+                    recipe
+                        .roles
+                        .iter()
+                        .map(|(role, profile)| (*role, profile.clone())),
+                );
+            }
+        }
+        if !bindings
+            .iter()
+            .any(|(role, profile)| *role == request.role && *profile == metadata.base_profile_id)
+        {
+            return Err("candidate base profile is not bound to this role by the current Project or selected recipe".into());
+        }
+        let base = applied
+            .profiles
+            .get(&metadata.base_profile_id)
+            .ok_or("candidate base profile is absent from applied config")?;
+        if crate::store::agent_profile_digest(base)? != metadata.base_profile_digest
+            || metadata.project_id != request.project_id
+            || metadata.role != request.role
+            || metadata.profile_id != package.profile_id
+            || metadata.config_revision.0 != request.config_revision
+            || metadata.config_digest != request.config_digest
+            || package.revision.project_id != request.project_id
+            || package.revision.role != request.role
+            || package.profile_id != request.profile_id
+        {
+            return Err("candidate package metadata does not match the qualification request and current config".into());
+        }
+        let profile: crate::config::Profile = toml::from_str(
+            std::str::from_utf8(
+                package
+                    .files
+                    .get("config.toml")
+                    .ok_or("candidate config.toml is missing")?,
+            )
+            .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| format!("candidate config.toml is invalid: {error}"))?;
+        if crate::store::agent_profile_digest(&profile)? != request.profile_digest {
+            return Err("candidate profile digest differs from the qualification request".into());
+        }
+        Ok(profile)
+    }
+
     /// Resolve the single currently approval-eligible revision by its stable
     /// candidate ID. Ambiguous IDs fail closed instead of choosing by recency.
     pub fn current_learning_candidate_package(
@@ -5469,6 +5597,7 @@ mod tests {
         profile_trial_review_bundle,
     };
     use crate::store::human::HumanDecisionResult;
+    use crate::store::learning_store::candidate_revision_is_pinned;
     use crate::store::{
         ConfigStore, DurableInput, EffectIntent, ExpectedRevision, OwnerMetadata, ProjectRecord,
         content_digest, durable_input_digest,
@@ -6742,7 +6871,7 @@ mod tests {
             .unwrap();
         assert_eq!(indexed.0, input.findings[0]);
         assert_eq!(indexed.1, receipt.manifest_digest.as_str());
-        store.connection.execute_batch("DROP TABLE supervisor_topic_publications; DELETE FROM schema_migrations WHERE version=21; DELETE FROM schema_migrations WHERE version=20; DROP TABLE learning_decisions; DROP TABLE learning_findings; DROP TABLE learning_batches; DELETE FROM schema_migrations WHERE version=19; PRAGMA user_version=18;").unwrap();
+        store.connection.execute_batch("DROP TABLE provider_qualification_candidate_targets; DELETE FROM schema_migrations WHERE version=22; DROP TABLE supervisor_topic_publications; DELETE FROM schema_migrations WHERE version=21; DELETE FROM schema_migrations WHERE version=20; DROP TABLE learning_decisions; DROP TABLE learning_findings; DROP TABLE learning_batches; DELETE FROM schema_migrations WHERE version=19; PRAGMA user_version=18;").unwrap();
         drop(store);
         let migrated = ConfigStore::open_test(temp.path()).unwrap();
         let backfilled: String = migrated
@@ -7854,7 +7983,7 @@ mod tests {
             generation,
             101,
             &config,
-            config_digest,
+            config_digest.clone(),
             &result,
         )
         .unwrap();
@@ -7981,6 +8110,30 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+        let candidate_profile: crate::config::Profile =
+            toml::from_str(std::str::from_utf8(package.files.get("config.toml").unwrap()).unwrap())
+                .unwrap();
+        let qualification_request =
+            crate::store::provider_qualification_runtime::ProviderQualificationRequest {
+                request_id: "candidate-resolver-fixture".into(),
+                project_id: project.clone(),
+                role: package.revision.role,
+                profile_id: package.profile_id.clone(),
+                profile_digest: crate::store::agent_profile_digest(&candidate_profile).unwrap(),
+                config_revision: config_revision.0,
+                config_digest: config_digest.clone(),
+                target: crate::store::provider_qualification_runtime::ProviderQualificationTarget::Candidate {
+                    candidate_id: candidate_id.clone(),
+                    candidate_digest: Digest::parse(candidate_digest.clone()).unwrap(),
+                },
+            };
+        let resolved_profile = store
+            .resolve_provider_qualification_candidate(&qualification_request, &applied_config)
+            .unwrap();
+        assert_eq!(
+            crate::store::agent_profile_digest(&resolved_profile).unwrap(),
+            qualification_request.profile_digest
+        );
         let metadata: crate::learning::ProfileCandidateMetadata = crate::protocol::parse_unique(
             package
                 .files
@@ -8145,6 +8298,245 @@ mod tests {
             candidate["revision"]["candidate_id"] == other_candidate_id
                 && candidate["revision"]["digest"] == other_candidate_digest.as_str()
         }));
+    }
+
+    #[test]
+    fn nonterminal_provider_qualification_pins_only_its_exact_candidate() {
+        use crate::store::provider_qualification_runtime::{
+            ProviderQualificationJobStatus as JobStatus, ProviderQualificationRequest,
+            ProviderQualificationTarget, QualificationClaim,
+        };
+
+        let (_temp, mut store, project, generation, _) = running_store();
+        let files = BTreeMap::from([("config.toml".to_owned(), b"fixture".to_vec())]);
+        let manifest_digest = crate::learning::manifest_digest(&files).unwrap();
+        let rows = files
+            .iter()
+            .map(|(path, bytes)| {
+                (
+                    path.clone(),
+                    Digest::parse(format!("{:x}", Sha256::digest(bytes))).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let candidate_digest = crate::learning::candidate_revision_digest(&files).unwrap();
+        let record = LearningCandidateRecord {
+            revision: CandidateRevision {
+                candidate_id: "qualification-pinned-candidate".into(),
+                project_id: project.clone(),
+                role: Role::Worker,
+                digest: candidate_digest.clone(),
+                created_at: "2026-11-12T00:00:00Z".into(),
+                expires_at: "2026-11-13T00:00:00Z".into(),
+                status: CandidateStatus::Proposed,
+            },
+            profile_id: ProfileId::parse("qualification-pinned-profile").unwrap(),
+            package_manifest_digest: manifest_digest,
+            package_files_json: serde_json::to_string(&files).unwrap(),
+            package_json: serde_json::to_string(&rows).unwrap(),
+            expected_pairs: 5,
+        };
+        store
+            .register_learning_candidate(generation, &record)
+            .unwrap();
+        let project_record = store.project(&project).unwrap().unwrap();
+        let request = ProviderQualificationRequest {
+            request_id: "qualification-candidate-pin".into(),
+            project_id: project.clone(),
+            role: Role::Worker,
+            profile_id: record.profile_id.clone(),
+            profile_digest: Digest::parse("a".repeat(64)).unwrap(),
+            config_revision: project_record.config_revision.0,
+            config_digest: project_record.config_digest,
+            target: ProviderQualificationTarget::Candidate {
+                candidate_id: record.revision.candidate_id.clone(),
+                candidate_digest: candidate_digest.clone(),
+            },
+        };
+        store
+            .enqueue_provider_qualification(generation, &request)
+            .unwrap();
+        let tx = store.connection.transaction().unwrap();
+        assert!(
+            candidate_revision_is_pinned(
+                &tx,
+                &project,
+                &record.revision.candidate_id,
+                &candidate_digest,
+            )
+            .unwrap()
+        );
+        tx.rollback().unwrap();
+        let QualificationClaim::Claimed { .. } = store
+            .claim_provider_qualification(generation, 4, 4)
+            .unwrap()
+        else {
+            panic!("queued candidate qualification must be claimable");
+        };
+        store
+            .mark_provider_qualification_unknown(generation, &request.request_id)
+            .unwrap();
+        let tx = store.connection.transaction().unwrap();
+        assert!(
+            candidate_revision_is_pinned(
+                &tx,
+                &project,
+                &record.revision.candidate_id,
+                &candidate_digest,
+            )
+            .unwrap()
+        );
+        tx.rollback().unwrap();
+        let failed_result = "{}";
+        store
+            .finish_provider_qualification_job(
+                generation,
+                &request.request_id,
+                JobStatus::Failed,
+                failed_result,
+                &Digest::parse(format!("{:x}", Sha256::digest(failed_result.as_bytes()))).unwrap(),
+                true,
+            )
+            .unwrap();
+        let tx = store.connection.transaction().unwrap();
+        assert!(
+            !candidate_revision_is_pinned(
+                &tx,
+                &project,
+                &record.revision.candidate_id,
+                &candidate_digest,
+            )
+            .unwrap()
+        );
+        tx.rollback().unwrap();
+    }
+
+    #[test]
+    fn candidate_qualification_enqueue_checks_status_atomically_and_replays_exact_request() {
+        use crate::store::provider_qualification_runtime::{
+            ProviderQualificationRequest, ProviderQualificationTarget,
+        };
+
+        let (_temp, mut store, project, generation, _) = running_store();
+        let files = BTreeMap::from([("config.toml".to_owned(), b"fixture".to_vec())]);
+        let manifest_digest = crate::learning::manifest_digest(&files).unwrap();
+        let rows = files
+            .iter()
+            .map(|(path, bytes)| {
+                (
+                    path.clone(),
+                    Digest::parse(format!("{:x}", Sha256::digest(bytes))).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let candidate_digest = crate::learning::candidate_revision_digest(&files).unwrap();
+        let record = LearningCandidateRecord {
+            revision: CandidateRevision {
+                candidate_id: "qualification-atomicity-candidate".into(),
+                project_id: project.clone(),
+                role: Role::Worker,
+                digest: candidate_digest.clone(),
+                created_at: "2026-11-12T00:00:00Z".into(),
+                expires_at: "2026-11-13T00:00:00Z".into(),
+                status: CandidateStatus::Proposed,
+            },
+            profile_id: ProfileId::parse("qualification-atomicity-profile").unwrap(),
+            package_manifest_digest: manifest_digest,
+            package_files_json: serde_json::to_string(&files).unwrap(),
+            package_json: serde_json::to_string(&rows).unwrap(),
+            expected_pairs: 5,
+        };
+        store
+            .register_learning_candidate(generation, &record)
+            .unwrap();
+        let project_record = store.project(&project).unwrap().unwrap();
+        let request = ProviderQualificationRequest {
+            request_id: "qualification-atomicity-request".into(),
+            project_id: project.clone(),
+            role: Role::Worker,
+            profile_id: record.profile_id.clone(),
+            profile_digest: Digest::parse("a".repeat(64)).unwrap(),
+            config_revision: project_record.config_revision.0,
+            config_digest: project_record.config_digest,
+            target: ProviderQualificationTarget::Candidate {
+                candidate_id: record.revision.candidate_id.clone(),
+                candidate_digest: candidate_digest.clone(),
+            },
+        };
+
+        let tx = store.connection.transaction().unwrap();
+        super::set_candidate_revision_status(
+            &tx,
+            &project,
+            &record.revision.candidate_id,
+            &candidate_digest,
+            CandidateStatus::Expired,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert!(
+            store
+                .enqueue_provider_qualification(generation, &request)
+                .unwrap_err()
+                .contains("proposed")
+        );
+        assert!(
+            store
+                .provider_qualification_job(&request.request_id)
+                .unwrap()
+                .is_none()
+        );
+        let candidate_target_count: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM provider_qualification_candidate_targets WHERE request_id=?1",
+                [&request.request_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(candidate_target_count, 0);
+
+        let tx = store.connection.transaction().unwrap();
+        super::set_candidate_revision_status(
+            &tx,
+            &project,
+            &record.revision.candidate_id,
+            &candidate_digest,
+            CandidateStatus::Proposed,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let digest = store
+            .enqueue_provider_qualification(generation, &request)
+            .unwrap();
+        let tx = store.connection.transaction().unwrap();
+        super::set_candidate_revision_status(
+            &tx,
+            &project,
+            &record.revision.candidate_id,
+            &candidate_digest,
+            CandidateStatus::Expired,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(
+            store
+                .enqueue_provider_qualification(generation, &request)
+                .unwrap(),
+            digest
+        );
+        let mut changed = request.clone();
+        changed.target = ProviderQualificationTarget::Candidate {
+            candidate_id: record.revision.candidate_id,
+            candidate_digest: Digest::parse("e".repeat(64)).unwrap(),
+        };
+        assert!(
+            store
+                .enqueue_provider_qualification(generation, &changed)
+                .unwrap_err()
+                .contains("reused with different content")
+        );
     }
 
     #[test]
@@ -9016,6 +9408,8 @@ mod tests {
                SELECT operation_id,project_id,topic_key,destination_root,intent_json,intent_digest,state,receipt_json,receipt_digest,conflict_json,created_at_unix,published_at_unix FROM supervisor_topic_publications_v21;
              DROP TABLE supervisor_topic_publications_v21;
              CREATE INDEX supervisor_topic_publications_project ON supervisor_topic_publications(project_id,state,created_at_unix DESC,topic_key);
+             DROP TABLE provider_qualification_candidate_targets;
+             DELETE FROM schema_migrations WHERE version=22;
              DELETE FROM schema_migrations WHERE version=21;
              PRAGMA user_version=20;"
         ).unwrap();
@@ -9026,7 +9420,7 @@ mod tests {
                 .connection
                 .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap(),
-            21
+            22
         );
         let migrated_json: String = migrated
             .connection
