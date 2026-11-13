@@ -291,6 +291,49 @@ fn resolve_topic_source(
     }))
 }
 
+fn validate_topic_sources_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    project_id: &ProjectId,
+    destination_root: &std::path::Path,
+    sources: &[crate::topic::TopicSourceProof],
+) -> Result<(), String> {
+    for source in sources {
+        if resolve_topic_source(tx, project_id, &source.finding_id)?.as_ref() != Some(source) {
+            return Err(format!(
+                "Topic source Finding `{}` no longer matches its published provenance",
+                source.finding_id
+            ));
+        }
+        let ticket_run_id = TicketRunId::parse(source.ticket_run_id.clone())?;
+        let publications = published_knowledge_from(tx, project_id, Some(&ticket_run_id), 1)?;
+        let publication = publications
+            .first()
+            .filter(|publication| {
+                publication.input.ticket_run_id == ticket_run_id
+                    && publication.manifest_digest == source.publication_digest
+            })
+            .ok_or_else(|| {
+                format!(
+                    "Topic source Finding `{}` has no matching published Postmortem",
+                    source.finding_id
+                )
+            })?;
+        crate::knowledge::validate_publication(
+            destination_root,
+            &publication.input,
+            &publication.manifest,
+            &publication.manifest_digest,
+        )
+        .map_err(|error| {
+            format!(
+                "Topic source Finding `{}` is unavailable under its destination root: {error}",
+                source.finding_id
+            )
+        })?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LearningFinding {
     pub id: Digest,
@@ -561,6 +604,16 @@ fn supervisor_learning_snapshot_in_transaction(
             {
                 return Err("stored Supervisor Topic revision predecessor is inconsistent".into());
             }
+        }
+        if validate_topic_sources_in_transaction(
+            tx,
+            project,
+            &intent.destination_root,
+            &intent.sources,
+        )
+        .is_err()
+        {
+            continue;
         }
         topics.push(SupervisorTopicEntry {
             topic_key: intent.key,
@@ -2183,6 +2236,65 @@ pub(crate) fn validate_v10_schema(connection: &Connection) -> Result<(), String>
     Ok(())
 }
 
+fn published_knowledge_from(
+    connection: &Connection,
+    project: &ProjectId,
+    ticket_run: Option<&TicketRunId>,
+    limit: usize,
+) -> Result<Vec<PublishedKnowledgeRecord>, String> {
+    const MAX_ITEMS: usize = 100;
+    if limit == 0 || limit > MAX_ITEMS {
+        return Err(format!(
+            "knowledge result limit must be between 1 and {MAX_ITEMS}"
+        ));
+    }
+    let ticket_run_filter = ticket_run.map(TicketRunId::as_str);
+    let mut statement = connection.prepare(
+        "SELECT ticket_run_id,request_digest,request_json,manifest_json,manifest_digest FROM knowledge_publications WHERE project_id=?1 AND state='published' AND (?2 IS NULL OR ticket_run_id=?2) ORDER BY created_at_unix DESC,ticket_run_id DESC LIMIT ?3",
+    ).map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(
+            params![project.as_str(), ticket_run_filter, limit as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let mut publications = Vec::new();
+    for row in rows {
+        let (ticket_run_id, request_digest, request_json, manifest_json, manifest_digest) =
+            row.map_err(|error| error.to_string())?;
+        verify_digest(&request_json, &Digest::parse(request_digest)?)?;
+        let input: PostmortemInput = crate::protocol::parse_unique(request_json.as_bytes())?;
+        validate_postmortem_input(&input).map_err(|error| error.to_string())?;
+        let manifest: PublicationManifest =
+            crate::protocol::parse_unique(manifest_json.as_bytes())?;
+        let manifest_digest = Digest::parse(manifest_digest)?;
+        let canonical_manifest = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
+        if input.project_id != *project
+            || input.ticket_run_id.as_str() != ticket_run_id
+            || manifest.project_id != *project
+            || manifest.ticket_run_id.as_str() != ticket_run_id
+            || manifest.operation_id != input.operation_id
+            || format!("{:x}", Sha256::digest(&canonical_manifest)) != manifest_digest.as_str()
+        {
+            return Err("stored knowledge publication has invalid provenance".into());
+        }
+        publications.push(PublishedKnowledgeRecord {
+            input,
+            manifest,
+            manifest_digest,
+        });
+    }
+    Ok(publications)
+}
+
 impl ConfigStore {
     /// Read the committed publications for one Project through the typed store API.
     pub fn published_knowledge(
@@ -2191,57 +2303,25 @@ impl ConfigStore {
         ticket_run: Option<&TicketRunId>,
         limit: usize,
     ) -> Result<Vec<PublishedKnowledgeRecord>, String> {
-        const MAX_ITEMS: usize = 100;
-        if limit == 0 || limit > MAX_ITEMS {
-            return Err(format!(
-                "knowledge result limit must be between 1 and {MAX_ITEMS}"
-            ));
-        }
-        let ticket_run_filter = ticket_run.map(TicketRunId::as_str);
-        let mut statement = self.connection.prepare(
-            "SELECT ticket_run_id,request_digest,request_json,manifest_json,manifest_digest FROM knowledge_publications WHERE project_id=?1 AND state='published' AND (?2 IS NULL OR ticket_run_id=?2) ORDER BY created_at_unix DESC,ticket_run_id DESC LIMIT ?3",
-        ).map_err(|error| error.to_string())?;
-        let rows = statement
-            .query_map(
-                params![project.as_str(), ticket_run_filter, limit as i64],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                    ))
-                },
-            )
+        published_knowledge_from(&self.connection, project, ticket_run, limit)
+    }
+
+    pub(crate) fn validate_topic_sources_at(
+        &mut self,
+        project: &ProjectId,
+        destination_root: &std::path::Path,
+        sources: &[crate::topic::TopicSourceProof],
+    ) -> Result<(), String> {
+        let tx = self
+            .connection
+            .transaction()
             .map_err(|error| error.to_string())?;
-        let mut publications = Vec::new();
-        for row in rows {
-            let (ticket_run_id, request_digest, request_json, manifest_json, manifest_digest) =
-                row.map_err(|error| error.to_string())?;
-            verify_digest(&request_json, &Digest::parse(request_digest)?)?;
-            let input: PostmortemInput = crate::protocol::parse_unique(request_json.as_bytes())?;
-            validate_postmortem_input(&input).map_err(|error| error.to_string())?;
-            let manifest: PublicationManifest =
-                crate::protocol::parse_unique(manifest_json.as_bytes())?;
-            let manifest_digest = Digest::parse(manifest_digest)?;
-            let canonical_manifest = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
-            if input.project_id != *project
-                || input.ticket_run_id.as_str() != ticket_run_id
-                || manifest.project_id != *project
-                || manifest.ticket_run_id.as_str() != ticket_run_id
-                || manifest.operation_id != input.operation_id
-                || format!("{:x}", Sha256::digest(&canonical_manifest)) != manifest_digest.as_str()
-            {
-                return Err("stored knowledge publication has invalid provenance".into());
-            }
-            publications.push(PublishedKnowledgeRecord {
-                input,
-                manifest,
-                manifest_digest,
-            });
+        if let Err(reason) =
+            validate_topic_sources_in_transaction(&tx, project, destination_root, sources)
+        {
+            return Err(reason.chars().take(512).collect());
         }
-        Ok(publications)
+        tx.commit().map_err(|error| error.to_string())
     }
 
     /// Resolve the exact immutable profile-trial authorization for a pending human request.
@@ -9495,6 +9575,306 @@ mod tests {
                 .relative_path,
             format!("projects/{}/topics/{}.md", project, intent.key.as_str())
         );
+    }
+
+    #[test]
+    fn topic_publication_waits_until_exact_source_bytes_exist_at_new_root() {
+        let LearningDispatchFixture {
+            _temp,
+            mut store,
+            project,
+            generation,
+            result,
+            config,
+            config_digest,
+            ..
+        } = learning_dispatch_fixture_with_topic(
+            crate::engine::orchestration::AgentAssertion::Succeeded,
+            false,
+            false,
+            None,
+            true,
+            None,
+        );
+        let root_a = std::path::PathBuf::from(&config.knowledge.as_ref().unwrap().root);
+        let root_b = _temp.path().join("moved-knowledge-root");
+        crate::engine::factory_runtime::tests::apply_agent_result_with_topic_root_for_test(
+            &mut store,
+            generation,
+            101,
+            &config,
+            config_digest,
+            &result,
+            Some(root_b.clone()),
+        )
+        .unwrap();
+        let operation_id: String = store
+            .connection
+            .query_row(
+                "SELECT operation_id FROM supervisor_topic_publications WHERE project_id=?1",
+                [project.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let operation = OperationId::parse(operation_id.clone()).unwrap();
+        let intent = store.supervisor_topic_intent(&operation).unwrap().unwrap();
+        let run_hash = format!(
+            "{:x}",
+            Sha256::digest(intent.sources[0].ticket_run_id.as_bytes())
+        );
+        let relative_source = format!("projects/{project}/postmortems/{run_hash}.md");
+        let source_a = root_a.join(&relative_source);
+        let source_b = root_b.join(&relative_source);
+        let source_bytes = fs::read(&source_a).unwrap();
+        assert!(!source_b.exists());
+
+        let handler = crate::topic_effect::TopicEffectHandler::new(root_b.clone());
+        let limits = crate::effects::EffectLimits {
+            max_attempts: 3,
+            max_age: std::time::Duration::from_secs(3600),
+            retry_base: std::time::Duration::from_secs(1),
+            retry_max: std::time::Duration::from_secs(8),
+        };
+        assert!(matches!(
+            crate::effects::EffectDispatcher::tick(
+                &mut store,
+                generation,
+                102,
+                &[&handler],
+                limits,
+            )
+            .unwrap(),
+            crate::effects::DispatchTick::WaitingForReconciliation { .. }
+        ));
+        assert!(
+            store
+                .supervisor_topic_receipt(&operation)
+                .unwrap()
+                .is_none()
+        );
+        let pending_receipt: String = store
+            .connection
+            .query_row(
+                "SELECT receipt_json FROM effects WHERE operation_id=?1",
+                [&operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let pending_receipt: serde_json::Value =
+            crate::protocol::parse_unique(pending_receipt.as_bytes()).unwrap();
+        assert_eq!(pending_receipt["state"], "source_unavailable");
+        assert!(
+            pending_receipt["reason"]
+                .as_str()
+                .unwrap()
+                .contains(&intent.sources[0].finding_id.to_string())
+        );
+        let topic_state: String = store
+            .connection
+            .query_row(
+                "SELECT state FROM supervisor_topic_publications WHERE operation_id=?1",
+                [&operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(topic_state, "pending");
+
+        fs::create_dir_all(source_b.parent().unwrap()).unwrap();
+        fs::write(&source_b, b"wrong Postmortem bytes").unwrap();
+        drop(store);
+        let mut store = ConfigStore::open_test(_temp.path()).unwrap();
+        let generation = store
+            .start_owner(&super::super::OwnerMetadata {
+                owner_nonce: "topic-source-replay".into(),
+                state_root: _temp.path().display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "test-restart".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            crate::effects::EffectDispatcher::tick(
+                &mut store,
+                generation,
+                103,
+                &[&handler],
+                limits,
+            )
+            .unwrap(),
+            crate::effects::DispatchTick::WaitingForReconciliation { .. }
+        ));
+        assert!(
+            store
+                .supervisor_topic_receipt(&operation)
+                .unwrap()
+                .is_none()
+        );
+        fs::write(&source_b, &source_bytes).unwrap();
+        assert_eq!(fs::read(&source_b).unwrap(), source_bytes);
+        assert!(matches!(
+            crate::effects::EffectDispatcher::tick(
+                &mut store,
+                generation,
+                105,
+                &[&handler],
+                limits,
+            )
+            .unwrap(),
+            crate::effects::DispatchTick::Completed { .. }
+        ));
+        assert!(
+            store
+                .supervisor_topic_receipt(&operation)
+                .unwrap()
+                .is_some()
+        );
+        let topic_path = root_b.join(format!(
+            "projects/{project}/topics/{}.md",
+            intent.key.as_str()
+        ));
+        let cited_source = topic_path
+            .parent()
+            .unwrap()
+            .join(format!("../postmortems/{run_hash}.md"));
+        assert_eq!(fs::read(cited_source).unwrap(), source_bytes);
+    }
+
+    #[test]
+    fn missing_published_source_preserves_receipt_and_is_omitted_from_context() {
+        let LearningDispatchFixture {
+            _temp,
+            mut store,
+            project,
+            generation,
+            result,
+            config,
+            config_digest,
+            ..
+        } = learning_dispatch_fixture_with_topic(
+            crate::engine::orchestration::AgentAssertion::Succeeded,
+            false,
+            false,
+            None,
+            true,
+            None,
+        );
+        let root = std::path::PathBuf::from(&config.knowledge.as_ref().unwrap().root);
+        crate::engine::factory_runtime::tests::apply_agent_result_with_topic_root_for_test(
+            &mut store,
+            generation,
+            101,
+            &config,
+            config_digest,
+            &result,
+            Some(root.clone()),
+        )
+        .unwrap();
+        let operation_id: String = store
+            .connection
+            .query_row(
+                "SELECT operation_id FROM supervisor_topic_publications WHERE project_id=?1",
+                [project.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let operation = OperationId::parse(operation_id.clone()).unwrap();
+        let intent = store.supervisor_topic_intent(&operation).unwrap().unwrap();
+        let handler = crate::topic_effect::TopicEffectHandler::new(root.clone());
+        let limits = crate::effects::EffectLimits {
+            max_attempts: 3,
+            max_age: std::time::Duration::from_secs(3600),
+            retry_base: std::time::Duration::from_secs(1),
+            retry_max: std::time::Duration::from_secs(8),
+        };
+        assert!(matches!(
+            crate::effects::EffectDispatcher::tick(
+                &mut store,
+                generation,
+                102,
+                &[&handler],
+                limits,
+            )
+            .unwrap(),
+            crate::effects::DispatchTick::Completed { .. }
+        ));
+        let receipt = store.supervisor_topic_receipt(&operation).unwrap().unwrap();
+        let run_hash = format!(
+            "{:x}",
+            Sha256::digest(intent.sources[0].ticket_run_id.as_bytes())
+        );
+        let source_path = root.join(format!("projects/{project}/postmortems/{run_hash}.md"));
+        let source_bytes = fs::read(&source_path).unwrap();
+        fs::remove_file(&source_path).unwrap();
+
+        let effect = store
+            .effect_by_logical_key(&format!("topic-create:{project}:{}", intent.key.as_str()))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            handler.execute(&mut store, generation, &effect),
+            Err(crate::topic::TopicPublicationError::SourceUnavailable(_))
+        ));
+        assert_eq!(
+            store.supervisor_topic_receipt(&operation).unwrap(),
+            Some(receipt.clone())
+        );
+        let missing = store
+            .maintain_project_supervisor_learning(
+                generation,
+                &project,
+                "2026-11-08T00:00:00Z",
+                12,
+                Some(&root),
+            )
+            .unwrap();
+        assert!(missing.topics.is_empty());
+        assert_eq!(missing.omitted_topics, 1);
+
+        fs::write(&source_path, b"tampered Postmortem bytes").unwrap();
+        assert!(matches!(
+            handler.execute(&mut store, generation, &effect),
+            Err(crate::topic::TopicPublicationError::SourceUnavailable(_))
+        ));
+        assert!(
+            store
+                .maintain_project_supervisor_learning(
+                    generation,
+                    &project,
+                    "2026-11-08T00:00:00Z",
+                    12,
+                    Some(&root),
+                )
+                .unwrap()
+                .topics
+                .is_empty()
+        );
+
+        fs::write(&source_path, &source_bytes).unwrap();
+        assert!(
+            store
+                .validate_topic_sources_at(&project, &root, &intent.sources)
+                .is_ok()
+        );
+        assert_eq!(
+            handler.execute(&mut store, generation, &effect).unwrap(),
+            receipt
+        );
+        let restored = store
+            .maintain_project_supervisor_learning(
+                generation,
+                &project,
+                "2026-11-08T00:00:00Z",
+                12,
+                Some(&root),
+            )
+            .unwrap();
+        assert_eq!(restored.topics.len(), 1);
+        assert_eq!(restored.topics[0].content, intent.content);
     }
 
     #[test]

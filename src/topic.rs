@@ -126,13 +126,16 @@ pub struct TopicReceipt {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TopicPublicationError {
     Conflict(String),
+    SourceUnavailable(String),
     Failure(String),
 }
 
 impl std::fmt::Display for TopicPublicationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Conflict(reason) | Self::Failure(reason) => formatter.write_str(reason),
+            Self::Conflict(reason) | Self::SourceUnavailable(reason) | Self::Failure(reason) => {
+                formatter.write_str(reason)
+            }
         }
     }
 }
