@@ -5745,7 +5745,7 @@ fn runtime_owner_projection_matches(
     let identity = process_identity_for_pid(pid)
         .map_err(|error| format!("inspect controller process birth identity: {error:?}"))?
         .filter(|identity| {
-            identity.start_identity == start_identity
+            owner_projection_start_identity_matches(identity, start_identity)
                 && identity.quality == ProcessIdentityQuality::KernelBirthToken
         })
         .ok_or("controller process no longer matches its owner projection")?;
@@ -5763,6 +5763,19 @@ fn runtime_owner_projection_matches(
         return Err("controller executable image differs from the pinned product digest".into());
     }
     Ok(identity)
+}
+
+fn owner_projection_start_identity_matches(
+    identity: &ProcessIdentity,
+    projected_identity: &str,
+) -> bool {
+    #[cfg(target_os = "macos")]
+    let identity = identity.start_identity.strip_prefix("macos-start:");
+    #[cfg(target_os = "linux")]
+    let identity = identity.start_identity.strip_prefix("linux-start-ticks:");
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let identity: Option<&str> = None;
+    identity == Some(projected_identity)
 }
 
 fn verify_public_controller_status(
@@ -6498,6 +6511,186 @@ mod tests {
             .nth(19)
             .unwrap()
             .to_owned()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_owner_projection_consumer_accepts_public_runtime_output() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+
+        struct ControllerGuard(std::process::Child);
+
+        impl ControllerGuard {
+            fn wait(&mut self, timeout: Duration) -> std::process::ExitStatus {
+                let deadline = Instant::now() + timeout;
+                loop {
+                    if let Some(status) = self.0.try_wait().unwrap() {
+                        return status;
+                    }
+                    assert!(Instant::now() < deadline, "fixture controller did not stop");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+
+        impl Drop for ControllerGuard {
+            fn drop(&mut self) {
+                if matches!(self.0.try_wait(), Ok(None)) {
+                    if let Ok(processes) = inspect_process_table() {
+                        let _ = rex_projects::process::signal_process_group_if_observed(
+                            self.0.id(),
+                            &processes,
+                            &processes,
+                            rex_projects::process::ProcessSignal::Kill,
+                        );
+                    }
+                    let _ = self.0.kill();
+                }
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while matches!(self.0.try_wait(), Ok(None)) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let fixture = temporary.path();
+        let state_root = fixture.join("state");
+        fs::create_dir(&state_root).unwrap();
+        let current_exe = std::env::current_exe().unwrap();
+        let xtask_executable = current_exe.clone();
+        let product_cli = current_exe
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("rex-projects");
+        assert!(product_cli.is_file(), "build the production CLI first");
+        let rex = fixture.join("rex");
+        fs::write(
+            &rex,
+            r##"#!/bin/sh
+case "$*" in
+  *whoami*) printf '%s\n' '{"endpoint":"http://fixture","instance_id":"fixture-owner-server","host_id":"fixture-host","rex_version":"test"}' ;;
+  *"api list"*) printf '%s\n' '{"methods":{"session.view":{},"session.new_window":{},"session.new_split":{},"session.focus_block":{},"session.zoom_block":{},"block.close":{}}}' ;;
+  *"api call session.view"*) printf '%s\n' '{"session_id":"projection-session","windows":[{"window_id":"fixture-window","layers":[{"blocks":[{"block_id":"fixture-controller-block","label":"runtime-owner-projection-test","flavor":"shell"}]}]}]}' ;;
+  *"events -s projection-session --json"*) exec /bin/sleep 2 ;;
+  *) exit 0 ;;
+esac
+"##,
+        )
+        .unwrap();
+        fs::set_permissions(&rex, fs::Permissions::from_mode(0o700)).unwrap();
+        let request = Request {
+            cli: &product_cli,
+            rex: &rex,
+            rex_server: "http://fixture",
+            rex_session: "projection-session",
+            expected_instance: "fixture-owner-server",
+            fixture_root: fixture,
+        };
+        prepare_profiles(
+            &request,
+            &xtask_executable,
+            &product_cli,
+            ProfilePreparation::default(),
+        )
+        .unwrap();
+        fs::write(
+            fixture.join("config.toml"),
+            config_text(&request, &xtask_executable, false),
+        )
+        .unwrap();
+        let applied = product(&request, &state_root, &["config", "apply", "--bootstrap"]).unwrap();
+        require_success("bootstrap runtime owner fixture", &applied).unwrap();
+
+        let mut command = std::process::Command::new(&product_cli);
+        command
+            .args([
+                "--config",
+                fixture.join("config.toml").to_str().unwrap(),
+                "--state-root",
+                state_root.to_str().unwrap(),
+                "runtime",
+                "run",
+                "--rex-server",
+                "http://fixture",
+            ])
+            .env("REX_SESSION", request.rex_session)
+            .env("REX_BLOCK", "fixture-controller-block")
+            .env("XDG_STATE_HOME", fixture.join("xdg-state"))
+            .env_remove("REX_PROJECTS_AGENT")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .process_group(0);
+        let mut controller = ControllerGuard(command.spawn().unwrap());
+        let controller_identity = process_identity_for_pid(controller.0.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            controller_identity.process_group_id,
+            controller.0.id(),
+            "test controller must own the process group used by scoped cleanup"
+        );
+        let projection_path = state_root.join("runtime-owner.json");
+        let startup_deadline = Instant::now() + Duration::from_secs(10);
+        while !projection_path.is_file() && Instant::now() < startup_deadline {
+            if let Some(status) = controller.0.try_wait().unwrap() {
+                panic!("fixture controller exited before projection: {status}");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            projection_path.is_file(),
+            "public runtime did not write {} (state entries: {:?})",
+            projection_path.display(),
+            fs::read_dir(&state_root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>()
+        );
+        let projection: Value =
+            serde_json::from_slice(&fs::read(&projection_path).unwrap()).unwrap();
+        let generation = projection["generation"].as_u64().unwrap();
+        assert_eq!(
+            projection["pid"].as_u64(),
+            Some(u64::from(controller.0.id()))
+        );
+        let status = product(&request, &state_root, &["--json", "status"]).unwrap();
+        require_success("read public runtime owner status", &status).unwrap();
+        let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(status.pointer("/owner/active"), Some(&Value::Bool(true)));
+        assert_eq!(
+            status.pointer("/owner/generation").and_then(Value::as_u64),
+            Some(generation)
+        );
+        let observed = runtime_owner_projection_matches(&request, &state_root, generation).unwrap();
+        assert_eq!(observed.pid, controller.0.id());
+        assert_eq!(observed.quality, ProcessIdentityQuality::KernelBirthToken);
+
+        let wrong_state_root = fixture.join("wrong-owner-projection");
+        fs::create_dir(&wrong_state_root).unwrap();
+        let mut wrong_projection = projection;
+        wrong_projection["state_root"] = json!(wrong_state_root.to_string_lossy());
+        wrong_projection["process_start_identity"] = json!("not-the-controller-birth-token");
+        fs::write(
+            wrong_state_root.join("runtime-owner.json"),
+            serde_json::to_vec(&wrong_projection).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime_owner_projection_matches(&request, &wrong_state_root, generation).unwrap_err(),
+            "controller process no longer matches its owner projection"
+        );
+
+        let stopped = product(
+            &request,
+            &state_root,
+            &["runtime", "stop", "--request-id", "owner-projection-stop"],
+        )
+        .unwrap();
+        require_success("stop fixture runtime controller", &stopped).unwrap();
+        assert!(controller.wait(Duration::from_secs(10)).success());
     }
 
     fn fixture_body_receipt(

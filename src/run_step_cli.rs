@@ -2211,7 +2211,8 @@ while (! -e $ARGV[0]) { select undef, undef, undef, 0.05; }
         use crate::engine::factory_runtime::FactoryRuntimeObservationServices;
         use crate::runtime_services::{RuntimeExecutable, RuntimeServices};
         use crate::store::agent_runtime::tests::{
-            prepared_anchored_block_loss_fixture, test_execution_slot_disposition,
+            prepared_anchored_block_loss_fixture, test_agent_launch_states,
+            test_execution_slot_disposition,
         };
 
         let root = tempdir().unwrap();
@@ -2314,8 +2315,20 @@ esac
             )
             .env(BLOCK_LOSS_GRACE_ENV, "1")
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            shim_command.process_group(0);
+        }
         let mut shim = BlockLossChildGuard::new(shim_command.spawn().unwrap(), spool.clone());
+        assert_eq!(
+            shim.child_identity
+                .as_ref()
+                .map(|identity| identity.process_group_id),
+            Some(shim.child.id()),
+            "guarded run-step child must own a private process group for cleanup"
+        );
         let start_deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !anchor_marker.exists() {
             assert!(
@@ -2428,6 +2441,13 @@ esac
             test_execution_slot_disposition(&fixture.store, &fixture.slot_owner_id),
             "live"
         );
+        let recovery_run = fixture
+            .store
+            .recoverable_agent_runs(fixture.generation, 8)
+            .unwrap()
+            .into_iter()
+            .find(|run| run.agent_run_id == fixture.authority.agent_run_id)
+            .expect("the accepted run must be available before block loss");
         assert_eq!(
             crate::process::process_identity_for_pid(reader_identity.pid)
                 .unwrap()
@@ -2506,6 +2526,7 @@ esac
         let recovery_deadline = std::time::Instant::now() + Duration::from_secs(20);
         let mut reconnected = false;
         let mut matching_terminal_proof = false;
+        let mut verified_cancelled_writer_may_be_terminated = false;
         while std::time::Instant::now() < recovery_deadline {
             let report = FactoryRuntimeObservationServices::recover_agents(
                 &mut services,
@@ -2525,13 +2546,70 @@ esac
             let slot = test_execution_slot_disposition(&fixture.store, &fixture.slot_owner_id);
             if slot == "released" {
                 let family = spool.read_run_family_record().unwrap().unwrap();
-                let result = spool.read_turn_result(&start).unwrap();
                 assert_eq!(family.coverage, RunFamilyCoverage::Complete);
                 wait_for_family_absence(&family);
-                assert!(matches!(
-                    result.receipt.outcome,
-                    crate::run_step::TurnOutcome::Cancelled
-                ));
+                let cleanup = spool
+                    .read_block_loss_cleanup_snapshot()
+                    .unwrap()
+                    .expect("recovery must persist its exact absence proof");
+                assert_eq!(cleanup.agent_run_id, fixture.authority.agent_run_id);
+                assert_eq!(cleanup.reservation_epoch, fixture.reservation.project_epoch);
+                assert!(
+                    crate::process::matching_processes(
+                        &cleanup.process_tree,
+                        &crate::process::inspect_process_table().unwrap()
+                    )
+                    .is_empty()
+                );
+                let child_status = shim.wait_bounded(Duration::from_secs(5)).unwrap();
+                let mut child_stderr = String::new();
+                if let Some(mut pipe) = shim.child.stderr.take() {
+                    use std::io::Read;
+                    pipe.read_to_string(&mut child_stderr).unwrap();
+                }
+                match spool.read_turn_result(&start) {
+                    Ok(result) => {
+                        assert!(matches!(
+                            result.receipt.outcome,
+                            crate::run_step::TurnOutcome::Cancelled
+                        ));
+                        result.validate_for(&start).unwrap();
+                        assert_eq!(result.receipt.processes.len(), family.process_tree.len());
+                        assert!(
+                            family.process_tree.iter().all(|identity| {
+                                result.receipt.processes.iter().any(|observed| {
+                                    observed.pid == identity.pid
+                                        && observed.parent_pid == identity.parent_pid
+                                        && observed.process_group_id == identity.process_group_id
+                                        && observed.start_identity == identity.start_identity
+                                        && observed.identity_quality == "kernel_birth_token"
+                                })
+                            }),
+                            "cancelled receipt must bind the complete family"
+                        );
+                        verified_cancelled_writer_may_be_terminated = true;
+                        if !cleanup.cleanup_covered {
+                            assert_eq!(recovery_run.agent_state, "running");
+                            assert_eq!(recovery_run.launch_state, "running");
+                        }
+                    }
+                    Err(error)
+                        if error == "run-step spool file is not present"
+                            && cleanup.cleanup_covered =>
+                    {
+                        use std::os::unix::process::ExitStatusExt;
+                        assert!(
+                            matches!(child_status.signal(), Some(libc::SIGTERM | libc::SIGKILL)),
+                            "missing result requires covered absence proof and expected writer cancellation; status={child_status}, stderr={child_stderr}"
+                        );
+                        verified_cancelled_writer_may_be_terminated = true;
+                    }
+                    Err(error) => panic!("read terminal run-step result: {error}"),
+                }
+                assert_eq!(
+                    test_agent_launch_states(&fixture.store, &fixture.slot_owner_id),
+                    ("cancelled".into(), fixture.generation, "cancelled".into())
+                );
                 let facts = fixture
                     .store
                     .test_connection()
@@ -2593,7 +2671,20 @@ esac
         );
 
         drop(services);
-        assert!(shim.wait_bounded(Duration::from_secs(5)).unwrap().success());
+        let final_status = shim.wait_bounded(Duration::from_secs(5)).unwrap();
+        if verified_cancelled_writer_may_be_terminated {
+            use std::os::unix::process::ExitStatusExt;
+            assert!(
+                final_status.success()
+                    || matches!(final_status.signal(), Some(libc::SIGTERM | libc::SIGKILL)),
+                "verified cancelled result permits normal or signal termination only: {final_status}"
+            );
+        } else {
+            assert!(
+                final_status.success(),
+                "run-step child failed: {final_status}"
+            );
+        }
         shim.finished = true;
     }
 
