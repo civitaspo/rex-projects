@@ -971,6 +971,7 @@ fn provider_status_state_fixture() {
         profile_digest: Digest::parse("b".repeat(64)).unwrap(),
         config_revision: revision.0,
         config_digest: applied.digest,
+        target: rex_projects::store::provider_qualification_runtime::ProviderQualificationTarget::AppliedProfile,
     };
     store
         .enqueue_provider_qualification(generation, &request)
@@ -1634,6 +1635,7 @@ fn controller_once_leaves_queued_qualification_and_never_uses_mutating_transport
         profile_digest,
         config_revision: 1,
         config_digest: loaded.digest,
+        target: rex_projects::store::provider_qualification_runtime::ProviderQualificationTarget::AppliedProfile,
     };
     let request_digest = request_digest(&request).unwrap();
     let connection = rusqlite::Connection::open(state.join("state.sqlite3")).unwrap();

@@ -4,6 +4,21 @@ Provider qualification runs under the foreground machine controller. If the
 controller stops during a launch, the saved request and its execution slot can
 remain `unknown`. A missing Rex block does not prove that its process exited.
 
+To qualify an applied role profile, queue it with `provider qualify`. To
+qualify an exact proposed profile candidate, use its candidate ID and revision
+digest:
+
+```sh
+rex-projects --config /path/to/config.toml --state-root /path/to/state \
+  provider qualify-candidate --project project-id --candidate candidate-id \
+  --candidate-digest 64-character-sha256 --request-id request-id
+```
+
+The controller resolves that immutable candidate package against the current
+Project configuration before launch. Candidate qualification uses the same
+foreground controller, held execution slot, and result checks as applied
+profile qualification. The `--request-id` option is optional.
+
 Use the same configuration and state directory as the interrupted request:
 
 ```sh

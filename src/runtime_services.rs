@@ -30,6 +30,32 @@ use crate::store::scheduler::{ObservedTicket, TicketScanKey};
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+fn qualification_profile(
+    store: &ConfigStore,
+    applied: &AppliedConfig,
+    request: &crate::store::provider_qualification_runtime::ProviderQualificationRequest,
+) -> Result<crate::config::Profile, String> {
+    use crate::store::provider_qualification_runtime::ProviderQualificationTarget as Target;
+    match &request.target {
+        Target::AppliedProfile => {
+            if applied.digest != request.config_digest {
+                return Err("provider qualification config changed after request".into());
+            }
+            let profile = applied
+                .profiles
+                .get(&request.profile_id)
+                .ok_or("provider qualification profile is absent from applied configuration")?;
+            if crate::store::agent_profile_digest(profile)? != request.profile_digest {
+                return Err("provider qualification profile changed after request".into());
+            }
+            Ok(profile.clone())
+        }
+        Target::Candidate { .. } => {
+            store.resolve_provider_qualification_candidate(request, applied)
+        }
+    }
+}
+
 fn get_recovery_ticket(
     adapter: &dyn TicketAdapter,
     request_id: RequestId,
@@ -1281,7 +1307,7 @@ impl RuntimeServices {
                 self.provider_qualification_recovery_ids
                     .insert(job.request.request_id.clone());
                 if let Err(error) = self
-                    .preflight_provider_qualification_deadline(&job)
+                    .preflight_provider_qualification_deadline(store, &job)
                     .and_then(|_| self.start_provider_qualification(store, &job))
                 {
                     let _ = store.mark_provider_qualification_unknown(
@@ -1354,7 +1380,7 @@ impl RuntimeServices {
             .clamp(1, u32::MAX as usize) as u32;
         match store.claim_provider_qualification(self.owner_generation, capacity, per_project)? {
             crate::store::provider_qualification_runtime::QualificationClaim::Claimed { job, .. } => {
-                if let Err(error) = self.preflight_provider_qualification_deadline(&job) {
+                if let Err(error) = self.preflight_provider_qualification_deadline(store, &job) {
                     store.fail_provider_qualification_before_launch(
                         self.owner_generation,
                         &job.request.request_id,
@@ -1386,15 +1412,12 @@ impl RuntimeServices {
 
     fn preflight_provider_qualification_deadline(
         &self,
+        store: &ConfigStore,
         job: &crate::store::provider_qualification_runtime::ProviderQualificationJob,
     ) -> Result<u64, String> {
-        let profile = self
-            .applied_config
-            .profiles
-            .get(&job.request.profile_id)
-            .ok_or("provider qualification profile is absent from applied configuration")?;
+        let profile = qualification_profile(store, &self.applied_config, &job.request)?;
         preflight_provider_qualification_job(
-            profile,
+            &profile,
             job,
             &self.applied_config.digest,
             self.config.runtime.shutdown_grace_seconds,
@@ -1410,22 +1433,13 @@ impl RuntimeServices {
         if job.status != Status::Running || job.controller_generation != self.owner_generation {
             return Err("provider qualification job is not claimed by this controller".into());
         }
-        let profile = self
-            .applied_config
-            .profiles
-            .get(&job.request.profile_id)
-            .ok_or("provider qualification profile is absent from applied configuration")?;
-        if crate::store::agent_profile_digest(profile)? != job.request.profile_digest
-            || self.applied_config.digest != job.request.config_digest
-        {
-            return Err("provider qualification profile or config changed after request".into());
-        }
+        let profile = qualification_profile(store, &self.applied_config, &job.request)?;
         let shutdown_grace_seconds = self.config.runtime.shutdown_grace_seconds.clamp(1, 300);
         let deadline_seconds = crate::run_step::qualification_deadline_seconds(
             profile.turn_timeout_seconds,
             shutdown_grace_seconds,
         )?;
-        let identity = crate::run_step::profile_runtime_identity(profile)
+        let identity = crate::run_step::profile_runtime_identity(&profile)
             .map_err(|error| error.to_string())?;
         let operation_digest = job.request_digest.as_str();
         let operation_id = format!("qualification-{}", &operation_digest[..24]);
@@ -1877,17 +1891,7 @@ impl RuntimeServices {
                 "provider structured result digest is invalid",
             );
         }
-        let Some(profile) = self.applied_config.profiles.get(&job.request.profile_id) else {
-            return finish_qualification_failed(
-                store,
-                self.owner_generation,
-                job,
-                &package,
-                &run,
-                rex.as_ref().unwrap_or(&self.rex),
-                "provider profile changed during qualification",
-            );
-        };
+        let profile = &package.profile;
         let identity = match crate::run_step::profile_runtime_identity(profile) {
             Ok(identity) => identity,
             Err(_) => {
@@ -5980,6 +5984,7 @@ mod provider_qualification_preflight_tests {
                 profile_digest,
                 config_revision: 1,
                 config_digest: config_digest.clone(),
+                target: crate::store::provider_qualification_runtime::ProviderQualificationTarget::AppliedProfile,
             },
             request_digest: Digest::parse("b".repeat(64)).unwrap(),
             status: ProviderQualificationJobStatus::Running,
@@ -7887,6 +7892,7 @@ mod provider_qualification_requested_reconcile_tests {
                 profile_digest: crate::store::agent_profile_digest(profile).unwrap(),
                 config_revision: revision.0,
                 config_digest: project_digest.clone(),
+                target: crate::store::provider_qualification_runtime::ProviderQualificationTarget::AppliedProfile,
             };
             store
                 .enqueue_provider_qualification(prior_owner_generation, &request)
@@ -7931,6 +7937,7 @@ mod provider_qualification_requested_reconcile_tests {
                     profile_digest: crate::store::agent_profile_digest(profile).unwrap(),
                     config_revision: revision.0,
                     config_digest: project_digest.clone(),
+                    target: crate::store::provider_qualification_runtime::ProviderQualificationTarget::AppliedProfile,
                 }
             )
             .unwrap()
@@ -8078,6 +8085,7 @@ mod provider_qualification_requested_reconcile_tests {
                 profile_digest: crate::store::agent_profile_digest(profile).unwrap(),
                 config_revision: revision.0,
                 config_digest: applied.digest.clone(),
+                target: crate::store::provider_qualification_runtime::ProviderQualificationTarget::AppliedProfile,
             };
             store
                 .enqueue_provider_qualification(prior_owner_generation, &request)
