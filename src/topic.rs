@@ -1,8 +1,7 @@
-//! Typed, create-only Supervisor Topic documents.
+//! Typed, immutable Supervisor Topic documents.
 //!
-//! Topic creation is intentionally immutable in this increment. The durable
-//! intent fixes the project, destination, rendered bytes, and source proof;
-//! retries can only reconcile those exact bytes.
+//! The durable intent fixes the Project, version, destination, rendered bytes,
+//! and source proof; retries can only reconcile those exact bytes.
 
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions};
@@ -94,6 +93,10 @@ pub struct TopicIntent {
     pub operation_id: String,
     pub project_id: ProjectId,
     pub key: TopicKey,
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub expected_prior_digest: Option<Digest>,
     pub destination_root: PathBuf,
     pub content: String,
     pub content_digest: Digest,
@@ -156,9 +159,6 @@ pub fn validate_changes(changes: &[TopicChange]) -> Result<(), String> {
         let key = TopicKey::parse(&change.topic_key)?;
         if !keys.insert(key) {
             return Err("Supervisor proposed the same Topic key more than once".into());
-        }
-        if change.expected_prior_digest.is_some() {
-            return Err("Topic revisions are not supported by this host yet".into());
         }
         if change.title.trim().is_empty()
             || change.summary.trim().is_empty()
@@ -231,6 +231,10 @@ pub fn render(
     output.push_str(&yaml_string(project_id.as_str()));
     output.push_str("\n  topic_key: ");
     output.push_str(&yaml_string(key.as_str()));
+    if let Some(prior_digest) = &change.expected_prior_digest {
+        output.push_str("\n  prior_content_sha256: ");
+        output.push_str(&yaml_string(prior_digest.as_str()));
+    }
     output.push_str("\n  source_findings:\n");
     let mut sorted_sources = sources.to_vec();
     sorted_sources.sort_by(|left, right| left.finding_id.cmp(&right.finding_id));
@@ -282,7 +286,65 @@ pub fn content_digest(content: &str) -> Digest {
     Digest::parse(format!("{:x}", Sha256::digest(content.as_bytes()))).expect("sha256 is a digest")
 }
 
-pub fn publish_create_only(intent: &TopicIntent) -> Result<TopicReceipt, TopicPublicationError> {
+pub fn publication_relative_path(intent: &TopicIntent) -> Result<String, String> {
+    validate_version_identity(intent)?;
+    let project = intent.project_id.as_str();
+    let filename = if intent.revision == 0 {
+        format!("{}.md", intent.key.as_str())
+    } else {
+        format!("{}.r{}.md", intent.key.as_str(), intent.content_digest)
+    };
+    Ok(format!("projects/{project}/topics/{filename}"))
+}
+
+pub fn validate_version_identity(intent: &TopicIntent) -> Result<(), String> {
+    match (intent.revision, intent.expected_prior_digest.as_ref()) {
+        (0, None) => Ok(()),
+        (0, Some(_)) => Err("genesis Topic intent cannot have a prior digest".into()),
+        (_, None) => Err("revised Topic intent must have a prior digest".into()),
+        (_, Some(_)) => Ok(()),
+    }
+}
+
+pub fn expected_operation_id(intent: &TopicIntent) -> Result<String, String> {
+    validate_version_identity(intent)?;
+    if intent.revision == 0 {
+        let mut identity_hash = Sha256::new();
+        identity_hash.update(b"rex-supervisor-topic-create-v1\0");
+        identity_hash.update(intent.project_id.as_str().as_bytes());
+        identity_hash.update(b"\0");
+        identity_hash.update(intent.key.as_str().as_bytes());
+        return Ok(format!("topic-{:x}", identity_hash.finalize()));
+    }
+    let mut sources = intent.sources.clone();
+    sources.sort_by(|left, right| left.finding_id.cmp(&right.finding_id));
+    let source_identity = serde_json::to_vec(&sources).map_err(|error| error.to_string())?;
+    let mut identity_hash = Sha256::new();
+    identity_hash.update(b"rex-supervisor-topic-revision-v1\0");
+    identity_hash.update(intent.project_id.as_str().as_bytes());
+    identity_hash.update(b"\0");
+    identity_hash.update(intent.key.as_str().as_bytes());
+    identity_hash.update(b"\0");
+    identity_hash.update(intent.destination_root.to_string_lossy().as_bytes());
+    identity_hash.update(b"\0");
+    identity_hash.update(intent.revision.to_be_bytes());
+    identity_hash.update(b"\0");
+    identity_hash.update(
+        intent
+            .expected_prior_digest
+            .as_ref()
+            .ok_or("revised Topic intent has no prior digest")?
+            .as_str()
+            .as_bytes(),
+    );
+    identity_hash.update(b"\0");
+    identity_hash.update(intent.content_digest.as_str().as_bytes());
+    identity_hash.update(b"\0");
+    identity_hash.update(&source_identity);
+    Ok(format!("topic-{:x}", identity_hash.finalize()))
+}
+
+pub fn publish_immutable(intent: &TopicIntent) -> Result<TopicReceipt, TopicPublicationError> {
     if !intent.destination_root.is_absolute() {
         return Err("Topic intent destination root must be absolute".into());
     }
@@ -291,9 +353,13 @@ pub fn publish_create_only(intent: &TopicIntent) -> Result<TopicReceipt, TopicPu
     let bundle = ensure_child_dir(&root, "projects")?;
     let project_dir = ensure_child_dir(&bundle, project)?;
     let topics_dir = ensure_child_dir(&project_dir, "topics")?;
-    let filename = format!("{}.md", intent.key.as_str());
-    let target = topics_dir.join(&filename);
-    let relative_path = format!("projects/{project}/topics/{filename}");
+    validate_version_identity(intent)?;
+    let relative_path = publication_relative_path(intent)?;
+    let filename = relative_path
+        .rsplit('/')
+        .next()
+        .ok_or("invalid Topic relative path")?;
+    let target = topics_dir.join(filename);
     let bytes = intent.content.as_bytes();
     if bytes.len() > MAX_TOPIC_DOCUMENT_BYTES
         || content_digest(&intent.content) != intent.content_digest
@@ -524,7 +590,7 @@ fn unix_now() -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        TopicChange, TopicKey, TopicSourceProof, content_digest, publish_create_only, render,
+        TopicChange, TopicKey, TopicSourceProof, content_digest, publish_immutable, render,
         validate_changes,
     };
     use crate::domain::{
@@ -620,11 +686,11 @@ mod tests {
         malformed["expected_prior_digest"] = json!("not-a-digest");
         assert!(parse(malformed).is_err());
 
-        let mut unsupported_revision = topic;
-        unsupported_revision["expected_prior_digest"] = json!(digest);
-        let parsed = parse(unsupported_revision).unwrap();
+        let mut revision = topic;
+        revision["expected_prior_digest"] = json!(digest);
+        let parsed = parse(revision).unwrap();
         let decoded = serde_json::from_value::<TopicChange>(parsed).unwrap();
-        assert!(validate_changes(&[decoded]).is_err());
+        assert!(validate_changes(&[decoded]).is_ok());
     }
 
     #[test]
@@ -647,6 +713,8 @@ mod tests {
             operation_id: "topic-create-test".into(),
             project_id: project,
             key: TopicKey::parse(&proposal.topic_key).unwrap(),
+            revision: 0,
+            expected_prior_digest: None,
             destination_root: root.path().to_path_buf(),
             content_digest: content_digest(&content),
             content,
@@ -658,12 +726,12 @@ mod tests {
         std::fs::create_dir_all(staging.parent().unwrap()).unwrap();
         let target = root.path().join("projects/sample/topics/safe-replay.md");
         std::fs::write(&staging, b"unexpected").unwrap();
-        assert!(publish_create_only(&intent).is_err());
+        assert!(publish_immutable(&intent).is_err());
         assert_eq!(std::fs::read(&staging).unwrap(), b"unexpected");
         std::fs::write(&staging, &intent.content.as_bytes()[..7]).unwrap();
         let partial_alias = staging.with_extension("alias");
         std::fs::hard_link(&staging, &partial_alias).unwrap();
-        assert!(publish_create_only(&intent).is_err());
+        assert!(publish_immutable(&intent).is_err());
         assert_eq!(
             std::fs::read(&staging).unwrap(),
             &intent.content.as_bytes()[..7]
@@ -674,7 +742,7 @@ mod tests {
 
         std::fs::write(&staging, &intent.content).unwrap();
         std::fs::hard_link(&staging, &target).unwrap();
-        publish_create_only(&intent).unwrap();
+        publish_immutable(&intent).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), intent.content.as_bytes());
         assert!(!staging.exists());
         std::fs::remove_file(&target).unwrap();
@@ -683,25 +751,25 @@ mod tests {
                 std::fs::remove_file(&target).unwrap();
             }
             std::fs::write(&staging, &intent.content.as_bytes()[..partial_len]).unwrap();
-            publish_create_only(&intent).unwrap();
+            publish_immutable(&intent).unwrap();
             assert_eq!(std::fs::read(&target).unwrap(), intent.content.as_bytes());
             assert!(!staging.exists());
         }
-        let receipt = publish_create_only(&intent).unwrap();
+        let receipt = publish_immutable(&intent).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), intent.content.as_bytes());
         assert_eq!(receipt.manifest.content_sha256, intent.content_digest);
-        assert!(publish_create_only(&intent).unwrap().manifest == receipt.manifest);
+        assert!(publish_immutable(&intent).unwrap().manifest == receipt.manifest);
         std::fs::write(&target, "human edit").unwrap();
-        assert!(publish_create_only(&intent).is_err());
+        assert!(publish_immutable(&intent).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"human edit");
         let unexpected = vec![b'x'; super::MAX_TOPIC_DOCUMENT_BYTES * 16];
         std::fs::write(&target, &unexpected).unwrap();
-        assert!(publish_create_only(&intent).is_err());
+        assert!(publish_immutable(&intent).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), unexpected);
         std::fs::remove_file(&target).unwrap();
         std::os::unix::fs::symlink(root.path().join("missing"), &target).unwrap();
         assert!(matches!(
-            publish_create_only(&intent),
+            publish_immutable(&intent),
             Err(super::TopicPublicationError::Conflict(_))
         ));
         assert!(
@@ -717,7 +785,7 @@ mod tests {
         let mut invalid_parent_intent = intent;
         invalid_parent_intent.destination_root = invalid_root.path().to_path_buf();
         assert!(matches!(
-            publish_create_only(&invalid_parent_intent),
+            publish_immutable(&invalid_parent_intent),
             Err(super::TopicPublicationError::Conflict(_))
         ));
         assert!(!outside.path().join("sample/topics/safe-replay.md").exists());

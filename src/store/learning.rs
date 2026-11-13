@@ -50,6 +50,17 @@ struct SupervisorTopicPublicationDbRow {
     receipt_digest: Option<String>,
 }
 
+struct PublishedTopicVersionDbRow {
+    operation_id: String,
+    intent_json: String,
+    intent_digest: String,
+    receipt_json: String,
+    receipt_digest: String,
+    destination_root: String,
+    revision: i64,
+    prior_content_digest: Option<String>,
+}
+
 fn sorted_source_ids(sources: &[crate::topic::TopicSourceProof]) -> Vec<Digest> {
     let mut ids = sources
         .iter()
@@ -57,6 +68,15 @@ fn sorted_source_ids(sources: &[crate::topic::TopicSourceProof]) -> Vec<Digest> 
         .collect::<Vec<_>>();
     ids.sort();
     ids
+}
+
+fn sorted_source_publication_digests(sources: &[crate::topic::TopicSourceProof]) -> Vec<Digest> {
+    let mut digests = sources
+        .iter()
+        .map(|source| source.publication_digest.clone())
+        .collect::<Vec<_>>();
+    digests.sort();
+    digests
 }
 
 fn resolve_topic_source(
@@ -263,12 +283,18 @@ fn supervisor_learning_snapshot_in_transaction(
     let topic_destination_root =
         topic_destination_root.map(|root| root.to_string_lossy().into_owned());
     let total_published_topics: usize = tx.query_row(
-        "SELECT COUNT(*) FROM supervisor_topic_publications WHERE project_id=?1 AND state='published' AND destination_root=?2",
+        "SELECT COUNT(DISTINCT topic_key) FROM supervisor_topic_publications WHERE project_id=?1 AND state='published' AND destination_root=?2",
         params![project.as_str(), topic_destination_root.as_deref()],
         |row| row.get(0),
     ).map_err(|error| error.to_string())?;
     let mut topic_stmt = tx.prepare(
-        "SELECT topic_key,intent_json,intent_digest,receipt_json,receipt_digest FROM supervisor_topic_publications WHERE project_id=?1 AND state='published' AND destination_root=?2 ORDER BY published_at_unix DESC,operation_id DESC LIMIT 5",
+        "SELECT p.operation_id,p.topic_key,p.intent_json,p.intent_digest,p.receipt_json,p.receipt_digest,p.revision,p.prior_content_digest
+         FROM supervisor_topic_publications p
+         JOIN (SELECT topic_key,MAX(revision) AS revision FROM supervisor_topic_publications
+               WHERE project_id=?1 AND state='published' AND destination_root=?2 GROUP BY topic_key) latest
+           ON latest.topic_key=p.topic_key AND latest.revision=p.revision
+         WHERE p.project_id=?1 AND p.state='published' AND p.destination_root=?2
+         ORDER BY p.published_at_unix DESC,p.operation_id DESC LIMIT 5",
     ).map_err(|error| error.to_string())?;
     let topic_rows = topic_stmt
         .query_map(
@@ -280,6 +306,9 @@ fn supervisor_learning_snapshot_in_transaction(
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             },
         )
@@ -288,7 +317,17 @@ fn supervisor_learning_snapshot_in_transaction(
         .map_err(|error| error.to_string())?;
     drop(topic_stmt);
     let mut topics = Vec::new();
-    for (topic_key, intent_json, intent_digest, receipt_json, receipt_digest) in topic_rows {
+    for (
+        stored_operation_id,
+        topic_key,
+        intent_json,
+        intent_digest,
+        receipt_json,
+        receipt_digest,
+        revision,
+        prior_digest,
+    ) in topic_rows
+    {
         verify_digest(&intent_json, &Digest::parse(intent_digest)?)?;
         verify_digest(&receipt_json, &Digest::parse(receipt_digest)?)?;
         let intent: crate::topic::TopicIntent =
@@ -296,17 +335,62 @@ fn supervisor_learning_snapshot_in_transaction(
         let receipt: crate::topic::TopicReceipt =
             crate::protocol::parse_unique(receipt_json.as_bytes())?;
         if intent.project_id != *project
+            || intent.operation_id != stored_operation_id
             || intent.key.as_str() != topic_key
+            || i64::try_from(intent.revision).ok() != Some(revision)
+            || intent.expected_prior_digest.as_ref().map(Digest::as_str) != prior_digest.as_deref()
+            || crate::topic::validate_version_identity(&intent).is_err()
+            || crate::topic::expected_operation_id(&intent)? != intent.operation_id
             || !intent.destination_root.is_absolute()
             || topic_destination_root
                 .as_deref()
                 .is_none_or(|root| intent.destination_root.to_string_lossy() != root)
             || intent.content_digest != crate::topic::content_digest(&intent.content)
+            || receipt.manifest.operation_id != intent.operation_id
             || receipt.manifest.project_id != *project
             || receipt.manifest.topic_key.as_str() != topic_key
+            || receipt.manifest.format != "okf-0.2"
             || receipt.manifest.content_sha256 != intent.content_digest
+            || receipt.manifest.relative_path != crate::topic::publication_relative_path(&intent)?
+            || receipt.manifest.byte_count != intent.content.len()
+            || receipt.manifest.source_finding_ids != sorted_source_ids(&intent.sources)
+            || receipt.manifest.source_publication_digests
+                != sorted_source_publication_digests(&intent.sources)
+            || receipt.manifest_digest
+                != Digest::parse(format!(
+                    "{:x}",
+                    Sha256::digest(
+                        serde_json::to_vec(&receipt.manifest).map_err(|e| e.to_string())?
+                    )
+                ))?
         {
             return Err("stored Supervisor Topic publication has invalid provenance".into());
+        }
+        if let Some(prior_digest) = &intent.expected_prior_digest {
+            let prior: Option<(String, String, String, String)> = tx.query_row(
+                "SELECT operation_id,intent_json,intent_digest,destination_root FROM supervisor_topic_publications WHERE project_id=?1 AND topic_key=?2 AND destination_root=?3 AND state='published' AND revision<?4 ORDER BY revision DESC LIMIT 1",
+                params![project.as_str(), topic_key, topic_destination_root.as_deref(), revision],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).optional().map_err(|error| error.to_string())?;
+            let Some((prior_operation_id, prior_json, prior_digest_json, prior_root)) = prior
+            else {
+                return Err("stored Supervisor Topic revision has no published predecessor".into());
+            };
+            verify_digest(&prior_json, &Digest::parse(prior_digest_json)?)?;
+            let prior_intent: crate::topic::TopicIntent =
+                crate::protocol::parse_unique(prior_json.as_bytes())?;
+            if prior_root != topic_destination_root.as_deref().unwrap_or_default()
+                || prior_intent.operation_id != prior_operation_id
+                || prior_intent.project_id != *project
+                || prior_intent.key.as_str() != topic_key
+                || prior_intent.revision >= intent.revision
+                || crate::topic::expected_operation_id(&prior_intent)? != prior_intent.operation_id
+                || prior_intent.content_digest
+                    != crate::topic::content_digest(&prior_intent.content)
+                || prior_intent.content_digest != *prior_digest
+            {
+                return Err("stored Supervisor Topic revision predecessor is inconsistent".into());
+            }
         }
         topics.push(SupervisorTopicEntry {
             topic_key: intent.key,
@@ -582,6 +666,170 @@ pub(crate) fn validate_v20_topic_publications(connection: &Connection) -> Result
     ];
     if required.iter().any(|column| !actual.contains(*column)) {
         return Err("database claims schema v20 but Topic publication ledger is incomplete".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn migrate_v21_topic_revisions(connection: &Connection) -> Result<(), String> {
+    let tx = connection
+        .unchecked_transaction()
+        .map_err(|e| e.to_string())?;
+    let version: i64 = tx
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if version != 20 {
+        return Err(format!(
+            "Topic revision migration requires schema v20, found v{version}"
+        ));
+    }
+    tx.execute_batch(
+        "ALTER TABLE supervisor_topic_publications RENAME TO supervisor_topic_publications_v20;
+        CREATE TABLE supervisor_topic_publications (
+            operation_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(project_id),
+            topic_key TEXT NOT NULL,
+            destination_root TEXT NOT NULL,
+            intent_json TEXT NOT NULL CHECK(length(intent_json)<=1048576),
+            intent_digest TEXT NOT NULL CHECK(length(intent_digest)=64),
+            state TEXT NOT NULL CHECK(state IN ('pending','published','conflict')),
+            receipt_json TEXT,
+            receipt_digest TEXT CHECK(receipt_digest IS NULL OR length(receipt_digest)=64),
+            conflict_json TEXT,
+            created_at_unix INTEGER NOT NULL,
+            published_at_unix INTEGER,
+            revision INTEGER NOT NULL DEFAULT 0 CHECK(revision>=0),
+            prior_content_digest TEXT CHECK(prior_content_digest IS NULL OR length(prior_content_digest)=64),
+            UNIQUE(project_id,topic_key,revision),
+            CHECK((revision=0 AND prior_content_digest IS NULL) OR (revision>0 AND prior_content_digest IS NOT NULL)),
+            CHECK((state='published' AND receipt_json IS NOT NULL AND receipt_digest IS NOT NULL AND published_at_unix IS NOT NULL AND conflict_json IS NULL)
+               OR (state='pending' AND receipt_json IS NULL AND receipt_digest IS NULL AND published_at_unix IS NULL AND conflict_json IS NULL)
+               OR (state='conflict' AND receipt_json IS NULL AND receipt_digest IS NULL AND published_at_unix IS NULL AND conflict_json IS NOT NULL))
+        );
+        INSERT INTO supervisor_topic_publications(
+            operation_id,project_id,topic_key,destination_root,intent_json,intent_digest,state,
+            receipt_json,receipt_digest,conflict_json,created_at_unix,published_at_unix,revision,prior_content_digest
+        ) SELECT operation_id,project_id,topic_key,destination_root,intent_json,intent_digest,state,
+            receipt_json,receipt_digest,conflict_json,created_at_unix,published_at_unix,0,NULL
+          FROM supervisor_topic_publications_v20;
+        DROP TABLE supervisor_topic_publications_v20;
+        CREATE INDEX supervisor_topic_publications_project ON supervisor_topic_publications(project_id,state,created_at_unix DESC,topic_key);
+        INSERT INTO schema_migrations(version,applied_at_unix) VALUES (21,unixepoch());
+        PRAGMA user_version=21;"
+    )
+    .map_err(|e| e.to_string())?;
+    let foreign_key_failure: Option<(String, i64, String)> = tx
+        .query_row(
+            "PRAGMA foreign_key_check(supervisor_topic_publications)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if let Some((table, rowid, parent)) = foreign_key_failure {
+        return Err(format!(
+            "Topic revision migration found foreign key violation in {table} row {rowid} referencing {parent}"
+        ));
+    }
+    tx.commit().map_err(|e| e.to_string())
+}
+
+pub(crate) fn validate_v21_topic_publications(connection: &Connection) -> Result<(), String> {
+    validate_v20_topic_publications(connection)?;
+    let mut stmt = connection
+        .prepare("PRAGMA table_info(supervisor_topic_publications)")
+        .map_err(|e| e.to_string())?;
+    let actual = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    if !actual.contains("revision") || !actual.contains("prior_content_digest") {
+        return Err("database claims schema v21 but Topic revision ledger is incomplete".into());
+    }
+    let mut index_stmt = connection
+        .prepare("PRAGMA index_list(supervisor_topic_publications)")
+        .map_err(|e| e.to_string())?;
+    let indexes = index_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? != 0,
+                row.get::<_, i64>(4)? != 0,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    drop(index_stmt);
+    let mut has_revision_unique = false;
+    let mut has_legacy_unique = false;
+    for (name, unique, partial) in indexes {
+        if !unique {
+            continue;
+        }
+        let quoted_name = name.replace('"', "\"\"");
+        let sql = format!("PRAGMA index_info(\"{quoted_name}\")");
+        let mut columns_stmt = connection.prepare(&sql).map_err(|e| e.to_string())?;
+        let columns = columns_stmt
+            .query_map([], |row| row.get::<_, String>(2))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        has_revision_unique |= !partial && columns == ["project_id", "topic_key", "revision"];
+        has_legacy_unique |= columns == ["project_id", "topic_key"];
+    }
+    if !has_revision_unique || has_legacy_unique {
+        return Err("database claims schema v21 but Topic revision uniqueness is invalid".into());
+    }
+    let table_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='supervisor_topic_publications'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let normalized = table_sql
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("");
+    for required in [
+        "revisionintegernotnulldefault0check(revision>=0)",
+        "prior_content_digesttextcheck(prior_content_digestisnullorlength(prior_content_digest)=64)",
+        "check((revision=0andprior_content_digestisnull)or(revision>0andprior_content_digestisnotnull))",
+        "check(statein('pending','published','conflict'))",
+        "check(receipt_digestisnullorlength(receipt_digest)=64)",
+        "check(length(intent_digest)=64)",
+        "check(length(intent_json)<=1048576)",
+        "check((state='published'andreceipt_jsonisnotnullandreceipt_digestisnotnullandpublished_at_unixisnotnullandconflict_jsonisnull)or(state='pending'andreceipt_jsonisnullandreceipt_digestisnullandpublished_at_unixisnullandconflict_jsonisnull)or(state='conflict'andreceipt_jsonisnullandreceipt_digestisnullandpublished_at_unixisnullandconflict_jsonisnotnull))",
+    ] {
+        if !normalized.contains(required) {
+            return Err(
+                "database claims schema v21 but Topic ledger constraints are incomplete".into(),
+            );
+        }
+    }
+    let foreign_key_to_projects: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_list('supervisor_topic_publications') WHERE \"table\"='projects' AND \"from\"='project_id' AND \"to\"='project_id')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if !foreign_key_to_projects {
+        return Err(
+            "database claims schema v21 but Topic Project ownership is not constrained".into(),
+        );
+    }
+    let invalid: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM supervisor_topic_publications WHERE revision<0 OR (revision=0 AND prior_content_digest IS NOT NULL) OR (revision>0 AND (prior_content_digest IS NULL OR length(prior_content_digest)<>64)))",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if invalid {
+        return Err("database claims schema v21 but Topic revision identities are invalid".into());
     }
     Ok(())
 }
@@ -2290,20 +2538,32 @@ impl ConfigStore {
         &self,
         operation_id: &OperationId,
     ) -> Result<Option<crate::topic::TopicIntent>, String> {
-        let row: Option<(String, String, String, String)> = self.connection.query_row(
-            "SELECT intent_json,intent_digest,project_id,destination_root FROM supervisor_topic_publications WHERE operation_id=?1",
+        let row: Option<(String, String, String, String, i64, Option<String>)> = self.connection.query_row(
+            "SELECT intent_json,intent_digest,project_id,destination_root,revision,prior_content_digest FROM supervisor_topic_publications WHERE operation_id=?1",
             [operation_id.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
         ).optional().map_err(|error| error.to_string())?;
-        let Some((intent_json, intent_digest, project_id, destination_root)) = row else {
+        let Some((
+            intent_json,
+            intent_digest,
+            project_id,
+            destination_root,
+            revision,
+            prior_digest,
+        )) = row
+        else {
             return Ok(None);
         };
         verify_digest(&intent_json, &Digest::parse(intent_digest)?)?;
         let intent: crate::topic::TopicIntent =
             crate::protocol::parse_unique(intent_json.as_bytes())?;
         if intent.operation_id != operation_id.as_str()
+            || crate::topic::expected_operation_id(&intent)? != intent.operation_id
             || intent.project_id.as_str() != project_id
             || intent.destination_root.to_string_lossy() != destination_root
+            || i64::try_from(intent.revision).ok() != Some(revision)
+            || intent.expected_prior_digest.as_ref().map(Digest::as_str) != prior_digest.as_deref()
+            || crate::topic::validate_version_identity(&intent).is_err()
             || !intent.destination_root.is_absolute()
             || intent.content_digest != crate::topic::content_digest(&intent.content)
         {
@@ -2381,8 +2641,23 @@ impl ConfigStore {
         let digest = Digest::parse(digest.ok_or("published Topic row has no receipt digest")?)?;
         verify_digest(&json, &digest)?;
         let receipt: crate::topic::TopicReceipt = crate::protocol::parse_unique(json.as_bytes())?;
+        let intent = self
+            .supervisor_topic_intent(operation_id)?
+            .ok_or("published Topic receipt has no durable intent")?;
         if receipt.manifest.operation_id != operation_id.as_str()
-            || receipt.manifest.content_sha256.as_str().is_empty()
+            || receipt.manifest.project_id != intent.project_id
+            || receipt.manifest.topic_key != intent.key
+            || receipt.manifest.format != "okf-0.2"
+            || receipt.manifest.relative_path != crate::topic::publication_relative_path(&intent)?
+            || receipt.manifest.content_sha256 != intent.content_digest
+            || receipt.manifest.byte_count != intent.content.len()
+            || receipt.manifest.source_finding_ids != sorted_source_ids(&intent.sources)
+            || receipt.manifest.source_publication_digests
+                != sorted_source_publication_digests(&intent.sources)
+            || Digest::parse(format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&receipt.manifest).map_err(|e| e.to_string())?)
+            ))? != receipt.manifest_digest
         {
             return Err("stored Topic receipt has invalid identity".into());
         }
@@ -2437,12 +2712,12 @@ impl ConfigStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         validate_active_generation(&tx, generation)?;
-        let row: Option<SupervisorTopicPublicationDbRow> = tx.query_row(
-            "SELECT project_id,topic_key,destination_root,intent_json,receipt_json,receipt_digest FROM supervisor_topic_publications WHERE operation_id=?1 AND state IN ('pending','published')",
+        let row: Option<(SupervisorTopicPublicationDbRow, i64, Option<String>)> = tx.query_row(
+            "SELECT project_id,topic_key,destination_root,intent_json,receipt_json,receipt_digest,revision,prior_content_digest FROM supervisor_topic_publications WHERE operation_id=?1 AND state IN ('pending','published')",
             [operation_id.as_str()],
-            |row| Ok(SupervisorTopicPublicationDbRow { project_id: row.get(0)?, topic_key: row.get(1)?, destination_root: row.get(2)?, intent_json: row.get(3)?, receipt_json: row.get(4)?, receipt_digest: row.get(5)? }),
+            |row| Ok((SupervisorTopicPublicationDbRow { project_id: row.get(0)?, topic_key: row.get(1)?, destination_root: row.get(2)?, intent_json: row.get(3)?, receipt_json: row.get(4)?, receipt_digest: row.get(5)? }, row.get(6)?, row.get(7)?)),
         ).optional().map_err(|error| error.to_string())?;
-        let Some(row) = row else {
+        let Some((row, ledger_revision, ledger_prior_digest)) = row else {
             return Err("Topic receipt has no durable pending intent".into());
         };
         let SupervisorTopicPublicationDbRow {
@@ -2463,11 +2738,16 @@ impl ConfigStore {
         verify_digest(&intent_json, &Digest::parse(intent_digest)?)?;
         let intent: crate::topic::TopicIntent =
             crate::protocol::parse_unique(intent_json.as_bytes())?;
-        let expected_path = format!("projects/{}/topics/{}.md", project, key);
+        let expected_path = crate::topic::publication_relative_path(&intent)?;
         if intent.project_id.as_str() != project
             || intent.key.as_str() != key
             || intent.destination_root.to_string_lossy() != root
             || intent.operation_id != operation_id.as_str()
+            || i64::try_from(intent.revision).ok() != Some(ledger_revision)
+            || intent.expected_prior_digest.as_ref().map(Digest::as_str)
+                != ledger_prior_digest.as_deref()
+            || crate::topic::expected_operation_id(&intent)? != intent.operation_id
+            || intent.content_digest != crate::topic::content_digest(&intent.content)
             || receipt.manifest.project_id != intent.project_id
             || receipt.manifest.topic_key != intent.key
             || receipt.manifest.operation_id != operation_id.as_str()
@@ -2476,6 +2756,15 @@ impl ConfigStore {
             || receipt.manifest.content_sha256 != intent.content_digest
             || receipt.manifest.byte_count != intent.content.len()
             || receipt.manifest.source_finding_ids != sorted_source_ids(&intent.sources)
+            || receipt.manifest.source_publication_digests
+                != sorted_source_publication_digests(&intent.sources)
+            || receipt.manifest_digest
+                != Digest::parse(format!(
+                    "{:x}",
+                    Sha256::digest(
+                        serde_json::to_vec(&receipt.manifest).map_err(|e| e.to_string())?
+                    )
+                ))?
         {
             return Err("Topic receipt does not match its exact durable intent".into());
         }
@@ -3207,6 +3496,191 @@ impl ConfigStore {
                                 }
                             }
                             if sources.len() == change.source_finding_ids.len() {
+                                let key = crate::topic::TopicKey::parse(&change.topic_key)?;
+                                let history: Option<(Option<i64>, bool)> = Some(tx.query_row(
+                                    "SELECT MAX(revision),EXISTS(SELECT 1 FROM supervisor_topic_publications p WHERE p.project_id=?1 AND p.topic_key=?2 AND p.state='pending') FROM supervisor_topic_publications WHERE project_id=?1 AND topic_key=?2",
+                                    params![binding.project_id.as_str(), key.as_str()],
+                                    |row| Ok((row.get(0)?, row.get(1)?)),
+                                ).map_err(|error| error.to_string())?);
+                                let max_revision = history
+                                    .as_ref()
+                                    .and_then(|(revision, _)| *revision)
+                                    .map(|revision| {
+                                        u64::try_from(revision)
+                                            .map_err(|_| "stored Topic revision ordinal is invalid")
+                                    })
+                                    .transpose()?;
+                                let prior_published: Option<PublishedTopicVersionDbRow> = tx.query_row(
+                                    "SELECT operation_id,intent_json,intent_digest,receipt_json,receipt_digest,destination_root,revision,prior_content_digest FROM supervisor_topic_publications WHERE project_id=?1 AND topic_key=?2 AND state='published' ORDER BY revision DESC LIMIT 1",
+                                    params![binding.project_id.as_str(), key.as_str()],
+                                    |row| Ok(PublishedTopicVersionDbRow {
+                                        operation_id: row.get(0)?,
+                                        intent_json: row.get(1)?,
+                                        intent_digest: row.get(2)?,
+                                        receipt_json: row.get(3)?,
+                                        receipt_digest: row.get(4)?,
+                                        destination_root: row.get(5)?,
+                                        revision: row.get(6)?,
+                                        prior_content_digest: row.get(7)?,
+                                    }),
+                                ).optional().map_err(|error| error.to_string())?;
+                                let issued_topics = snapshot_value
+                                    .get("maintenance")
+                                    .and_then(|value| value.get("topics"))
+                                    .and_then(serde_json::Value::as_array);
+                                let issued_prior = issued_topics.and_then(|topics| {
+                                    topics.iter().find_map(|topic| {
+                                        (topic.get("topic_key").and_then(serde_json::Value::as_str)
+                                            == Some(key.as_str()))
+                                        .then(|| {
+                                            topic
+                                                .get("content_digest")
+                                                .and_then(serde_json::Value::as_str)
+                                        })
+                                        .flatten()
+                                    })
+                                });
+                                let root_string = root.to_string_lossy().into_owned();
+                                let prior_digest = match (
+                                    &change.expected_prior_digest,
+                                    &history,
+                                    &prior_published,
+                                ) {
+                                    (_, Some((_, true)), _) => {
+                                        rejection.get_or_insert_with(|| {
+                                            format!(
+                                                "Topic `{}` has a pending publication",
+                                                key.as_str()
+                                            )
+                                        });
+                                        None
+                                    }
+                                    (None, Some((None, false)), None) => None,
+                                    (
+                                        Some(expected),
+                                        Some((Some(_), false)),
+                                        Some(PublishedTopicVersionDbRow {
+                                            operation_id: prior_operation_id,
+                                            intent_json,
+                                            intent_digest,
+                                            receipt_json,
+                                            receipt_digest,
+                                            destination_root: prior_root,
+                                            revision: prior_revision,
+                                            prior_content_digest: prior_ledger_digest,
+                                        }),
+                                    ) => {
+                                        verify_digest(
+                                            intent_json,
+                                            &Digest::parse(intent_digest.clone())?,
+                                        )?;
+                                        verify_digest(
+                                            receipt_json,
+                                            &Digest::parse(receipt_digest.clone())?,
+                                        )?;
+                                        let prior_intent: crate::topic::TopicIntent =
+                                            crate::protocol::parse_unique(intent_json.as_bytes())?;
+                                        let prior_receipt: crate::topic::TopicReceipt =
+                                            crate::protocol::parse_unique(receipt_json.as_bytes())?;
+                                        if prior_root != &root_string
+                                            || prior_intent.operation_id != *prior_operation_id
+                                            || prior_intent.destination_root.to_string_lossy()
+                                                != root_string
+                                            || i64::try_from(prior_intent.revision).ok()
+                                                != Some(*prior_revision)
+                                            || prior_intent
+                                                .expected_prior_digest
+                                                .as_ref()
+                                                .map(Digest::as_str)
+                                                != prior_ledger_digest.as_deref()
+                                            || crate::topic::validate_version_identity(
+                                                &prior_intent,
+                                            )
+                                            .is_err()
+                                            || crate::topic::expected_operation_id(&prior_intent)?
+                                                != prior_intent.operation_id
+                                            || prior_intent.content_digest
+                                                != crate::topic::content_digest(
+                                                    &prior_intent.content,
+                                                )
+                                            || prior_receipt.manifest.operation_id
+                                                != prior_intent.operation_id
+                                            || prior_receipt.manifest.project_id
+                                                != binding.project_id
+                                            || prior_receipt.manifest.topic_key != key
+                                            || prior_receipt.manifest.content_sha256
+                                                != prior_intent.content_digest
+                                            || prior_receipt.manifest.byte_count
+                                                != prior_intent.content.len()
+                                            || prior_receipt.manifest.format != "okf-0.2"
+                                            || prior_receipt.manifest.relative_path
+                                                != crate::topic::publication_relative_path(
+                                                    &prior_intent,
+                                                )?
+                                            || prior_receipt.manifest.source_finding_ids
+                                                != sorted_source_ids(&prior_intent.sources)
+                                            || prior_receipt.manifest.source_publication_digests
+                                                != sorted_source_publication_digests(
+                                                    &prior_intent.sources,
+                                                )
+                                            || prior_receipt.manifest_digest
+                                                != Digest::parse(format!(
+                                                    "{:x}",
+                                                    Sha256::digest(
+                                                        serde_json::to_vec(
+                                                            &prior_receipt.manifest,
+                                                        )
+                                                        .map_err(|e| e.to_string())?
+                                                    )
+                                                ))?
+                                            || prior_intent.content_digest != *expected
+                                            || issued_prior != Some(expected.as_str())
+                                        {
+                                            rejection.get_or_insert_with(|| format!("Topic `{}` prior digest is stale or was not present in the issued learning batch", key.as_str()));
+                                            None
+                                        } else {
+                                            Some(expected.clone())
+                                        }
+                                    }
+                                    (None, _, _) => {
+                                        rejection.get_or_insert_with(|| {
+                                            format!(
+                                                "Topic `{}` already has publication history",
+                                                key.as_str()
+                                            )
+                                        });
+                                        None
+                                    }
+                                    (Some(_), _, _) => {
+                                        rejection.get_or_insert_with(|| format!("Topic `{}` prior digest does not match a published version", key.as_str()));
+                                        None
+                                    }
+                                };
+                                if rejection.is_some() {
+                                    continue;
+                                }
+                                let revision = match max_revision {
+                                    Some(revision) => match revision.checked_add(1) {
+                                        Some(revision) if prior_digest.is_some() => revision,
+                                        _ => {
+                                            rejection.get_or_insert_with(|| format!("Topic `{}` revision ordinal overflow or missing prior version", key.as_str()));
+                                            continue;
+                                        }
+                                    },
+                                    None if prior_digest.is_none() => 0,
+                                    None => {
+                                        rejection.get_or_insert_with(|| {
+                                            format!(
+                                                "Topic `{}` has no prior publication",
+                                                key.as_str()
+                                            )
+                                        });
+                                        continue;
+                                    }
+                                };
+                                let mut sources = sources;
+                                sources
+                                    .sort_by(|left, right| left.finding_id.cmp(&right.finding_id));
                                 match crate::topic::render(&binding.project_id, change, &sources) {
                                     Ok(content) => {
                                         rendered_topic_bytes = rendered_topic_bytes
@@ -3217,34 +3691,21 @@ impl ConfigStore {
                                         {
                                             rejection.get_or_insert_with(|| "Supervisor Topic batch exceeds its rendered byte limit".into());
                                         }
-                                        let key = crate::topic::TopicKey::parse(&change.topic_key)?;
-                                        let exists: bool = tx.query_row(
-                                            "SELECT EXISTS(SELECT 1 FROM supervisor_topic_publications WHERE project_id=?1 AND topic_key=?2)",
-                                            params![binding.project_id.as_str(), key.as_str()],
-                                            |row| row.get(0),
-                                        ).map_err(|error| error.to_string())?;
-                                        if exists {
-                                            rejection.get_or_insert_with(|| format!(
-                                                "Topic `{}` already has an accepted creation intent", key.as_str()
-                                            ));
-                                        }
-                                        let mut identity_hash = Sha256::new();
-                                        identity_hash.update(b"rex-supervisor-topic-create-v1\0");
-                                        identity_hash
-                                            .update(binding.project_id.as_str().as_bytes());
-                                        identity_hash.update(b"\0");
-                                        identity_hash.update(key.as_str().as_bytes());
-                                        let operation_id =
-                                            format!("topic-{:x}", identity_hash.finalize());
-                                        topic_intents.push(crate::topic::TopicIntent {
-                                            operation_id,
+                                        let content_digest = crate::topic::content_digest(&content);
+                                        let mut intent = crate::topic::TopicIntent {
+                                            operation_id: String::new(),
                                             project_id: binding.project_id.clone(),
                                             key,
+                                            revision,
+                                            expected_prior_digest: prior_digest,
                                             destination_root: root.to_path_buf(),
-                                            content_digest: crate::topic::content_digest(&content),
+                                            content_digest,
                                             content,
                                             sources,
-                                        });
+                                        };
+                                        intent.operation_id =
+                                            crate::topic::expected_operation_id(&intent)?;
+                                        topic_intents.push(intent);
                                     }
                                     Err(error) => {
                                         rejection.get_or_insert(error);
@@ -3314,8 +3775,8 @@ impl ConfigStore {
             }
             let intent_digest = Digest::parse(super::content_digest(&intent_json))?;
             tx.execute(
-                "INSERT INTO supervisor_topic_publications(operation_id,project_id,topic_key,destination_root,intent_json,intent_digest,state,created_at_unix) VALUES (?1,?2,?3,?4,?5,?6,'pending',?7)",
-                params![intent.operation_id,intent.project_id.as_str(),intent.key.as_str(),intent.destination_root.to_string_lossy(),intent_json,intent_digest.as_str(),now_unix],
+                "INSERT INTO supervisor_topic_publications(operation_id,project_id,topic_key,destination_root,intent_json,intent_digest,state,created_at_unix,revision,prior_content_digest) VALUES (?1,?2,?3,?4,?5,?6,'pending',?7,?8,?9)",
+                params![intent.operation_id,intent.project_id.as_str(),intent.key.as_str(),intent.destination_root.to_string_lossy(),intent_json,intent_digest.as_str(),now_unix,i64::try_from(intent.revision).map_err(|_| "Topic revision ordinal exceeds SQLite range")?,intent.expected_prior_digest.as_ref().map(Digest::as_str)],
             ).map_err(|error| error.to_string())?;
             let request_json = super::canonical_json(&serde_json::json!({
                 "operation_id": intent.operation_id,
@@ -3326,7 +3787,16 @@ impl ConfigStore {
                 subject_type: "project".into(),
                 subject_id: intent.project_id.to_string(),
                 operation_id: intent.operation_id.clone(),
-                logical_key: format!("topic-create:{}:{}", intent.project_id, intent.key.as_str()),
+                logical_key: if intent.revision == 0 {
+                    format!("topic-create:{}:{}", intent.project_id, intent.key.as_str())
+                } else {
+                    format!(
+                        "topic-revision:{}:{}:{}",
+                        intent.project_id,
+                        intent.key.as_str(),
+                        intent.revision
+                    )
+                },
                 kind: crate::engine::reducer::effect_name(
                     &crate::engine::reducer::EffectKind::PublishTopic,
                 )
@@ -4206,6 +4676,408 @@ mod tests {
         );
     }
 
+    #[test]
+    fn v21_topic_validator_rejects_partial_revision_unique_key() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE supervisor_topic_publications (
+                operation_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                topic_key TEXT NOT NULL,
+                destination_root TEXT NOT NULL,
+                intent_json TEXT NOT NULL,
+                intent_digest TEXT NOT NULL,
+                state TEXT NOT NULL,
+                receipt_json TEXT,
+                receipt_digest TEXT,
+                conflict_json TEXT,
+                created_at_unix INTEGER NOT NULL,
+                published_at_unix INTEGER,
+                revision INTEGER NOT NULL DEFAULT 0,
+                prior_content_digest TEXT
+             );",
+            )
+            .unwrap();
+        connection.execute_batch(
+            "CREATE UNIQUE INDEX topic_partial_revision ON supervisor_topic_publications(project_id,topic_key,revision) WHERE state='published';",
+        ).unwrap();
+        let error = super::validate_v21_topic_publications(&connection).unwrap_err();
+        assert!(error.contains("revision uniqueness is invalid"), "{error}");
+    }
+
+    #[test]
+    fn v21_topic_validator_rejects_missing_state_and_revision_checks() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE supervisor_topic_publications (
+                operation_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                topic_key TEXT NOT NULL,
+                destination_root TEXT NOT NULL,
+                intent_json TEXT NOT NULL,
+                intent_digest TEXT NOT NULL,
+                state TEXT NOT NULL,
+                receipt_json TEXT,
+                receipt_digest TEXT,
+                conflict_json TEXT,
+                created_at_unix INTEGER NOT NULL,
+                published_at_unix INTEGER,
+                revision INTEGER NOT NULL DEFAULT 0,
+                prior_content_digest TEXT,
+                UNIQUE(project_id,topic_key,revision)
+             );",
+            )
+            .unwrap();
+        let error = super::validate_v21_topic_publications(&connection).unwrap_err();
+        assert!(
+            error.contains("ledger constraints are incomplete"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn topic_snapshot_selects_current_distinct_keys_before_its_limit() {
+        let (_temp, mut store, project, _generation, _run) = running_store();
+        let root = std::env::temp_dir().join("rex-projects-topic-snapshot-fixture");
+        let root_string = root.to_string_lossy().into_owned();
+        let insert = |store: &mut ConfigStore,
+                      key: &str,
+                      revision: u64,
+                      prior: Option<Digest>,
+                      content: &str,
+                      state: &str,
+                      published_at: Option<i64>| {
+            let mut intent = crate::topic::TopicIntent {
+                operation_id: String::new(),
+                project_id: project.clone(),
+                key: crate::topic::TopicKey::parse(key).unwrap(),
+                revision,
+                expected_prior_digest: prior.clone(),
+                destination_root: std::path::PathBuf::from(&root_string),
+                content: content.to_owned(),
+                content_digest: crate::topic::content_digest(content),
+                sources: Vec::new(),
+            };
+            intent.operation_id = crate::topic::expected_operation_id(&intent).unwrap();
+            let mut receipt_json = None;
+            let mut receipt_digest = None;
+            if state == "published" {
+                let manifest = crate::topic::TopicManifest {
+                    operation_id: intent.operation_id.clone(),
+                    project_id: project.clone(),
+                    topic_key: intent.key.clone(),
+                    relative_path: crate::topic::publication_relative_path(&intent).unwrap(),
+                    format: "okf-0.2".into(),
+                    content_sha256: intent.content_digest.clone(),
+                    source_finding_ids: Vec::new(),
+                    source_publication_digests: Vec::new(),
+                    byte_count: content.len(),
+                };
+                let manifest_digest = Digest::parse(format!(
+                    "{:x}",
+                    Sha256::digest(serde_json::to_vec(&manifest).unwrap())
+                ))
+                .unwrap();
+                let receipt = crate::topic::TopicReceipt {
+                    manifest,
+                    manifest_digest,
+                    published_at_unix: published_at.unwrap(),
+                };
+                let json = serde_json::to_string(&receipt).unwrap();
+                receipt_digest = Some(crate::store::content_digest(&json));
+                receipt_json = Some(json);
+            }
+            let intent_json = crate::store::canonical_json(&intent).unwrap();
+            let intent_digest = crate::store::content_digest(&intent_json);
+            let conflict_json = (state == "conflict").then(|| {
+                serde_json::json!({"operation_id":intent.operation_id,"state":"conflict","reason":"fixture mismatch"}).to_string()
+            });
+            store.connection.execute(
+                "INSERT INTO supervisor_topic_publications(operation_id,project_id,topic_key,destination_root,intent_json,intent_digest,state,receipt_json,receipt_digest,conflict_json,created_at_unix,published_at_unix,revision,prior_content_digest) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,?11,?12,?13)",
+                params![intent.operation_id, project.as_str(), key, root_string, intent_json, intent_digest, state, receipt_json, receipt_digest, conflict_json, published_at, i64::try_from(revision).unwrap(), prior.as_ref().map(Digest::as_str)],
+            ).unwrap();
+            intent
+        };
+
+        let first = insert(
+            &mut store,
+            "topic-0",
+            0,
+            None,
+            "topic zero genesis",
+            "published",
+            Some(10),
+        );
+        let second = insert(
+            &mut store,
+            "topic-0",
+            1,
+            Some(first.content_digest.clone()),
+            "topic zero revision one",
+            "published",
+            Some(20),
+        );
+        let current = insert(
+            &mut store,
+            "topic-0",
+            2,
+            Some(second.content_digest.clone()),
+            "topic zero revision two",
+            "published",
+            Some(100),
+        );
+        for index in 1..=5 {
+            insert(
+                &mut store,
+                &format!("topic-{index}"),
+                0,
+                None,
+                &format!("topic {index}"),
+                "published",
+                Some(10 + index),
+            );
+        }
+        insert(
+            &mut store,
+            "topic-0",
+            3,
+            Some(current.content_digest.clone()),
+            "conflicted next version",
+            "conflict",
+            None,
+        );
+        insert(
+            &mut store,
+            "unpublished",
+            0,
+            None,
+            "pending only",
+            "pending",
+            None,
+        );
+
+        let tx = store.connection.transaction().unwrap();
+        let snapshot = super::supervisor_learning_snapshot_in_transaction(
+            &tx,
+            &project,
+            "2026-11-13T00:00:00Z",
+            0,
+            Some(std::path::Path::new(&root_string)),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(snapshot.topics.len(), 5);
+        assert_eq!(snapshot.omitted_topics, 1);
+        let current_entry = snapshot
+            .topics
+            .iter()
+            .find(|topic| topic.topic_key.as_str() == "topic-0")
+            .unwrap();
+        assert_eq!(current_entry.content, current.content);
+        assert_eq!(current_entry.content_digest, current.content_digest);
+        assert_eq!(
+            snapshot
+                .topics
+                .iter()
+                .map(|topic| topic.topic_key.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            5
+        );
+    }
+
+    #[test]
+    fn conflicting_revision_is_durably_rejected_and_keeps_last_published_topic_current() {
+        let LearningDispatchFixture {
+            _temp,
+            mut store,
+            project,
+            generation,
+            result,
+            config,
+            config_digest,
+            ..
+        } = learning_dispatch_fixture_with_topic(
+            crate::engine::orchestration::AgentAssertion::Succeeded,
+            false,
+            false,
+            None,
+            true,
+            None,
+        );
+        let root = std::path::PathBuf::from(&config.knowledge.as_ref().unwrap().root);
+        crate::engine::factory_runtime::tests::apply_agent_result_with_topic_root_for_test(
+            &mut store,
+            generation,
+            101,
+            &config,
+            config_digest,
+            &result,
+            Some(root.clone()),
+        )
+        .unwrap();
+        let genesis: String = store
+            .connection
+            .query_row(
+                "SELECT operation_id FROM supervisor_topic_publications WHERE project_id=?1",
+                [project.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let genesis_operation = OperationId::parse(genesis).unwrap();
+        let genesis_intent = store
+            .supervisor_topic_intent(&genesis_operation)
+            .unwrap()
+            .unwrap();
+        let handler = crate::topic_effect::TopicEffectHandler::new(root.clone());
+        let limits = crate::effects::EffectLimits {
+            max_attempts: 3,
+            max_age: std::time::Duration::from_secs(3600),
+            retry_base: std::time::Duration::from_secs(1),
+            retry_max: std::time::Duration::from_secs(8),
+        };
+        crate::effects::EffectDispatcher::tick(&mut store, generation, 102, &[&handler], limits)
+            .unwrap();
+        let change = crate::topic::TopicChange {
+            topic_key: genesis_intent.key.as_str().into(),
+            title: "A revised title that conflicts on disk".into(),
+            summary: "The host must preserve bytes at a digest-derived revision path.".into(),
+            claims: vec!["A mismatching file is never overwritten.".into()],
+            applicability: "Used to test a revision destination conflict.".into(),
+            proposed_check: "Keep the last successfully published version current.".into(),
+            counterexamples: Vec::new(),
+            source_finding_ids: genesis_intent
+                .sources
+                .iter()
+                .map(|source| source.finding_id.clone())
+                .collect(),
+            expected_prior_digest: Some(genesis_intent.content_digest.clone()),
+        };
+        let content = crate::topic::render(&project, &change, &genesis_intent.sources).unwrap();
+        let mut revision = crate::topic::TopicIntent {
+            operation_id: String::new(),
+            project_id: project.clone(),
+            key: genesis_intent.key.clone(),
+            revision: 1,
+            expected_prior_digest: Some(genesis_intent.content_digest.clone()),
+            destination_root: root.clone(),
+            content_digest: crate::topic::content_digest(&content),
+            content,
+            sources: genesis_intent.sources.clone(),
+        };
+        revision.operation_id = crate::topic::expected_operation_id(&revision).unwrap();
+        let intent_json = crate::store::canonical_json(&revision).unwrap();
+        let intent_digest = crate::store::content_digest(&intent_json);
+        store.connection.execute(
+            "INSERT INTO supervisor_topic_publications(operation_id,project_id,topic_key,destination_root,intent_json,intent_digest,state,created_at_unix,revision,prior_content_digest) VALUES (?1,?2,?3,?4,?5,?6,'pending',103,1,?7)",
+            params![revision.operation_id, project.as_str(), revision.key.as_str(), root.to_string_lossy(), intent_json, intent_digest, revision.expected_prior_digest.as_ref().unwrap().as_str()],
+        ).unwrap();
+        let request_json = crate::store::canonical_json(&serde_json::json!({
+            "operation_id": revision.operation_id,
+            "intent_digest": intent_digest,
+        }))
+        .unwrap();
+        let effect = crate::store::EffectIntent {
+            project_id: project.clone(),
+            subject_type: "project".into(),
+            subject_id: project.to_string(),
+            operation_id: revision.operation_id.clone(),
+            logical_key: format!("topic-revision:{}:{}:1", project, revision.key.as_str()),
+            kind: "publish_topic".into(),
+            request_digest: crate::store::content_digest(&request_json),
+            request_json,
+            expected_revision: None,
+        };
+        let tx = store.connection.transaction().unwrap();
+        super::super::insert_effect(&tx, &effect, 103).unwrap();
+        tx.commit().unwrap();
+        let tx = store.connection.transaction().unwrap();
+        let pending_snapshot = super::supervisor_learning_snapshot_in_transaction(
+            &tx,
+            &project,
+            "2026-11-13T00:00:00Z",
+            0,
+            Some(&root),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(pending_snapshot.topics.len(), 1);
+        assert_eq!(pending_snapshot.topics[0].content, genesis_intent.content);
+        assert_eq!(
+            pending_snapshot.topics[0].content_digest,
+            genesis_intent.content_digest
+        );
+        let target = root.join(crate::topic::publication_relative_path(&revision).unwrap());
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let unexpected = b"preserve this unrecognized revision artifact";
+        std::fs::write(&target, unexpected).unwrap();
+        assert!(matches!(
+            crate::effects::EffectDispatcher::tick(
+                &mut store,
+                generation,
+                104,
+                &[&handler],
+                limits,
+            )
+            .unwrap(),
+            crate::effects::DispatchTick::Completed { .. }
+        ));
+        assert_eq!(std::fs::read(&target).unwrap(), unexpected);
+        let (state, conflict_json): (String, String) = store.connection.query_row(
+            "SELECT state,conflict_json FROM supervisor_topic_publications WHERE operation_id=?1",
+            [revision.operation_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(state, "conflict");
+        assert!(conflict_json.contains("different bytes"));
+        let tx = store.connection.transaction().unwrap();
+        let snapshot = super::supervisor_learning_snapshot_in_transaction(
+            &tx,
+            &project,
+            "2026-11-13T00:00:00Z",
+            0,
+            Some(&root),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(snapshot.topics.len(), 1);
+        assert_eq!(snapshot.topics[0].content, genesis_intent.content);
+        assert_eq!(
+            snapshot.topics[0].content_digest,
+            genesis_intent.content_digest
+        );
+        assert!(matches!(
+            handler.execute(&mut store, generation, &effect),
+            Err(crate::topic::TopicPublicationError::Conflict(_))
+        ));
+        assert_eq!(std::fs::read(&target).unwrap(), unexpected);
+        std::fs::remove_file(&target).unwrap();
+        store.stop_owner(generation).unwrap();
+        drop(store);
+        let mut store = ConfigStore::open_test(_temp.path()).unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "topic-conflict-replay-owner".into(),
+                state_root: _temp.path().display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "topic-conflict-replay-start".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            handler.execute(&mut store, generation, &effect),
+            Err(crate::topic::TopicPublicationError::Conflict(_))
+        ));
+        assert!(!target.exists());
+    }
+
     fn digest_serialized<T: serde::Serialize>(value: &T) -> Digest {
         Digest::parse(format!("{:x}", Sha256::digest(serde_json::to_vec(value).unwrap())).as_str())
             .unwrap()
@@ -4857,7 +5729,7 @@ mod tests {
             .unwrap();
         assert_eq!(indexed.0, input.findings[0]);
         assert_eq!(indexed.1, receipt.manifest_digest.as_str());
-        store.connection.execute_batch("DROP TABLE supervisor_topic_publications; DELETE FROM schema_migrations WHERE version=20; DROP TABLE learning_decisions; DROP TABLE learning_findings; DROP TABLE learning_batches; DELETE FROM schema_migrations WHERE version=19; PRAGMA user_version=18;").unwrap();
+        store.connection.execute_batch("DROP TABLE supervisor_topic_publications; DELETE FROM schema_migrations WHERE version=21; DELETE FROM schema_migrations WHERE version=20; DROP TABLE learning_decisions; DROP TABLE learning_findings; DROP TABLE learning_batches; DELETE FROM schema_migrations WHERE version=19; PRAGMA user_version=18;").unwrap();
         drop(store);
         let migrated = ConfigStore::open_test(temp.path()).unwrap();
         let backfilled: String = migrated
@@ -5920,7 +6792,7 @@ mod tests {
         assert_eq!(effect, "publish_topic");
         let operation = OperationId::parse(operation_id.clone()).unwrap();
         let intent = store.supervisor_topic_intent(&operation).unwrap().unwrap();
-        crate::topic::publish_create_only(&intent).unwrap();
+        crate::topic::publish_immutable(&intent).unwrap();
         assert!(
             store
                 .supervisor_topic_receipt(&operation)
@@ -6103,6 +6975,37 @@ mod tests {
             )
             .unwrap();
 
+        let mut wrong_format = durable_receipt.clone();
+        wrong_format.manifest.format = "unsupported-format".into();
+        wrong_format.manifest_digest = Digest::parse(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&wrong_format.manifest).unwrap())
+        ))
+        .unwrap();
+        let wrong_format_json = crate::store::canonical_json(&wrong_format).unwrap();
+        store.connection.execute(
+            "UPDATE supervisor_topic_publications SET receipt_json=?2,receipt_digest=?3 WHERE operation_id=?1",
+            params![operation.as_str(), wrong_format_json, crate::store::content_digest(&wrong_format_json)],
+        ).unwrap();
+        assert!(
+            store
+                .maintain_project_supervisor_learning(
+                    generation,
+                    &project,
+                    "2026-11-08T00:00:00Z",
+                    12,
+                    Some(&root),
+                )
+                .is_err(),
+            "a matching receipt digest must not authorize an unsupported Topic format"
+        );
+        assert!(store.supervisor_topic_receipt(&operation).is_err());
+        let valid_receipt_json = crate::store::canonical_json(&durable_receipt).unwrap();
+        store.connection.execute(
+            "UPDATE supervisor_topic_publications SET receipt_json=?2,receipt_digest=?3 WHERE operation_id=?1",
+            params![operation.as_str(), valid_receipt_json, crate::store::content_digest(&valid_receipt_json)],
+        ).unwrap();
+
         drop(store);
         let reopened = ConfigStore::open_test(_temp.path()).unwrap();
         assert!(
@@ -6110,6 +7013,82 @@ mod tests {
                 .supervisor_topic_receipt(&operation)
                 .unwrap()
                 .is_some()
+        );
+        let mut legacy_intent_value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&intent).unwrap()).unwrap();
+        legacy_intent_value
+            .as_object_mut()
+            .unwrap()
+            .remove("revision");
+        legacy_intent_value
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_prior_digest");
+        let legacy_intent_json = crate::store::canonical_json(&legacy_intent_value).unwrap();
+        let legacy_intent_digest = crate::store::content_digest(&legacy_intent_json);
+        reopened.connection.execute(
+            "UPDATE supervisor_topic_publications SET intent_json=?2,intent_digest=?3 WHERE operation_id=?1",
+            params![operation.as_str(), legacy_intent_json, legacy_intent_digest],
+        ).unwrap();
+        reopened.connection.execute_batch(
+            "ALTER TABLE supervisor_topic_publications RENAME TO supervisor_topic_publications_v21;
+             CREATE TABLE supervisor_topic_publications (
+                operation_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(project_id),
+                topic_key TEXT NOT NULL,
+                destination_root TEXT NOT NULL,
+                intent_json TEXT NOT NULL CHECK(length(intent_json)<=1048576),
+                intent_digest TEXT NOT NULL CHECK(length(intent_digest)=64),
+                state TEXT NOT NULL CHECK(state IN ('pending','published','conflict')),
+                receipt_json TEXT,
+                receipt_digest TEXT CHECK(receipt_digest IS NULL OR length(receipt_digest)=64),
+                conflict_json TEXT,
+                created_at_unix INTEGER NOT NULL,
+                published_at_unix INTEGER,
+                UNIQUE(project_id,topic_key),
+                CHECK((state='published' AND receipt_json IS NOT NULL AND receipt_digest IS NOT NULL AND published_at_unix IS NOT NULL AND conflict_json IS NULL)
+                   OR (state='pending' AND receipt_json IS NULL AND receipt_digest IS NULL AND published_at_unix IS NULL AND conflict_json IS NULL)
+                   OR (state='conflict' AND receipt_json IS NULL AND receipt_digest IS NULL AND published_at_unix IS NULL AND conflict_json IS NOT NULL))
+             );
+             INSERT INTO supervisor_topic_publications(operation_id,project_id,topic_key,destination_root,intent_json,intent_digest,state,receipt_json,receipt_digest,conflict_json,created_at_unix,published_at_unix)
+               SELECT operation_id,project_id,topic_key,destination_root,intent_json,intent_digest,state,receipt_json,receipt_digest,conflict_json,created_at_unix,published_at_unix FROM supervisor_topic_publications_v21;
+             DROP TABLE supervisor_topic_publications_v21;
+             CREATE INDEX supervisor_topic_publications_project ON supervisor_topic_publications(project_id,state,created_at_unix DESC,topic_key);
+             DELETE FROM schema_migrations WHERE version=21;
+             PRAGMA user_version=20;"
+        ).unwrap();
+        drop(reopened);
+        let migrated = ConfigStore::open_test(_temp.path()).unwrap();
+        assert_eq!(
+            migrated
+                .connection
+                .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap(),
+            21
+        );
+        let migrated_json: String = migrated
+            .connection
+            .query_row(
+                "SELECT intent_json FROM supervisor_topic_publications WHERE operation_id=?1",
+                [operation.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated_json, legacy_intent_json);
+        let migrated_intent = migrated
+            .supervisor_topic_intent(&operation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated_intent.revision, 0);
+        assert_eq!(migrated_intent.expected_prior_digest, None);
+        assert_eq!(
+            migrated
+                .supervisor_topic_receipt(&operation)
+                .unwrap()
+                .unwrap()
+                .manifest
+                .relative_path,
+            format!("projects/{}/topics/{}.md", project, intent.key.as_str())
         );
     }
 
@@ -6145,6 +7124,24 @@ mod tests {
             Some(root.clone()),
         )
         .unwrap();
+        let topic_handler = crate::topic_effect::TopicEffectHandler::new(root.clone());
+        let effect_limits = crate::effects::EffectLimits {
+            max_attempts: 3,
+            max_age: std::time::Duration::from_secs(3600),
+            retry_base: std::time::Duration::from_secs(1),
+            retry_max: std::time::Duration::from_secs(8),
+        };
+        assert!(matches!(
+            crate::effects::EffectDispatcher::tick(
+                &mut store,
+                generation,
+                102,
+                &[&topic_handler],
+                effect_limits,
+            )
+            .unwrap(),
+            crate::effects::DispatchTick::Completed { .. }
+        ));
         let first_intent_json: String = store
             .connection
             .query_row(
@@ -6173,7 +7170,7 @@ mod tests {
                     std::slice::from_ref(&project),
                     4000,
                     3600,
-                    None
+                    Some(root.as_path())
                 )
                 .unwrap(),
             Some(project.clone())
@@ -6212,15 +7209,16 @@ mod tests {
                 "A previously consumed Finding remains valid source evidence.".into(),
             ],
             topic_changes: vec![crate::topic::TopicChange {
-                topic_key: "later-consumed-source".into(),
-                title: "Use durable consumed evidence".into(),
-                summary: "A later decision can cite a Finding consumed by an earlier batch.".into(),
-                claims: vec!["Consumption records which batch used a Finding.".into()],
-                applicability: "Use when a later Topic depends on prior published evidence.".into(),
-                proposed_check: "Resolve the Finding by its published provenance.".into(),
+                topic_key: first_intent.key.as_str().into(),
+                title: "Revise the durable consumed evidence guidance".into(),
+                summary: "A later batch revises the Topic using its exact published digest.".into(),
+                claims: vec!["Published Topic history is immutable.".into()],
+                applicability: "Use when existing guidance needs an evidence-backed revision."
+                    .into(),
+                proposed_check: "Compare the issued digest and preserve all prior versions.".into(),
                 counterexamples: Vec::new(),
                 source_finding_ids: vec![consumed_source.clone()],
-                expected_prior_digest: None,
+                expected_prior_digest: Some(first_intent.content_digest.clone()),
             }],
             checkpoint: BTreeMap::new(),
             improvements: Vec::new(),
@@ -6235,6 +7233,20 @@ mod tests {
             result_digest: None,
             artifact_refs: Vec::new(),
         };
+        let schema = crate::roles::result_schema(crate::domain::types::Role::Supervisor);
+        let encoded_message = serde_json::to_string(&message).unwrap();
+        let final_response = [
+            serde_json::json!({"type":"thread.started","thread_id":"topic-revision-thread"}),
+            serde_json::json!({"type":"item.completed","item":{"type":"agent_message","text":serde_json::to_string(&serde_json::json!({"result": encoded_message})).unwrap()}}),
+            serde_json::json!({"type":"turn.completed"}),
+        ].iter().map(serde_json::Value::to_string).collect::<Vec<_>>().join("\n");
+        let (_, parsed) = crate::providers::parse_result(
+            crate::domain::types::AgentAdapter::Codex,
+            final_response.as_bytes(),
+            &schema,
+        )
+        .unwrap();
+        let message = serde_json::from_value(parsed).unwrap();
         let second_result = crate::store::agent_results::host_validation_fixture::host_validated_supervisor_result_in_with_wake_inputs(
             &mut store,
             &std::fs::canonicalize(_temp.path()).unwrap(),
@@ -6249,11 +7261,415 @@ mod tests {
             generation,
             4001,
             &config,
-            config_digest,
+            config_digest.clone(),
             &second_result,
-            Some(root),
+            Some(root.clone()),
         )
         .unwrap();
+
+        let second_operation_id: String = store.connection.query_row(
+            "SELECT operation_id FROM supervisor_topic_publications WHERE project_id=?1 AND revision=1",
+            [project.as_str()],
+            |row| row.get(0),
+        ).unwrap();
+        let second_operation = OperationId::parse(second_operation_id.clone()).unwrap();
+        let second_intent = store
+            .supervisor_topic_intent(&second_operation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_intent.revision, 1);
+        assert_eq!(
+            second_intent.expected_prior_digest,
+            Some(first_intent.content_digest.clone())
+        );
+        assert_ne!(second_intent.content_digest, first_intent.content_digest);
+        assert_eq!(
+            std::fs::read(
+                root.join(crate::topic::publication_relative_path(&first_intent).unwrap())
+            )
+            .unwrap(),
+            first_intent.content.as_bytes()
+        );
+        crate::topic::publish_immutable(&second_intent).unwrap();
+        assert!(
+            store
+                .supervisor_topic_receipt(&second_operation)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read(
+                root.join(crate::topic::publication_relative_path(&second_intent).unwrap())
+            )
+            .unwrap(),
+            second_intent.content.as_bytes()
+        );
+        store.stop_owner(generation).unwrap();
+        drop(store);
+        let mut store = ConfigStore::open_test(_temp.path()).unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "topic-revision-replay-owner".into(),
+                state_root: _temp.path().display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "topic-revision-replay-start".into(),
+                executable_path: "/tmp/rex-projects-test".into(),
+                executable_digest: "e".repeat(64),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        assert_eq!(store.activate_starting_projects(generation).unwrap(), 1);
+        assert!(matches!(
+            crate::effects::EffectDispatcher::tick(
+                &mut store,
+                generation,
+                4002,
+                &[&topic_handler],
+                effect_limits,
+            )
+            .unwrap(),
+            crate::effects::DispatchTick::Completed { .. }
+        ));
+        assert!(
+            store
+                .supervisor_topic_receipt(&second_operation)
+                .unwrap()
+                .is_some()
+        );
+        let second_file =
+            root.join(crate::topic::publication_relative_path(&second_intent).unwrap());
+        assert_eq!(
+            std::fs::read(&second_file).unwrap(),
+            second_intent.content.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(
+                root.join(crate::topic::publication_relative_path(&first_intent).unwrap())
+            )
+            .unwrap(),
+            first_intent.content.as_bytes()
+        );
+        let second_effect = store
+            .effect_by_logical_key(&format!(
+                "topic-revision:{}:{}:1",
+                project,
+                second_intent.key.as_str()
+            ))
+            .unwrap()
+            .unwrap();
+        assert!(
+            topic_handler
+                .execute(&mut store, generation, &second_effect)
+                .is_ok()
+        );
+        assert_eq!(
+            store
+                .queue_due_supervisor_learning(
+                    generation,
+                    std::slice::from_ref(&project),
+                    8000,
+                    3600,
+                    Some(root.as_path())
+                )
+                .unwrap(),
+            Some(project.clone())
+        );
+        let latest_batch = store
+            .pending_role_wake_inputs(&project, &session, 16)
+            .unwrap()
+            .into_iter()
+            .find(|wake| wake.source_type == "learning_batch")
+            .unwrap();
+        let latest_topics = latest_batch.payload_json["maintenance"]["topics"]
+            .as_array()
+            .unwrap();
+        assert_eq!(latest_topics.len(), 1);
+        assert_eq!(latest_topics[0]["content"], second_intent.content);
+        assert_eq!(
+            latest_topics[0]["content_digest"],
+            second_intent.content_digest.as_str()
+        );
+        let third_wakes = store
+            .pending_role_wake_inputs(&project, &session, 16)
+            .unwrap()
+            .into_iter()
+            .map(|wake| crate::agent_api::AgentWakeItem {
+                wake_input_id: wake.wake_input_id,
+                source_type: wake.source_type,
+                source_id: wake.source_id,
+                source_revision: wake.source_revision,
+                priority: wake.priority,
+                payload_json: wake.payload_json,
+                host_artifact_source_evidence_ids: Vec::new(),
+                host_artifacts: Vec::new(),
+                host_completion_context: None,
+            })
+            .collect::<Vec<_>>();
+        let third_batch_wake = third_wakes
+            .iter()
+            .find(|wake| wake.source_type == "learning_batch")
+            .unwrap();
+        let third_batch = third_batch_wake.payload_json.clone();
+        let project_state = store.project(&project).unwrap().unwrap();
+        let third_payload = crate::engine::orchestration::LearningDecisionPayload {
+            batch_id: third_batch["batch_id"].as_str().unwrap().to_owned(),
+            batch_digest: Digest::parse(third_batch["batch_digest"].as_str().unwrap().to_owned())
+                .unwrap(),
+            config_revision: project_state.config_revision,
+            observations: vec!["The second immutable revision is now current.".into()],
+            topic_changes: vec![crate::topic::TopicChange {
+                topic_key: second_intent.key.as_str().into(),
+                title: "Refine the durable consumed evidence guidance".into(),
+                summary: "A second revision retains both earlier immutable versions.".into(),
+                claims: vec!["Each accepted revision names the preceding digest.".into()],
+                applicability: "Use when published guidance needs another evidence-backed change."
+                    .into(),
+                proposed_check: "Verify the exact latest digest from this batch.".into(),
+                counterexamples: Vec::new(),
+                source_finding_ids: vec![consumed_source.clone()],
+                expected_prior_digest: Some(second_intent.content_digest.clone()),
+            }],
+            checkpoint: BTreeMap::new(),
+            improvements: Vec::new(),
+            candidate_change: None,
+        };
+        let third_message = crate::roles::RoleResultMessage {
+            schema_version: 1,
+            message_id: "second-topic-revision-result".into(),
+            kind: crate::engine::orchestration::RoleOutputKind::LearningDecision,
+            assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+            structured_result: serde_json::to_value(third_payload).unwrap(),
+            result_digest: None,
+            artifact_refs: Vec::new(),
+        };
+        let encoded_message = serde_json::to_string(&third_message).unwrap();
+        let final_response = [
+            serde_json::json!({"type":"thread.started","thread_id":"topic-revision-thread-2"}),
+            serde_json::json!({"type":"item.completed","item":{"type":"agent_message","text":serde_json::to_string(&serde_json::json!({"result": encoded_message})).unwrap()}}),
+            serde_json::json!({"type":"turn.completed"}),
+        ]
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+        let (_, parsed) = crate::providers::parse_result(
+            crate::domain::types::AgentAdapter::Codex,
+            final_response.as_bytes(),
+            &schema,
+        )
+        .unwrap();
+        let third_message = serde_json::from_value(parsed).unwrap();
+        let third_result = crate::store::agent_results::host_validation_fixture::host_validated_supervisor_result_in_with_wake_inputs(
+            &mut store,
+            &std::fs::canonicalize(_temp.path()).unwrap(),
+            generation,
+            project.clone(),
+            third_message,
+            crate::domain::ids::AgentRunId::parse("second-topic-revision-agent").unwrap(),
+            third_wakes,
+        )
+        .unwrap()
+        .ingested;
+        crate::engine::factory_runtime::tests::apply_agent_result_with_topic_root_for_test(
+            &mut store,
+            generation,
+            8001,
+            &config,
+            config_digest.clone(),
+            &third_result,
+            Some(root.clone()),
+        )
+        .unwrap();
+        let third_operation_id: String = store
+            .connection
+            .query_row(
+                "SELECT operation_id FROM supervisor_topic_publications WHERE project_id=?1 AND revision=2",
+                [project.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let third_operation = OperationId::parse(third_operation_id).unwrap();
+        let third_intent = store
+            .supervisor_topic_intent(&third_operation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            third_intent.expected_prior_digest,
+            Some(second_intent.content_digest.clone())
+        );
+        assert!(matches!(
+            crate::effects::EffectDispatcher::tick(
+                &mut store,
+                generation,
+                8002,
+                &[&topic_handler],
+                effect_limits,
+            )
+            .unwrap(),
+            crate::effects::DispatchTick::Completed { .. }
+        ));
+        for intent in [&first_intent, &second_intent, &third_intent] {
+            assert_eq!(
+                std::fs::read(root.join(crate::topic::publication_relative_path(intent).unwrap()))
+                    .unwrap(),
+                intent.content.as_bytes()
+            );
+        }
+        assert_eq!(
+            store
+                .queue_due_supervisor_learning(
+                    generation,
+                    std::slice::from_ref(&project),
+                    12000,
+                    3600,
+                    Some(root.as_path())
+                )
+                .unwrap(),
+            Some(project.clone())
+        );
+        let newest_pending = store
+            .pending_role_wake_inputs(&project, &session, 16)
+            .unwrap();
+        let newest_batch = newest_pending
+            .iter()
+            .find(|wake| wake.source_type == "learning_batch")
+            .unwrap();
+        let newest_topics = newest_batch.payload_json["maintenance"]["topics"]
+            .as_array()
+            .unwrap();
+        assert_eq!(newest_topics.len(), 1);
+        assert_eq!(newest_topics[0]["content"], third_intent.content);
+        assert_eq!(
+            newest_topics[0]["content_digest"],
+            third_intent.content_digest.as_str()
+        );
+        let newest_batch_id = newest_batch.payload_json["batch_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let stale_payload = crate::engine::orchestration::LearningDecisionPayload {
+            batch_id: newest_batch_id.clone(),
+            batch_digest: Digest::parse(
+                newest_batch.payload_json["batch_digest"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            )
+            .unwrap(),
+            config_revision: store.project(&project).unwrap().unwrap().config_revision,
+            observations: vec!["The old digest must be rejected.".into()],
+            topic_changes: vec![crate::topic::TopicChange {
+                topic_key: third_intent.key.as_str().into(),
+                title: "Stale revision attempt".into(),
+                summary: "This proposal names an earlier version.".into(),
+                claims: vec!["Stale proposals do not replace the current version.".into()],
+                applicability: "Used only for the rejection fixture.".into(),
+                proposed_check: "The issued digest must match the current publication.".into(),
+                counterexamples: Vec::new(),
+                source_finding_ids: vec![consumed_source.clone()],
+                expected_prior_digest: Some(first_intent.content_digest.clone()),
+            }],
+            checkpoint: BTreeMap::new(),
+            improvements: Vec::new(),
+            candidate_change: None,
+        };
+        let stale_message = crate::roles::RoleResultMessage {
+            schema_version: 1,
+            message_id: "stale-topic-revision-result".into(),
+            kind: crate::engine::orchestration::RoleOutputKind::LearningDecision,
+            assertion: crate::engine::orchestration::AgentAssertion::Succeeded,
+            structured_result: serde_json::to_value(stale_payload).unwrap(),
+            result_digest: None,
+            artifact_refs: Vec::new(),
+        };
+        let encoded_message = serde_json::to_string(&stale_message).unwrap();
+        let final_response = [
+            serde_json::json!({"type":"thread.started","thread_id":"stale-topic-thread"}),
+            serde_json::json!({"type":"item.completed","item":{"type":"agent_message","text":serde_json::to_string(&serde_json::json!({"result": encoded_message})).unwrap()}}),
+            serde_json::json!({"type":"turn.completed"}),
+        ]
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+        let (_, parsed) = crate::providers::parse_result(
+            crate::domain::types::AgentAdapter::Codex,
+            final_response.as_bytes(),
+            &schema,
+        )
+        .unwrap();
+        let stale_message = serde_json::from_value(parsed).unwrap();
+        let newest_wakes = newest_pending
+            .into_iter()
+            .map(|wake| crate::agent_api::AgentWakeItem {
+                wake_input_id: wake.wake_input_id,
+                source_type: wake.source_type,
+                source_id: wake.source_id,
+                source_revision: wake.source_revision,
+                priority: wake.priority,
+                payload_json: wake.payload_json,
+                host_artifact_source_evidence_ids: Vec::new(),
+                host_artifacts: Vec::new(),
+                host_completion_context: None,
+            })
+            .collect();
+        let stale_result = crate::store::agent_results::host_validation_fixture::host_validated_supervisor_result_in_with_wake_inputs(
+            &mut store,
+            &std::fs::canonicalize(_temp.path()).unwrap(),
+            generation,
+            project.clone(),
+            stale_message,
+            crate::domain::ids::AgentRunId::parse("stale-topic-revision-agent").unwrap(),
+            newest_wakes,
+        )
+        .unwrap()
+        .ingested;
+        crate::engine::factory_runtime::tests::apply_agent_result_with_topic_root_for_test(
+            &mut store,
+            generation,
+            12001,
+            &config,
+            config_digest.clone(),
+            &stale_result,
+            Some(root.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row::<String, _, _>(
+                    "SELECT disposition FROM agent_result_reducer_ack WHERE evidence_id=?1",
+                    [stale_result.receipt.evidence_id()],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            "rejected_by_host"
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM learning_decisions WHERE batch_id=?1",
+                    [newest_batch_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM supervisor_topic_publications WHERE project_id=?1",
+                    [project.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            3
+        );
 
         assert_eq!(
             store
@@ -6289,11 +7705,12 @@ mod tests {
             first_batch_id
         );
         let second_intent_json: String = store.connection.query_row(
-            "SELECT intent_json FROM supervisor_topic_publications WHERE project_id=?1 AND topic_key='later-consumed-source'",
-            [project.as_str()], |row| row.get(0),
+            "SELECT intent_json FROM supervisor_topic_publications WHERE project_id=?1 AND topic_key=?2 AND revision=1",
+            params![project.as_str(), first_intent.key.as_str()], |row| row.get(0),
         ).unwrap();
         let second_intent: crate::topic::TopicIntent =
             crate::protocol::parse_unique(second_intent_json.as_bytes()).unwrap();
+        assert_eq!(second_intent.revision, 1);
         assert_eq!(
             second_intent
                 .sources

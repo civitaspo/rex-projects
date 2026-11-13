@@ -776,7 +776,7 @@ mod tests {
     fn schema_18_adds_conservative_launch_phase_and_monotonic_transitions() {
         let state = tempfile::tempdir().unwrap();
         let store = crate::store::ConfigStore::open_test(state.path()).unwrap();
-        assert_eq!(crate::store::SCHEMA_VERSION, 20);
+        assert_eq!(crate::store::SCHEMA_VERSION, 21);
         validate_v18_schema(&store.connection).unwrap();
         let legacy_default: String = store
             .connection
@@ -808,6 +808,7 @@ mod tests {
              DROP TABLE learning_findings;
              DROP TABLE learning_batches;
              DROP TABLE supervisor_topic_publications;
+             DELETE FROM schema_migrations WHERE version=21;
              DELETE FROM schema_migrations WHERE version=20;
              DELETE FROM schema_migrations WHERE version=19;
              ALTER TABLE agent_launch_reservations DROP COLUMN launch_phase;
