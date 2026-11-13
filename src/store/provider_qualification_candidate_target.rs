@@ -91,7 +91,7 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 22);
+        assert_eq!(version, crate::store::SCHEMA_VERSION);
         validate_v22_schema(&store.connection).unwrap();
         let trigger_count: i64 = store.connection.query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'provider_qualification_candidate_target_%'",
@@ -206,7 +206,9 @@ mod tests {
         let legacy = rusqlite::Connection::open(&database).unwrap();
         legacy
             .execute_batch(
-                "DROP TABLE provider_qualification_candidate_targets;
+                "DROP TABLE machine_shutdowns;
+                 DELETE FROM schema_migrations WHERE version=23;
+                 DROP TABLE provider_qualification_candidate_targets;
                  DELETE FROM schema_migrations WHERE version=22;
                  PRAGMA user_version=21;",
             )
@@ -239,7 +241,7 @@ mod tests {
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            22
+            crate::store::SCHEMA_VERSION
         );
         let after_job = migrated
             .provider_qualification_job(&request.request_id)
@@ -269,7 +271,7 @@ mod tests {
                     .starts_with("state.sqlite3.pre-v2-")
             })
             .collect::<Vec<_>>();
-        assert_eq!(backups.len(), old_backup_count + 1);
+        assert_eq!(backups.len(), old_backup_count + 2);
         assert!(
             backups
                 .iter()

@@ -2519,10 +2519,49 @@ esac
             "live",
             "an event-reader EOF cannot release the running Agent reservation"
         );
-        rex_transport
-            .close_agent_block(&ticket_window, &run_id, &block)
+        let agent_runs_before_drain: i64 = fixture
+            .store
+            .test_connection()
+            .query_row("SELECT COUNT(*) FROM agent_runs", [], |row| row.get(0))
             .unwrap();
+        let short_drain_now = super::unix_now_seconds().unwrap();
+        let short_drain_issues = services
+            .machine_shutdown_tick(
+                &mut fixture.store,
+                fixture.generation,
+                short_drain_now,
+                short_drain_now + 16,
+            )
+            .unwrap();
+        assert!(!short_drain_issues.is_empty());
+        assert!(!closed.exists());
+        assert_eq!(
+            test_execution_slot_disposition(&fixture.store, &fixture.slot_owner_id),
+            "live",
+            "insufficient deadline must retain a still-live run reservation"
+        );
+        let drain_issues = services
+            .machine_shutdown_tick(
+                &mut fixture.store,
+                fixture.generation,
+                super::unix_now_seconds().unwrap(),
+                super::unix_now_seconds().unwrap() + 30,
+            )
+            .unwrap();
+        assert!(
+            drain_issues.is_empty(),
+            "shutdown drain issues: {drain_issues:?}"
+        );
         assert!(closed.exists());
+        let agent_runs_after_drain: i64 = fixture
+            .store
+            .test_connection()
+            .query_row("SELECT COUNT(*) FROM agent_runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            agent_runs_after_drain, agent_runs_before_drain,
+            "drain-only processing must not dispatch another role"
+        );
         let first_post_close = FactoryRuntimeObservationServices::recover_agents(
             &mut services,
             &mut fixture.store,

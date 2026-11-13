@@ -7001,7 +7001,7 @@ mod tests {
             .unwrap();
         assert_eq!(indexed.0, input.findings[0]);
         assert_eq!(indexed.1, receipt.manifest_digest.as_str());
-        store.connection.execute_batch("DROP TABLE provider_qualification_candidate_targets; DELETE FROM schema_migrations WHERE version=22; DROP TABLE supervisor_topic_publications; DELETE FROM schema_migrations WHERE version=21; DELETE FROM schema_migrations WHERE version=20; DROP TABLE learning_decisions; DROP TABLE learning_findings; DROP TABLE learning_batches; DELETE FROM schema_migrations WHERE version=19; PRAGMA user_version=18;").unwrap();
+        store.connection.execute_batch("DROP TABLE machine_shutdowns; DELETE FROM schema_migrations WHERE version=23; DROP TABLE provider_qualification_candidate_targets; DELETE FROM schema_migrations WHERE version=22; DROP TABLE supervisor_topic_publications; DELETE FROM schema_migrations WHERE version=21; DELETE FROM schema_migrations WHERE version=20; DROP TABLE learning_decisions; DROP TABLE learning_findings; DROP TABLE learning_batches; DELETE FROM schema_migrations WHERE version=19; PRAGMA user_version=18;").unwrap();
         drop(store);
         let migrated = ConfigStore::open_test(temp.path()).unwrap();
         let backfilled: String = migrated
@@ -9538,6 +9538,8 @@ mod tests {
                SELECT operation_id,project_id,topic_key,destination_root,intent_json,intent_digest,state,receipt_json,receipt_digest,conflict_json,created_at_unix,published_at_unix FROM supervisor_topic_publications_v21;
              DROP TABLE supervisor_topic_publications_v21;
              CREATE INDEX supervisor_topic_publications_project ON supervisor_topic_publications(project_id,state,created_at_unix DESC,topic_key);
+             DROP TABLE machine_shutdowns;
+             DELETE FROM schema_migrations WHERE version=23;
              DROP TABLE provider_qualification_candidate_targets;
              DELETE FROM schema_migrations WHERE version=22;
              DELETE FROM schema_migrations WHERE version=21;
@@ -9550,7 +9552,7 @@ mod tests {
                 .connection
                 .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap(),
-            22
+            crate::store::SCHEMA_VERSION
         );
         let migrated_json: String = migrated
             .connection

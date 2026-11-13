@@ -31,6 +31,8 @@ pub struct AgentContext {
     pub scenario: String,
     #[serde(default)]
     pub hold_after_inbox: bool,
+    #[serde(default)]
+    pub require_human_instruction: bool,
     pub messages: Vec<ContextMessage>,
 }
 
@@ -209,6 +211,12 @@ pub fn run(
     } else {
         None
     };
+    if context.require_human_instruction && role == Role::Coordinator {
+        let inbox = inbox
+            .as_ref()
+            .ok_or("Coordinator instruction fixture did not read its public inbox")?;
+        inbox.validate_human_instruction(&invocation)?;
+    }
     if matches!(
         role,
         Role::Coordinator | Role::Worker | Role::Reviewer | Role::MergeDecision
@@ -2636,6 +2644,53 @@ impl FixtureInbox {
                     .and_then(Value::as_str)
                     .is_none_or(|wake_ticket_run| wake_ticket_run == ticket_run_id)
         })
+    }
+
+    fn validate_human_instruction(&self, invocation: &FixtureInvocation) -> Result<(), String> {
+        let ticket_run_id = invocation
+            .scope
+            .ticket_run_id
+            .as_deref()
+            .ok_or("Coordinator fixture has no TicketRun identity")?;
+        let instructions = self
+            .inputs
+            .iter()
+            .filter(|item| {
+                item.get("source_type").and_then(Value::as_str) == Some("human_instruction")
+            })
+            .collect::<Vec<_>>();
+        if instructions.len() != 1 {
+            return Err(
+                "public Coordinator inbox must contain exactly one human instruction".into(),
+            );
+        }
+        let item = instructions[0];
+        let payload = &item["payload_json"];
+        let request_id = payload["request_id"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or("Coordinator instruction omitted request ID")?;
+        let body = payload["body"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or("Coordinator instruction omitted body")?;
+        let digest = payload["body_digest"]
+            .as_str()
+            .ok_or("Coordinator instruction omitted body digest")?;
+        let expected_digest = format!("{:x}", Sha256::digest(body.as_bytes()));
+        if payload["schema_version"] != 1
+            || payload["project_id"].as_str() != Some(invocation.scope.project_id.as_str())
+            || payload["ticket_run_id"].as_str() != Some(ticket_run_id)
+            || payload["expected_revision"].as_u64() != invocation.subject_revision
+            || digest != expected_digest
+            || payload["namespace"].as_str().is_none_or(str::is_empty)
+            || payload["ticket_id"].as_str().is_none_or(str::is_empty)
+        {
+            return Err(format!(
+                "Coordinator instruction {request_id} does not match the current run binding"
+            ));
+        }
+        Ok(())
     }
 }
 

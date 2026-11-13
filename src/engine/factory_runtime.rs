@@ -5604,7 +5604,7 @@ pub(crate) mod tests {
         .unwrap();
         fixture
             .store
-            .process_next_control(fixture.owner_generation)
+            .process_next_control(fixture.owner_generation, 30)
             .unwrap()
             .unwrap();
         let reconciliation_state: String = fixture
@@ -6074,7 +6074,7 @@ pub(crate) mod tests {
         .unwrap();
         fixture
             .store
-            .process_next_control(fixture.owner_generation)
+            .process_next_control(fixture.owner_generation, 30)
             .unwrap()
             .unwrap();
         fixture

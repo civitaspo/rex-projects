@@ -34,6 +34,7 @@ const NATIVE_WORKER_READY_LIMIT: Duration = Duration::from_secs(60);
 const NATIVE_WORKER_TERMINAL_LIMIT: Duration = Duration::from_secs(360);
 const ACCEPTANCE_STAGE_ENV: &str = "REX_PROJECTS_ACCEPTANCE_STAGE";
 const COORDINATOR_INBOX_STAGE: &str = "supervisor_coordinator_inbox";
+const COORDINATOR_PROGRESS_INSTRUCTION_STAGE: &str = "supervisor_coordinator_progress_instruction";
 const COORDINATOR_BLOCK_LOSS_STAGE: &str = "supervisor_coordinator_block_loss";
 const COORDINATOR_WORKER_INBOX_STAGE: &str = "supervisor_coordinator_worker_inbox";
 const HOST_COMMIT_REVIEWER_INBOX_STAGE: &str = "host_commit_reviewer_inbox";
@@ -92,6 +93,7 @@ fn parse_acceptance_stage(value: Option<String>) -> Result<Option<String>, Strin
         None => Ok(None),
         Some(stage)
             if stage == COORDINATOR_INBOX_STAGE
+                || stage == COORDINATOR_PROGRESS_INSTRUCTION_STAGE
                 || stage == COORDINATOR_BLOCK_LOSS_STAGE
                 || stage == COORDINATOR_WORKER_INBOX_STAGE
                 || stage == WORKER_RECOVERY_INBOX_STAGE
@@ -304,6 +306,8 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
     let bounded_coordinator_stage = stage.is_some() && !request_merge_stage;
     let coordinator_block_loss_stage = stage.as_deref() == Some(COORDINATOR_BLOCK_LOSS_STAGE);
     let coordinator_worker_inbox_stage = stage.as_deref() == Some(COORDINATOR_WORKER_INBOX_STAGE);
+    let coordinator_progress_instruction_stage =
+        stage.as_deref() == Some(COORDINATOR_PROGRESS_INSTRUCTION_STAGE);
     let worker_verification_stage =
         stage.as_deref() == Some(HOST_COMMIT_VERIFICATION_REVIEWER_STAGE);
     let worker_review_rework_stage =
@@ -346,7 +350,9 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
         &executable,
         request.cli,
         ProfilePreparation {
-            hold_coordinator_after_inbox: bounded_coordinator_stage && !worker_connection_stage,
+            hold_coordinator_after_inbox: bounded_coordinator_stage
+                && !worker_connection_stage
+                && !coordinator_progress_instruction_stage,
             hold_worker_after_inbox: coordinator_worker_inbox_stage,
             hold_reviewer_after_inbox: false,
             host_worker: host_commit_reviewer_inbox_stage
@@ -358,6 +364,7 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
             worker_review_rework_stage,
             worker_verification_stage,
             request_merge_stage,
+            coordinator_progress_instruction_stage,
             native_worker_codex: native_worker_codex.as_deref(),
         },
     )?;
@@ -468,17 +475,32 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
         if let Ok(capture) = rex_capture(&request, &block) {
             trace.push(json!({"step":"controller_startup_failure","status":"captured","evidence":String::from_utf8_lossy(&capture.stdout)}));
         }
-        let _ = rex_call(
-            &request,
-            &["window", "close", "--session", request.rex_session, &window],
-        );
         return unsupported(
             request.fixture_root,
             &trace,
-            "foreground controller did not publish a live owner receipt",
+            "foreground controller did not publish a live owner receipt; its Rex window is preserved because process absence is unconfirmed",
             true,
         );
     }
+    let controller_identity = match capture_controller_identity(&owner_status, request.cli) {
+        Ok(identity) => identity,
+        Err(error) => {
+            trace.push(json!({"step":"controller_process_identity_captured","status":"incomplete","reason":error}));
+            let stop = product(&request, &state_root, &["runtime", "stop", "--json"])?;
+            trace.push(json!({"step":"bounded_stage_stop_request","status":if stop.status.is_some_and(|status| status.success()) {"queued"} else {"rejected"},"evidence":json_stdout(&stop)}));
+            return unsupported(
+                request.fixture_root,
+                &trace,
+                "cannot bind the live controller PID to a kernel birth identity and pinned executable; stop was requested and the Rex resource window is preserved",
+                true,
+            );
+        }
+    };
+    trace.push(json!({
+        "step":"controller_process_identity_captured",
+        "status":"passed",
+        "evidence":{"pid":controller_identity.pid,"start_identity":controller_identity.start_identity,"quality":controller_identity.quality,"executable":executable_path_for_identity(&controller_identity).map_err(|error| error.to_string())?}
+    }));
     // Qualification is an actual public product workflow. The CLI only queues durable jobs;
     // the foreground controller launches each bounded profile probe in its own Rex session.
     // We qualify roles in pipeline order, polling the public durable status endpoint before
@@ -558,6 +580,8 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
     let mut host_commit_reviewer_boundary_reached = false;
     let mut host_commit_connection_evidence = None;
     let mut coordinator_block_loss_proof = None;
+    let mut coordinator_progress_instruction_proof = None;
+    let mut coordinator_instruction_wake_id = None;
     let mut request_merge_evidence = RequestMergeEvidence::default();
     let mut request_merge_stop = None;
     loop {
@@ -754,10 +778,13 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
                     break;
                 }
             }
-            if let Some(coordinator) = observations
-                .iter()
-                .find(|observation| is_coordinator_dispatch_observation(observation))
-            {
+            if let Some(coordinator) = observations.iter().find(|observation| {
+                if coordinator_progress_instruction_stage {
+                    observation["role"] == "coordinator"
+                } else {
+                    is_coordinator_dispatch_observation(observation)
+                }
+            }) {
                 if !coordinator_boundary_reached {
                     trace.push(json!({"step":"coordinator_inbox_boundary_observed","status":"passed","evidence":coordinator}));
                     coordinator_boundary_reached = true;
@@ -771,7 +798,89 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
                     coordinator_block_loss_proof = Some(proof);
                     break;
                 }
-                if !worker_connection_stage {
+                if coordinator_progress_instruction_stage {
+                    let ticket_run_id = coordinator["ticket_run_id"]
+                        .as_str()
+                        .ok_or("Coordinator dispatch observation omitted TicketRun ID")?;
+                    if coordinator_instruction_wake_id.is_none() {
+                        if let Some(proof) =
+                            observe_coordinator_progress_result(&state_root, ticket_run_id, 1)?
+                        {
+                            trace.push(json!({"step":"coordinator_progress_result_reduced","status":"passed","evidence":proof}));
+                            let revision = proof["revision"].as_u64().ok_or(
+                                "Coordinator result proof omitted current TicketRun revision",
+                            )?;
+                            require_coordinator_instruction_in_fixture_context(
+                                &request.fixture_root.join("contexts/coordinator.json"),
+                            )?;
+                            let message_file =
+                                request.fixture_root.join("coordinator-instruction.txt");
+                            fs::write(
+                                &message_file,
+                                "Continue the bounded acceptance by acknowledging this durable human instruction.",
+                            )
+                            .map_err(|error| format!("write public Coordinator instruction: {error}"))?;
+                            let revision_text = revision.to_string();
+                            let request_id = "acceptance-coordinator-instruction-1";
+                            let instruction = product(
+                                &request,
+                                &state_root,
+                                &[
+                                    "ticket",
+                                    "instruct",
+                                    "--run",
+                                    ticket_run_id,
+                                    "--expected-revision",
+                                    &revision_text,
+                                    "--message-file",
+                                    message_file
+                                        .to_str()
+                                        .ok_or("instruction path is not UTF-8")?,
+                                    "--request-id",
+                                    request_id,
+                                    "--json",
+                                ],
+                            )?;
+                            require_success("public ticket instruct command", &instruction)?;
+                            let receipt = json_stdout(&instruction);
+                            let wake_id = receipt["coordinator_wake_input_id"]
+                                .as_u64()
+                                .ok_or("public ticket instruct omitted Coordinator wake ID")?;
+                            trace.push(json!({
+                                "step":"public_ticket_instruction",
+                                "status":"queued",
+                                "command":"ticket instruct --run <ticket-run-id> --expected-revision <current-revision> --message-file <file> --request-id <stable-id> --json",
+                                "evidence":receipt,
+                                "no_active_coordinator_slot_before_request":proof["active_coordinator_slots"] == 0
+                            }));
+                            coordinator_progress_instruction_proof = Some(json!({
+                                "initial_coordinator_result":proof,
+                                "instruction_receipt":receipt,
+                                "instruction_message_file":message_file,
+                                "coordinator_instruction_wake_id":wake_id,
+                                "later_coordinator_inbox":null,
+                                "later_coordinator_result":null
+                            }));
+                            coordinator_instruction_wake_id = Some(wake_id);
+                        }
+                    } else if let Some(wake_id) = coordinator_instruction_wake_id
+                        && let Some(observation) = observations.iter().find(|observation| {
+                            is_coordinator_instruction_observation(observation, wake_id)
+                        })
+                        && let Some(proof) =
+                            observe_coordinator_progress_result(&state_root, ticket_run_id, 2)?
+                    {
+                        trace.push(json!({"step":"durable_instruction_read_by_later_coordinator","status":"passed","evidence":{"wake_id":wake_id,"inbox_observation":observation,"coordinator_result":proof}}));
+                        if let Some(stage_proof) = coordinator_progress_instruction_proof.as_mut() {
+                            stage_proof["later_coordinator_inbox"] = observation.clone();
+                            stage_proof["later_coordinator_result"] = proof;
+                        }
+                        let stop = product(&request, &state_root, &["runtime", "stop", "--json"])?;
+                        trace.push(json!({"step":"bounded_stage_stop_request","status":if stop.status.is_some_and(|status| status.success()) {"queued"} else {"rejected"},"evidence":json_stdout(&stop)}));
+                        break;
+                    }
+                }
+                if !worker_connection_stage && !coordinator_progress_instruction_stage {
                     let stop = product(&request, &state_root, &["runtime", "stop", "--json"])?;
                     if !stop.status.is_some_and(|status| status.success()) {
                         trace.push(json!({"step":"bounded_stage_stop_request","status":"rejected","evidence":json_stdout(&stop)}));
@@ -796,10 +905,9 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
         trace.push(json!({"step":"rex_controller_output","status":"captured","evidence":String::from_utf8_lossy(&capture.stdout)}));
     }
     let _ = product(&request, &state_root, &["runtime", "stop", "--json"]);
-    let stopped = poll_controller_stopped(&request, &state_root);
-    trace.push(
-        json!({"step":"controller_stop","status":if stopped {"passed"} else {"unconfirmed"}}),
-    );
+    let stop_proof = poll_controller_stopped(&request, &state_root, &controller_identity);
+    let stopped = stop_proof["status"] == "passed";
+    trace.push(json!({"step":"controller_stop","status":if stopped {"passed"} else {"unconfirmed"},"evidence":stop_proof}));
     if !stopped {
         return unsupported(
             request.fixture_root,
@@ -863,6 +971,14 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
             || coordinator_block_loss_proof
                 .as_ref()
                 .is_some_and(|proof| proof["status"] == "passed"))
+        && (!coordinator_progress_instruction_stage
+            || coordinator_progress_instruction_proof
+                .as_ref()
+                .is_some_and(|proof| {
+                    proof["initial_coordinator_result"].is_object()
+                        && proof["later_coordinator_inbox"].is_object()
+                        && proof["later_coordinator_result"].is_object()
+                }))
         && (!host_commit_reviewer_inbox_stage
             || host_commit_connection_evidence
                 .as_ref()
@@ -917,6 +1033,7 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
         } else {
             json!({
                 "coordinator_missing_qualification_wait":coordinator_qualification_wait_proof,
+                "coordinator_progress_instruction":coordinator_progress_instruction_proof,
                 "coordinator_process_held_until_stop":coordinator_boundary_reached
             })
         };
@@ -2936,6 +3053,113 @@ fn read_public_inbox_observations(fixture_root: &Path) -> Result<Vec<Value>, Str
         .collect()
 }
 
+fn observe_coordinator_progress_result(
+    state_root: &Path,
+    ticket_run_id: &str,
+    expected_runs: u64,
+) -> Result<Option<Value>, String> {
+    let database = open_acceptance_state_read_only(state_root)?;
+    database
+        .busy_timeout(Duration::from_secs(2))
+        .map_err(|error| format!("set Coordinator evidence SQLite timeout: {error}"))?;
+    let ticket: Option<(u64, String)> = database
+        .query_row(
+            "SELECT revision,internal_phase FROM ticket_runs WHERE ticket_run_id=?1 AND project_id=?2",
+            params![ticket_run_id, FIXTURE_PROJECT_ID],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("read Coordinator TicketRun state: {error}"))?;
+    let Some((revision, phase)) = ticket else {
+        return Ok(None);
+    };
+    let mut statement = database
+        .prepare(
+            "SELECT a.agent_run_id,r.state,e.result_json,ack.disposition,
+                    (SELECT COUNT(*) FROM agent_terminal_receipts terminal WHERE terminal.agent_run_id=a.agent_run_id),
+                    (SELECT COUNT(*) FROM execution_slots slot WHERE slot.owner_kind='agent_run' AND slot.owner_id=a.agent_run_id AND slot.disposition!='released')
+             FROM agent_launch_authority a
+             JOIN agent_runs r ON r.agent_run_id=a.agent_run_id
+             LEFT JOIN agent_result_evidence e ON e.agent_run_id=a.agent_run_id AND e.outcome='completed'
+             LEFT JOIN agent_result_reducer_ack ack ON ack.evidence_id=e.evidence_id
+             WHERE a.project_id=?1 AND a.ticket_run_id=?2 AND a.role='coordinator'
+             ORDER BY r.started_at_unix,a.agent_run_id",
+        )
+        .map_err(|error| format!("prepare Coordinator result evidence query: {error}"))?;
+    let rows = statement
+        .query_map(params![FIXTURE_PROJECT_ID, ticket_run_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, u64>(4)?,
+                row.get::<_, u64>(5)?,
+            ))
+        })
+        .map_err(|error| format!("query Coordinator result evidence: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("read Coordinator result evidence row: {error}"))?;
+    let coordinator_count = rows.len() as u64;
+    if coordinator_count != expected_runs {
+        return Ok(None);
+    }
+    let planner_worker_runs: u64 = database
+        .query_row(
+            "SELECT COUNT(*) FROM agent_launch_authority WHERE project_id=?1 AND ticket_run_id=?2 AND role IN ('planner','worker')",
+            params![FIXTURE_PROJECT_ID, ticket_run_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("count unexpected Planner or Worker launches: {error}"))?;
+    let active_coordinator_slots: u64 = database
+        .query_row(
+            "SELECT COUNT(*) FROM execution_slots slot JOIN agent_launch_authority a ON a.agent_run_id=slot.owner_id WHERE a.project_id=?1 AND a.ticket_run_id=?2 AND a.role='coordinator' AND slot.owner_kind='agent_run' AND slot.disposition!='released'",
+            params![FIXTURE_PROJECT_ID, ticket_run_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("count active Coordinator slots: {error}"))?;
+    let mut runs = Vec::new();
+    for (run_id, state, result_json, disposition, terminal_count, active_slots) in rows {
+        let Some(result_json) = result_json else {
+            return Ok(None);
+        };
+        let result: Value = serde_json::from_str(&result_json)
+            .map_err(|error| format!("parse persisted Coordinator result: {error}"))?;
+        if state != "completed"
+            || terminal_count != 1
+            || active_slots != 0
+            || result["kind"] != "progress"
+            || result["assertion"]["assertion"] != "succeeded"
+            || disposition.as_deref() != Some("retained_as_claim")
+        {
+            return Ok(None);
+        }
+        runs.push(json!({
+            "agent_run_id":run_id,
+            "state":state,
+            "terminal_receipts":terminal_count,
+            "result_kind":result["kind"],
+            "assertion":result["assertion"],
+            "reducer_disposition":disposition,
+            "released_slot_count":active_slots
+        }));
+    }
+    if phase != "planning" || planner_worker_runs != 0 || active_coordinator_slots != 0 {
+        return Ok(None);
+    }
+    Ok(Some(json!({
+        "status":"passed",
+        "ticket_run_id":ticket_run_id,
+        "revision":revision,
+        "ticket_run_phase":phase,
+        "coordinator_run_count":coordinator_count,
+        "coordinator_runs":runs,
+        "active_coordinator_slots":active_coordinator_slots,
+        "planner_worker_run_count":planner_worker_runs,
+        "ticket_done":false
+    })))
+}
+
 fn read_probe_diagnostic(fixture_root: &Path, project: &str, role: &str) -> Option<Value> {
     let directory = fixture_root.join("agent-state").join("probe-diagnostics");
     for entry in fs::read_dir(directory).ok()? {
@@ -3060,6 +3284,7 @@ struct ProfilePreparation<'a> {
     worker_review_rework_stage: bool,
     worker_verification_stage: bool,
     request_merge_stage: bool,
+    coordinator_progress_instruction_stage: bool,
     native_worker_codex: Option<&'a Path>,
 }
 
@@ -3101,6 +3326,12 @@ fn prepare_profiles(
                 preparation.native_worker_codex.is_some(),
             )?
         };
+        let messages =
+            if preparation.coordinator_progress_instruction_stage && role == "coordinator" {
+                coordinator_progress_messages(messages)?
+            } else {
+                messages
+            };
         let messages = if preparation.request_merge_stage && role == "merge_decision" {
             request_merge_messages(messages)
         } else {
@@ -3112,7 +3343,7 @@ fn prepare_profiles(
         fs::write(
             &context,
             serde_json::to_vec(
-                &json!({"schema_version":1,"scenario":scenario,"hold_after_inbox":hold,"messages":messages}),
+                &json!({"schema_version":1,"scenario":scenario,"hold_after_inbox":hold,"require_human_instruction":false,"messages":messages}),
             )
             .map_err(|error| error.to_string())?,
         )
@@ -3153,6 +3384,59 @@ fn prepare_profiles(
         fs::write(profile.join("config.toml"), config).map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+fn coordinator_progress_messages(mut messages: Vec<Value>) -> Result<Vec<Value>, String> {
+    let index = messages
+        .iter()
+        .position(|item| item["lane"] == "workflow")
+        .ok_or("Coordinator fixture has no workflow result")?;
+    messages[index] = message(
+        "coordinator",
+        "progress",
+        json!({
+            "summary":"The Coordinator read the generated ticket inbox and recorded its bounded initial assessment.",
+            "completed_node_keys":[],
+            "pending_node_keys":[],
+            "evidence":[],
+            "next_observation_at":null
+        }),
+    )
+    .with_lane("workflow");
+    messages.truncate(index + 1);
+    Ok(messages)
+}
+
+fn require_coordinator_instruction_in_fixture_context(path: &Path) -> Result<(), String> {
+    let mut context: Value = serde_json::from_slice(
+        &fs::read(path).map_err(|error| format!("read Coordinator fixture context: {error}"))?,
+    )
+    .map_err(|error| format!("parse Coordinator fixture context: {error}"))?;
+    context["require_human_instruction"] = json!(true);
+    fs::write(
+        path,
+        serde_json::to_vec(&context).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("enable Coordinator inbox instruction assertion: {error}"))
+}
+
+fn is_coordinator_instruction_observation(observation: &Value, wake_id: u64) -> bool {
+    observation["role"] == "coordinator"
+        && observation["wake_input_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id.as_u64() == Some(wake_id)))
+        && observation["inbox_inputs"]
+            .as_array()
+            .is_some_and(|inputs| {
+                inputs.iter().any(|input| {
+                    input["wake_input_id"].as_u64() == Some(wake_id)
+                        && input["source_type"] == "human_instruction"
+                        && input
+                            .pointer("/payload_json/request_id")
+                            .and_then(Value::as_str)
+                            == Some("acceptance-coordinator-instruction-1")
+                })
+            })
 }
 
 fn profile_messages_with_review_rework(role: &str) -> Result<Vec<Value>, String> {
@@ -4346,17 +4630,94 @@ fn projects_running(status: &Value) -> bool {
     })
 }
 
-fn poll_controller_stopped(request: &Request<'_>, state_root: &Path) -> bool {
+fn capture_controller_identity(
+    owner_status: &Value,
+    pinned_cli: &Path,
+) -> Result<ProcessIdentity, String> {
+    let pid = owner_status["owner"]["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .ok_or("live controller owner receipt omitted its PID")?;
+    let identity = process_identity_for_pid(pid)
+        .map_err(|error| format!("inspect live controller process identity: {error}"))?
+        .ok_or("controller PID disappeared before its identity was captured")?;
+    if identity.quality != ProcessIdentityQuality::KernelBirthToken {
+        return Err("controller process identity is not a kernel birth token".into());
+    }
+    let actual = executable_path_for_identity(&identity)
+        .map_err(|error| format!("resolve pinned controller executable: {error}"))?
+        .ok_or("controller executable identity changed during capture")?;
+    let actual = actual.canonicalize().unwrap_or(actual);
+    let expected = pinned_cli
+        .canonicalize()
+        .unwrap_or_else(|_| pinned_cli.to_path_buf());
+    if actual != expected {
+        return Err(format!(
+            "controller PID {} does not run the pinned CLI: {} != {}",
+            identity.pid,
+            actual.display(),
+            expected.display()
+        ));
+    }
+    Ok(identity)
+}
+
+fn poll_controller_stopped(
+    request: &Request<'_>,
+    state_root: &Path,
+    controller_identity: &ProcessIdentity,
+) -> Value {
     let deadline = Instant::now() + POLL_LIMIT;
+    let mut last = json!({"status":"incomplete","reason":"shutdown not yet observed"});
     loop {
         if let Ok(output) = product(request, state_root, &["status", "--json"])
+            && output.status.is_some_and(|status| status.success())
             && let Ok(value) = serde_json::from_slice::<Value>(&output.stdout)
-            && value["owner"]["active"] == false
         {
-            return true;
+            let process = match process_identity_for_pid(controller_identity.pid) {
+                Ok(Some(current)) => {
+                    json!({
+                        "original_controller_absent":current.quality == ProcessIdentityQuality::KernelBirthToken
+                            && controller_identity.quality == ProcessIdentityQuality::KernelBirthToken
+                            && current.start_identity != controller_identity.start_identity,
+                        "observed_pid":current.pid,
+                        "observed_start_identity":current.start_identity,
+                    })
+                }
+                Ok(None) => json!({"original_controller_absent":true,"observed_pid":null}),
+                Err(error) => {
+                    json!({"original_controller_absent":false,"inspection_error":error.to_string()})
+                }
+            };
+            let slots_settled = value["occupied_slots"].as_u64() == Some(0);
+            let uncertain_owned_effects_clear = value["uncertain_effects"].as_u64() == Some(0);
+            let shutdown_stopped = value
+                .pointer("/machine_shutdown/status")
+                .and_then(Value::as_str)
+                == Some("stopped");
+            let owner_inactive = value["owner"]["active"] == false;
+            let passed = owner_inactive
+                && slots_settled
+                && uncertain_owned_effects_clear
+                && shutdown_stopped
+                && process["original_controller_absent"] == true;
+            last = json!({
+                "status":if passed {"passed"} else {"incomplete"},
+                "owner_inactive":owner_inactive,
+                "occupied_slots":value["occupied_slots"],
+                "uncertain_effects":value["uncertain_effects"],
+                "machine_shutdown":value["machine_shutdown"],
+                "pending_commands":value["pending_commands"],
+                "pending_effects":value["pending_effects"],
+                "controller_process":process,
+                "status_snapshot":value
+            });
+            if passed {
+                return last;
+            }
         }
         if Instant::now() >= deadline {
-            return false;
+            return last;
         }
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -8685,6 +9046,10 @@ esac
         assert_eq!(
             parse_acceptance_stage(Some(COORDINATOR_INBOX_STAGE.into())).unwrap(),
             Some(COORDINATOR_INBOX_STAGE.into())
+        );
+        assert_eq!(
+            parse_acceptance_stage(Some(COORDINATOR_PROGRESS_INSTRUCTION_STAGE.into())).unwrap(),
+            Some(COORDINATOR_PROGRESS_INSTRUCTION_STAGE.into())
         );
         assert_eq!(
             parse_acceptance_stage(Some(COORDINATOR_BLOCK_LOSS_STAGE.into())).unwrap(),

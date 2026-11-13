@@ -40,7 +40,7 @@ pub(crate) mod provider_qualification_candidate_target;
 #[path = "store/rex_view_tables.rs"]
 pub(crate) mod rex_view_tables;
 
-pub const SCHEMA_VERSION: i64 = 22;
+pub const SCHEMA_VERSION: i64 = 23;
 #[path = "store/accepted_plans.rs"]
 pub mod accepted_plans;
 pub mod agent_runtime;
@@ -48,6 +48,7 @@ pub mod host_jobs;
 pub mod human;
 #[path = "store/learning.rs"]
 mod learning_store;
+pub mod machine_shutdown;
 pub mod merge_claim_recovery;
 pub mod merge_work;
 pub use learning_store::{
@@ -335,6 +336,10 @@ pub struct RuntimeStatus {
     pub pending_effects: u64,
     pub uncertain_effects: u64,
     pub occupied_slots: u64,
+    pub machine_shutdown_request_id: Option<String>,
+    pub machine_shutdown_status: Option<String>,
+    pub machine_shutdown_deadline_unix: Option<i64>,
+    pub machine_shutdown_error: Option<String>,
     pub observed_at_unix: i64,
 }
 
@@ -780,11 +785,18 @@ impl ConfigStore {
             }
             provider_qualification_candidate_target::migrate_v22(&connection)?;
         }
+        if existing_version < 23 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            machine_shutdown::migrate_v23(&connection)?;
+        }
         artifact_registry::validate_v12_schema(&connection)?;
         agent_launch_phase::validate_v18_schema(&connection)?;
         learning_store::validate_v19_learning_batches(&connection)?;
         learning_store::validate_v21_topic_publications(&connection)?;
         provider_qualification_candidate_target::validate_v22_schema(&connection)?;
+        machine_shutdown::validate_v23_schema(&connection)?;
         Ok(Self {
             connection,
             _machine_lock: machine_lock,
@@ -3662,15 +3674,23 @@ impl ConfigStore {
         tx.execute("UPDATE effects SET status='uncertain', owner_generation=NULL, last_error='previous controller stopped before recording an outcome' WHERE status='claimed'", []).map_err(|e| e.to_string())?;
         tx.execute("UPDATE execution_slots SET disposition='unknown' WHERE disposition IN ('launch_pending','live')", []).map_err(|e| e.to_string())?;
         tx.execute("UPDATE agent_runs SET state='unknown', controller_generation=?1 WHERE state IN ('launch_pending','running','unknown')", [generation]).map_err(|e| e.to_string())?;
+        tx.execute("UPDATE machine_shutdowns SET owner_generation=?1,updated_at_unix=?2 WHERE status IN ('draining','incomplete')", params![generation, now]).map_err(|e| e.to_string())?;
         tx.execute("INSERT INTO controller_owners(singleton, owner_nonce, generation, state_root, config_source, pid, process_start_identity, executable_path, executable_digest, rex_endpoint, rex_server_identity, rex_session_id, rex_block_id, started_at_unix, heartbeat_at_unix, stopped_at_unix) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, NULL) ON CONFLICT(singleton) DO UPDATE SET owner_nonce=excluded.owner_nonce, generation=excluded.generation, state_root=excluded.state_root, config_source=excluded.config_source, pid=excluded.pid, process_start_identity=excluded.process_start_identity, executable_path=excluded.executable_path, executable_digest=excluded.executable_digest, rex_endpoint=excluded.rex_endpoint, rex_server_identity=excluded.rex_server_identity, rex_session_id=excluded.rex_session_id, rex_block_id=excluded.rex_block_id, started_at_unix=excluded.started_at_unix, heartbeat_at_unix=excluded.heartbeat_at_unix, stopped_at_unix=NULL", params![owner.owner_nonce, generation, owner.state_root, owner.config_source, std::process::id(), owner.process_start_identity, owner.executable_path, owner.executable_digest, owner.rex_endpoint, owner.rex_server_identity, owner.rex_session_id, owner.rex_block_id, now]).map_err(|e| e.to_string())?;
         // A new machine owner must reclaim Projects whose durable desired state is still
         // running. Keep their epoch and all execution-slot evidence intact: only lifecycle
         // ownership moves to this controller, which activates them on its first tick.
-        tx.execute(
+        let shutdown_active: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM machine_shutdowns WHERE status IN ('draining','incomplete'))",
+            [],
+            |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if !shutdown_active {
+            tx.execute(
             "UPDATE project_runtimes SET desired_lifecycle='running',observed_lifecycle='starting',controller_generation=?1 WHERE project_id IN (SELECT project_id FROM projects WHERE desired_lifecycle='running')",
             [generation],
         )
         .map_err(|error| error.to_string())?;
+        }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(generation)
     }
@@ -3698,7 +3718,11 @@ impl ConfigStore {
     pub fn process_next_control(
         &mut self,
         owner_generation: u64,
+        shutdown_grace_seconds: u64,
     ) -> Result<Option<ControlCommand>, String> {
+        if !(1..=300).contains(&shutdown_grace_seconds) {
+            return Err("machine shutdown grace must be between 1 and 300 seconds".into());
+        }
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -3715,8 +3739,19 @@ impl ConfigStore {
             ],
         )
         .map_err(|error| error.to_string())?;
+        let draining: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM machine_shutdowns WHERE status IN ('draining','incomplete'))",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if draining {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(None);
+        }
         let row: Option<PendingControlRow> = tx.query_row(
-            "SELECT request_id, kind, project_id, lifecycle, payload_json, created_at_unix FROM controller_commands WHERE state='pending' ORDER BY sequence LIMIT 1",
+            "SELECT request_id, kind, project_id, lifecycle, payload_json, created_at_unix FROM controller_commands WHERE state='pending' ORDER BY CASE kind WHEN 'machine_stop' THEN 0 ELSE 1 END,sequence LIMIT 1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
         ).optional().map_err(|e| e.to_string())?;
@@ -3769,7 +3804,14 @@ impl ConfigStore {
         let mut result = serde_json::json!({"accepted":true});
         let mut applied_config = None;
         match kind.as_str() {
-            "machine_stop" => {}
+            "machine_stop" => Self::begin_machine_shutdown_in_transaction(
+                &tx,
+                owner_generation,
+                &request_id,
+                machine_shutdown::MachineShutdownCause::Command,
+                now_unix()?,
+                shutdown_grace_seconds,
+            )?,
             "config_apply" => {
                 let outcome = payload_json
                     .as_deref()
@@ -4100,6 +4142,15 @@ impl ConfigStore {
         } else {
             (None, None, None, None)
         };
+        let machine_shutdown = if schema_version >= 23 {
+            connection.query_row(
+                "SELECT request_id,status,deadline_unix,last_error FROM machine_shutdowns ORDER BY requested_at_unix DESC,request_id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?,row.get::<_,Option<String>>(3)?)),
+            ).optional().map_err(|error| error.to_string())?
+        } else {
+            None
+        };
         let mut statement = connection.prepare("SELECT p.project_id,p.mode,p.desired_lifecycle,r.observed_lifecycle,r.project_epoch,r.next_due_at_unix,r.last_error FROM projects p JOIN project_runtimes r USING(project_id) ORDER BY p.project_id").map_err(|e| e.to_string())?;
         let projects = statement
             .query_map([], |row| {
@@ -4162,6 +4213,10 @@ impl ConfigStore {
             occupied_slots: count(
                 "SELECT COUNT(*) FROM execution_slots WHERE disposition!='released'",
             )?,
+            machine_shutdown_request_id: machine_shutdown.as_ref().map(|row| row.0.clone()),
+            machine_shutdown_status: machine_shutdown.as_ref().map(|row| row.1.clone()),
+            machine_shutdown_deadline_unix: machine_shutdown.as_ref().map(|row| row.2),
+            machine_shutdown_error: machine_shutdown.and_then(|row| row.3),
             observed_at_unix: now_unix()?,
         })
     }
@@ -5727,14 +5782,14 @@ pub(crate) mod tests {
         let second_generation = store.start_owner(&owner("second")).unwrap();
         assert!(
             store
-                .process_next_control(second_generation)
+                .process_next_control(second_generation, 30)
                 .unwrap()
                 .is_none()
         );
         assert!(!store.should_stop(second_generation).unwrap());
         assert!(
             store
-                .process_next_control(second_generation)
+                .process_next_control(second_generation, 30)
                 .unwrap()
                 .is_none()
         );
@@ -5763,7 +5818,7 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(
             store
-                .process_next_control(second_generation)
+                .process_next_control(second_generation, 30)
                 .unwrap()
                 .unwrap()
                 .kind,
@@ -16016,7 +16071,7 @@ pub(crate) mod tests {
             generation,
         )
         .unwrap();
-        store.process_next_control(generation).unwrap().unwrap();
+        store.process_next_control(generation, 30).unwrap().unwrap();
         assert_eq!(
             ConfigStore::status(temp.path()).unwrap().projects[0].observed_lifecycle,
             "starting"
@@ -16239,7 +16294,7 @@ pub(crate) mod tests {
                 generation,
             )
             .unwrap();
-            store.process_next_control(generation).unwrap().unwrap();
+            store.process_next_control(generation, 30).unwrap().unwrap();
         };
 
         // An initial start has no consumed scanner wake to retry.
@@ -16363,7 +16418,12 @@ pub(crate) mod tests {
             generation,
         )
         .unwrap();
-        assert!(store.process_next_control(generation).unwrap().is_none());
+        assert!(
+            store
+                .process_next_control(generation, 30)
+                .unwrap()
+                .is_none()
+        );
         let final_count: u64 = store
             .connection
             .query_row("SELECT COUNT(*) FROM role_wake_inputs", [], |row| {
@@ -16447,7 +16507,7 @@ pub(crate) mod tests {
             generation,
         )
         .unwrap();
-        let command = store.process_next_control(generation).unwrap().unwrap();
+        let command = store.process_next_control(generation, 30).unwrap().unwrap();
         assert_eq!(command.kind, "human_claim_release");
         let current: (String, u64) = store
             .connection

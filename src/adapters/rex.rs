@@ -609,6 +609,7 @@ pub struct RexCliTransport {
     session_id: String,
     environment: BTreeMap<OsString, OsString>,
     timeout: Duration,
+    process_timeout_padding: Duration,
     shutdown_grace: Duration,
     capabilities: RexCapabilities,
 }
@@ -642,7 +643,6 @@ impl RexCliTransport {
             &environment,
             timeout,
             shutdown_grace,
-            RexCliOperation::WhoAmI,
             &["whoami", "--json"],
         )?;
         let identity: WhoAmI = parse(&who.stdout)?;
@@ -655,7 +655,6 @@ impl RexCliTransport {
             &environment,
             timeout,
             shutdown_grace,
-            RexCliOperation::ApiList,
             &["api", "list", "--json"],
         )?;
         let methods = parse_method_names(&api.stdout)?;
@@ -672,6 +671,7 @@ impl RexCliTransport {
             session_id,
             environment,
             timeout,
+            process_timeout_padding: Duration::from_secs(2),
             shutdown_grace,
             capabilities,
         };
@@ -690,6 +690,16 @@ impl RexCliTransport {
 
     pub fn capabilities(&self) -> &RexCapabilities {
         &self.capabilities
+    }
+
+    /// Clone this pinned transport with a hard per-command deadline for bounded shutdown.
+    /// The executable, endpoint, server identity, session, and environment remain unchanged.
+    pub(crate) fn with_bounded_operation_timeout(&self, timeout: Duration) -> Self {
+        let mut bounded = self.clone();
+        bounded.timeout = timeout;
+        bounded.process_timeout_padding = Duration::ZERO;
+        bounded.shutdown_grace = Duration::from_millis(50);
+        bounded
     }
 
     /// Start a foreground Rex event reader scoped to this pinned endpoint and session.
@@ -1601,8 +1611,8 @@ impl RexCliTransport {
             &self.endpoint,
             &self.environment,
             self.timeout,
+            self.process_timeout_padding,
             self.shutdown_grace,
-            rex_cli_operation(args),
             args.to_vec(),
         )
     }
@@ -1814,7 +1824,6 @@ fn raw_cli(
     environment: &BTreeMap<OsString, OsString>,
     timeout: Duration,
     shutdown_grace: Duration,
-    operation: RexCliOperation,
     args: &[&str],
 ) -> Result<crate::process::ProcessOutput, RexError> {
     run_rex_cli(
@@ -1822,8 +1831,8 @@ fn raw_cli(
         endpoint,
         environment,
         timeout,
+        Duration::from_secs(2),
         shutdown_grace,
-        operation,
         args.iter().map(OsString::from).collect(),
     )
 }
@@ -1833,16 +1842,17 @@ fn run_rex_cli(
     endpoint: &str,
     environment: &BTreeMap<OsString, OsString>,
     timeout: Duration,
+    process_timeout_padding: Duration,
     shutdown_grace: Duration,
-    operation: RexCliOperation,
     args: Vec<OsString>,
 ) -> Result<crate::process::ProcessOutput, RexError> {
+    let operation = rex_cli_operation(&args);
     let mut full = vec![
         "--server".into(),
         endpoint.into(),
         "--autostart=false".into(),
         "--timeout".into(),
-        format!("{}s", timeout.as_secs()).into(),
+        format!("{:.3}s", timeout.as_secs_f64()).into(),
     ];
     full.extend(args);
     let result = run(ProcessRequest {
@@ -1852,7 +1862,7 @@ fn run_rex_cli(
         cwd: None,
         clear_environment: false,
         environment: environment.clone(),
-        timeout: timeout + Duration::from_secs(2),
+        timeout: timeout + process_timeout_padding,
         shutdown_grace,
         stdout_limit: 4 * 1024 * 1024,
         stderr_tail_limit: 64 * 1024,
@@ -2588,6 +2598,43 @@ mod tests {
             .observe_process(&window, run_id, "block-1")
             .unwrap();
         assert_eq!(observation.child.unwrap().name, "codex");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_transport_timeout_returns_before_a_slow_rex_command() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("rex slow fixture");
+        let whoami = serde_json::json!({
+            "endpoint":"unix:///tmp/rex-test.sock",
+            "instance_id":"instance-1",
+            "host_id":"host-1",
+            "rex_version":"1.2.3"
+        });
+        let api = serde_json::json!({"methods":{"session.view":{},"session.new_window":{},"session.new_split":{},"session.focus_block":{},"session.zoom_block":{},"block.close":{}}});
+        let body = format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *\"whoami --json\"*) printf '%s\\n' '{}' ;;\n  *\"api list --json\"*) printf '%s\\n' '{}' ;;\n  *\"session.view\"*) sleep 5; printf '%s\\n' '{{}}' ;;\n  *) exit 3 ;;\nesac\n",
+            whoami, api
+        );
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let transport = RexCliTransport::connect(
+            &script,
+            &[],
+            "unix:///tmp/rex-test.sock".into(),
+            "instance-1".into(),
+            "session-1".into(),
+            BTreeMap::<OsString, OsString>::new(),
+        )
+        .unwrap()
+        .with_bounded_operation_timeout(Duration::from_millis(100));
+
+        let started = Instant::now();
+        assert!(transport.session_view().is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[cfg(unix)]
