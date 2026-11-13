@@ -86,6 +86,12 @@ impl InlineFixtureV1 {
     }
 }
 
+impl Default for InlineFixtureV1 {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrialSide {
@@ -601,6 +607,18 @@ impl ProfileTrialAuthorization {
         if distinct.len() < MIN_DISTINCT_INPUTS {
             return Err("trial matrix must cover at least five distinct inputs".into());
         }
+        let input_digests = self
+            .inputs
+            .iter()
+            .map(|input| (input.input_id.as_str(), input.input_digest.as_str()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let distinct_task_digests = distinct
+            .iter()
+            .filter_map(|input_id| input_digests.get(input_id).copied())
+            .collect::<std::collections::BTreeSet<_>>();
+        if distinct_task_digests.len() < MIN_DISTINCT_INPUTS {
+            return Err("trial matrix must cover at least five distinct task input digests".into());
+        }
         let mut pair_indexes = std::collections::BTreeSet::new();
         for pair in &self.pairs {
             if !pair_indexes.insert(pair.pair_index)
@@ -611,6 +629,25 @@ impl ProfileTrialAuthorization {
                     "trial matrix pair indexes and inputs must be unique and authorized".into(),
                 );
             }
+        }
+        let mut pair_counts = std::collections::BTreeMap::<&str, usize>::new();
+        for pair in &self.pairs {
+            *pair_counts.entry(pair.input_id.as_str()).or_default() += 1;
+        }
+        let ordinary_coverage = self.pairs.len() == MAX_TRIAL_PAIRS_PER_REVISION
+            && self.inputs.len() == MIN_DISTINCT_INPUTS
+            && pair_counts.len() == MIN_DISTINCT_INPUTS
+            && pair_counts.values().all(|count| *count == 2);
+        if !ordinary_coverage
+            && self
+                .scoped_exception
+                .as_ref()
+                .is_none_or(|reason| reason.trim().len() < 20 || reason.len() > 4096)
+        {
+            return Err(
+                "nonstandard trial pair coverage requires an explicit scoped-exception rationale"
+                    .into(),
+            );
         }
         for profile in [&self.baseline, &self.candidate] {
             if profile.profile_config_json.len() > MAX_FROZEN_INPUT_BYTES {
@@ -1419,6 +1456,19 @@ mod tests {
     }
 
     #[test]
+    fn trial_matrix_requires_distinct_task_content_not_only_distinct_labels() {
+        let mut authorization = authorization();
+        let repeated = "{\"same\":true}".to_owned();
+        let digest = super::content_digest(repeated.as_bytes()).unwrap();
+        for input in &mut authorization.inputs {
+            input.input_json = repeated.clone();
+            input.input_digest = digest.clone();
+        }
+        let error = authorization.validate().unwrap_err();
+        assert!(error.contains("five distinct task input digests"));
+    }
+
+    #[test]
     fn profile_trial_human_request_binds_exact_authorization_and_bundle() {
         let mut authorization = authorization();
         let bundle = profile_trial_review_bundle(&authorization).unwrap();
@@ -1437,6 +1487,27 @@ mod tests {
             authorization.human_subject_digest,
             request.subject.digest().unwrap()
         );
+    }
+
+    #[test]
+    fn skewed_pair_coverage_requires_explicit_scoped_exception() {
+        let mut authorization = authorization();
+        for (index, pair) in authorization.pairs.iter_mut().enumerate() {
+            pair.input_id = if index < 6 {
+                "input-0".into()
+            } else {
+                format!("input-{}", index - 5)
+            };
+        }
+        assert!(
+            authorization
+                .validate()
+                .unwrap_err()
+                .contains("nonstandard trial pair coverage")
+        );
+        authorization.scoped_exception =
+            Some("This intentionally concentrates repetitions on one narrow input.".into());
+        assert!(authorization.validate().is_ok());
     }
 
     #[test]

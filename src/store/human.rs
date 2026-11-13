@@ -1249,6 +1249,20 @@ impl ConfigStore {
         tx.execute("INSERT INTO human_decisions(response_id,request_id,subject_digest,configuration_digest,policy_digest,choice,approved,explanation,decided_at_unix,receipt_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![intent.response_id,request_id.as_str(),receipt.subject_digest.as_str(),receipt.configuration_digest.as_str(),receipt.policy_digest.as_str(),choice_name(intent.choice),approved,intent.explanation,now,serde_json::to_string(&receipt).map_err(|error| error.to_string())?]).map_err(|error| error.to_string())?;
         tx.execute("UPDATE human_requests SET lifecycle='decided',decided_at_unix=?2 WHERE request_id=?1 AND lifecycle='response_queued'", params![request_id.as_str(), now]).map_err(|error| error.to_string())?;
         tx.execute("UPDATE human_decision_intents SET lifecycle='applied',processed_at_unix=?2,result_json=?3 WHERE response_id=?1 AND lifecycle='queued'", params![intent.response_id, now, result_json]).map_err(|error| error.to_string())?;
+        if request.purpose == HumanPurpose::ProfileTrial
+            && intent.choice == HumanDecisionChoice::Refuse
+        {
+            let changed = tx.execute(
+                "UPDATE profile_trial_authorizations SET lifecycle='refused',updated_at_unix=?3 \
+                 WHERE authorization_id=?1 AND human_request_id=?2 AND lifecycle='pending'",
+                params![request.subject.subject_id, request_id.as_str(), now],
+            ).map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err(
+                    "refused profile trial authorization is missing or no longer pending".into(),
+                );
+            }
+        }
         insert_role_wake(&tx, &request, &receipt, now)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(result)

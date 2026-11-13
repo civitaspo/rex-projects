@@ -2378,6 +2378,16 @@ impl ConfigStore {
             }
             false
         } else {
+            let overlapping: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM profile_trial_authorizations a WHERE a.project_id=?1 AND a.candidate_id=?2 AND a.candidate_digest=?3 AND a.authorization_id<>?4 AND a.lifecycle IN ('pending','authorized')) OR EXISTS(SELECT 1 FROM profile_trial_launches l JOIN profile_trial_authorizations a USING(authorization_id) WHERE a.project_id=?1 AND a.candidate_id=?2 AND a.candidate_digest=?3 AND l.lifecycle IN ('prepared','running','uncertain'))",
+                params![bound.project_id.as_str(), bound.candidate_id, bound.candidate_digest.as_str(), bound.authorization_id],
+                |row| row.get(0),
+            ).map_err(|error| error.to_string())?;
+            if overlapping {
+                return Err(
+                    "candidate already has a pending or active profile trial authorization".into(),
+                );
+            }
             tx.execute(
                 "INSERT INTO profile_trial_authorizations(authorization_id,project_id,candidate_id,candidate_digest,human_request_id,request_json,rex_view_id,artifact_path,authorization_digest,authorization_json,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'pending',?11,?11)",
                 params![bound.authorization_id,bound.project_id.as_str(),bound.candidate_id,bound.candidate_digest.as_str(),bound.human_request_id.as_str(),request_json,rex_view_id.as_str(),artifact_path_text,digest.as_str(),json,now_unix],
@@ -2911,6 +2921,20 @@ impl ConfigStore {
         }
         authorization.validate()?;
         Ok(Some(authorization))
+    }
+
+    pub(crate) fn profile_trial_authorization_lifecycle(
+        &self,
+        authorization_id: &str,
+    ) -> Result<Option<String>, String> {
+        self.connection
+            .query_row(
+                "SELECT lifecycle FROM profile_trial_authorizations WHERE authorization_id=?1",
+                [authorization_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
     }
 
     /// A dispatcher retry after the Store commit but before outbox acknowledgement
@@ -3841,6 +3865,23 @@ impl ConfigStore {
         request: &crate::store::provider_qualification_runtime::ProviderQualificationRequest,
         applied: &crate::config::AppliedConfig,
     ) -> Result<crate::config::Profile, String> {
+        self.resolve_candidate_profile(request, applied, false)
+    }
+
+    pub(crate) fn resolve_profile_trial_candidate(
+        &self,
+        request: &crate::store::provider_qualification_runtime::ProviderQualificationRequest,
+        applied: &crate::config::AppliedConfig,
+    ) -> Result<crate::config::Profile, String> {
+        self.resolve_candidate_profile(request, applied, true)
+    }
+
+    fn resolve_candidate_profile(
+        &self,
+        request: &crate::store::provider_qualification_runtime::ProviderQualificationRequest,
+        applied: &crate::config::AppliedConfig,
+        allow_trialing: bool,
+    ) -> Result<crate::config::Profile, String> {
         use crate::store::provider_qualification_runtime::ProviderQualificationTarget;
         let ProviderQualificationTarget::Candidate {
             candidate_id,
@@ -3871,13 +3912,21 @@ impl ConfigStore {
             params![request.project_id.as_str(), candidate_id, candidate_digest.as_str()],
             |row| row.get(0),
         ).optional().map_err(|error| error.to_string())?;
-        if status.as_deref() != Some("proposed") {
+        if !(status.as_deref() == Some("proposed")
+            || (allow_trialing
+                && matches!(status.as_deref(), Some("trialing" | "awaiting_approval"))))
+        {
             return Err("candidate is no longer eligible for provider qualification".into());
         }
         let package = self
             .learning_candidate_package(&request.project_id, candidate_id, candidate_digest)?
             .ok_or("exact candidate package is missing")?;
-        if package.revision.status != CandidateStatus::Proposed
+        if !(package.revision.status == CandidateStatus::Proposed
+            || (allow_trialing
+                && matches!(
+                    package.revision.status,
+                    CandidateStatus::Trialing | CandidateStatus::AwaitingApproval
+                )))
             || package.revision.digest != *candidate_digest
         {
             return Err("candidate revision is not the exact proposed target".into());

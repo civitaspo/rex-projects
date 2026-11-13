@@ -33,6 +33,7 @@ pub mod operations_runtime;
 pub mod parent_artifacts;
 pub mod process;
 pub mod profile_effect;
+pub mod profile_trial_request;
 pub mod profile_trial_runtime;
 pub mod protocol;
 pub mod provider_qualification_run;
