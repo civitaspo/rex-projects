@@ -831,6 +831,232 @@ fn agent_inbox_reads_the_scoped_snapshot_without_opening_state() {
 }
 
 #[test]
+fn supervisor_fixture_cli_handles_learning_batch_and_preserves_ticket_dispatch() {
+    use rex_projects::agent_api::{AgentWakeItem, AgentWakeSnapshot};
+    use rex_projects::domain::ids::{Digest, ProjectId};
+    use rex_projects::mailbox::{MailboxCapability, MailboxLimits};
+    use sha2::{Digest as _, Sha256};
+    use std::path::{Path, PathBuf};
+
+    fn invoke_fixture(inbox_item: AgentWakeItem, label: &str) -> serde_json::Value {
+        let temp = tempfile::tempdir().unwrap();
+        let run_id = format!("supervisor-{label}");
+        let control_dir = temp.path().join("run/control");
+        let state_dir = temp.path().join("fixture-state");
+        MailboxCapability::create(
+            &run_id,
+            &control_dir,
+            u64::MAX,
+            MailboxLimits {
+                max_request_bytes: 1_048_576,
+                max_pending_requests: 32,
+            },
+        )
+        .unwrap();
+
+        let mut snapshot = AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: ProjectId::parse("operations_project").unwrap(),
+            role_session_id: "project:operations_project:supervisor".into(),
+            agent_run_id: run_id.clone(),
+            digest: Digest::parse("0".repeat(64)).unwrap(),
+            worker_correction_context: None,
+            inputs: vec![inbox_item],
+        };
+        snapshot.digest = snapshot.content_digest().unwrap();
+        rex_projects::agent_api::publish_wake_snapshot(&control_dir, snapshot.clone()).unwrap();
+
+        let product_cli = PathBuf::from(env!("CARGO_BIN_EXE_rex-projects"));
+        let test_binary = std::env::current_exe().unwrap();
+        let xtask = test_binary
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("integration-test executable is under target/debug/deps")
+            .join(if cfg!(windows) { "xtask.exe" } else { "xtask" });
+        assert!(xtask.is_file(), "workspace xtask binary is available");
+
+        let schema_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("schemas/agent-results/supervisor-v1.json");
+        let schema = std::fs::read_to_string(schema_path).unwrap();
+        let context_path = temp.path().join("supervisor-context.json");
+        let context = serde_json::json!({
+            "schema_version":1,
+            "scenario":"acceptance_supervisor",
+            "messages":[
+                {
+                    "role":"supervisor","lane":"qualification","kind":"progress",
+                    "assertion":{"assertion":"succeeded"},
+                    "structured_result":{"summary":"Qualification probe completed.","completed_node_keys":[],"pending_node_keys":[],"evidence":[],"next_observation_at":null}
+                },
+                {
+                    "role":"supervisor","lane":"workflow","kind":"dispatch_request",
+                    "assertion":{"assertion":"succeeded"},
+                    "structured_result":{"ticket_reference":{"$fixture_ref":"inbox.ticket_id"},"expected_ticket_revision":{"$fixture_ref":"inbox.external_revision"},"coordinator_profile":{"$fixture_ref":"inbox.coordinator_profile"},"priority":1,"rationale":"The normalized ticket observation is eligible for dispatch."}
+                }
+            ]
+        });
+        std::fs::write(&context_path, serde_json::to_vec(&context).unwrap()).unwrap();
+
+        let projection_path = temp.path().join("codex-output-schema.json");
+        std::fs::write(
+            &projection_path,
+            br#"{"type":"object","properties":{"result":{"type":"string"}},"required":["result"],"additionalProperties":false}"#,
+        )
+        .unwrap();
+        let inbox_command = format!(
+            "'{}' agent inbox --run \"$REX_PROJECTS_RUN_ID\" --control-dir \"$REX_PROJECTS_CONTROL_DIR\" --json",
+            product_cli.display()
+        );
+        let prompt = format!(
+            "Return only a JSON object with exactly one property named `result`.\n<rex-projects-authoritative-result-schema>\n{schema}\n</rex-projects-authoritative-result-schema>\nApplied Project role profiles (trusted applied configuration; use the exact profile ID when requesting a role):\n```json\n{{\"coordinator\":\"fixture_coordinator\"}}\n```\nUse the public inbox command `{inbox_command}`."
+        );
+        let package_path = temp.path().join("run/run-step.package.json");
+        std::fs::write(
+            &package_path,
+            serde_json::to_vec(&serde_json::json!({
+                "descriptor":{
+                    "run_id":run_id,
+                    "role":"supervisor",
+                    "control_dir":control_dir,
+                    "ticket_run_id":null,
+                    "wake_snapshot_digest":snapshot.digest
+                },
+                "prompt":prompt
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let output = Command::new(xtask)
+            .args([
+                "fixture",
+                "agent",
+                "--provider",
+                "codex",
+                "--role",
+                "supervisor",
+                "--scenario",
+                "acceptance_supervisor",
+                "--context",
+            ])
+            .arg(&context_path)
+            .args(["--state-dir"])
+            .arg(&state_dir)
+            .args(["--runtime-binary"])
+            .arg(&product_cli)
+            .arg("--")
+            .args(["exec", "--json", "--no-daemon", "--output-schema"])
+            .arg(&projection_path)
+            .args([
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "never",
+                "-",
+            ])
+            .arg(prompt)
+            .env("REX_PROJECTS_AGENT", "1")
+            .env("REX_PROJECTS_CONTEXT", &context_path)
+            .env("REX_PROJECTS_PROJECT_ID", "operations_project")
+            .env("REX_PROJECTS_ROLE", "supervisor")
+            .env("REX_PROJECTS_RUN_ID", &run_id)
+            .env("REX_PROJECTS_CONTROL_DIR", &control_dir)
+            .env("REX_PROJECTS_ATTEMPT", "1")
+            .env("REX_PROJECTS_RUN_EPOCH", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fixture CLI failed for {label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .take(4096)
+                .collect::<String>()
+        );
+        let (thread_id, parsed) = rex_projects::providers::parse_result(
+            rex_projects::domain::types::AgentAdapter::Codex,
+            &output.stdout,
+            &rex_projects::roles::result_schema(rex_projects::domain::types::Role::Supervisor),
+        )
+        .unwrap();
+        assert_eq!(
+            thread_id.as_deref(),
+            Some("fixture-codex-acceptance_supervisor-supervisor")
+        );
+        parsed
+    }
+
+    let config_digest = "c".repeat(64);
+    let batch_base = serde_json::json!({
+        "type":"supervisor_learning_batch",
+        "project_id":"operations_project",
+        "config_revision":7,
+        "config_digest":config_digest,
+        "issued_at_unix":1794577080,
+        "prior_checkpoint":{},
+        "maintenance":{},
+        "findings":[]
+    });
+    let batch_digest = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&batch_base).unwrap())
+    );
+    let batch_id = format!("learning-{batch_digest}");
+    let mut batch_payload = batch_base;
+    batch_payload["batch_id"] = serde_json::json!(batch_id);
+    batch_payload["batch_digest"] = serde_json::json!(batch_digest);
+    let learning = invoke_fixture(
+        AgentWakeItem {
+            wake_input_id: 4,
+            source_type: "learning_batch".into(),
+            source_id: batch_id.clone(),
+            source_revision: 2,
+            priority: 1,
+            payload_json: batch_payload,
+            host_artifact_source_evidence_ids: vec![],
+            host_artifacts: vec![],
+            host_completion_context: None,
+        },
+        "learning-batch",
+    );
+    assert_eq!(learning["kind"], "learning_decision");
+    assert_eq!(learning["structured_result"]["batch_id"], batch_id);
+    assert_eq!(learning["structured_result"]["batch_digest"], batch_digest);
+    assert_eq!(learning["structured_result"]["config_revision"], 7);
+    assert!(
+        learning["structured_result"]["observations"][0]
+            .as_str()
+            .unwrap()
+            .contains("wake revision 2")
+    );
+
+    let ticket = invoke_fixture(
+        AgentWakeItem {
+            wake_input_id: 1,
+            source_type: "ticket_observation".into(),
+            source_id: "fixture/acceptance:T-42:ready".into(),
+            source_revision: 22,
+            priority: 30,
+            payload_json: serde_json::json!({
+                "schema_version":1,"kind":"ticket_observation","ticket_namespace":"fixture/acceptance",
+                "ticket_id":"T-42","status":"ready","title":"Acceptance ticket","labels":[],
+                "external_revision":"rev-opaque-42","goal_revision":0
+            }),
+            host_artifact_source_evidence_ids: vec![],
+            host_artifacts: vec![],
+            host_completion_context: None,
+        },
+        "ticket-dispatch",
+    );
+    assert_eq!(ticket["kind"], "dispatch_request");
+    assert_eq!(ticket["structured_result"]["ticket_reference"], "T-42");
+    assert_eq!(
+        ticket["structured_result"]["expected_ticket_revision"],
+        "rev-opaque-42"
+    );
+}
+
+#[test]
 fn agent_artifact_add_uses_limits_registered_for_its_run() {
     use rex_projects::mailbox::{MailboxCapability, MailboxLimits};
 
