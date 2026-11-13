@@ -1491,6 +1491,13 @@ fn record_directory_identity(
 ) -> Result<(), String> {
     let logical_path = path.display().to_string();
     let canonical_path = canonical.display().to_string();
+    if files.iter().any(|source| {
+        matches!(source.kind, SourceKind::Directory)
+            && source.path == logical_path
+            && source.canonical_path == canonical_path
+    }) {
+        return Ok(());
+    }
     let digest = format!("{:x}", Sha256::digest(canonical_path.as_bytes()));
     files.push(SourceFile {
         kind: SourceKind::Directory,
@@ -1632,6 +1639,71 @@ mod tests {
         assert_eq!(loaded.config.projects.len(), 2);
         assert_eq!(loaded.profiles.len(), 2);
         assert_eq!(loaded.source_files.len(), 7);
+    }
+
+    #[test]
+    fn shared_skill_directories_do_not_exhaust_manifest_entries() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture");
+        std::fs::copy(fixture.join("config.toml"), root.join("config.toml")).unwrap();
+        let skills = root.join("shared-skills");
+        let alias = root.join("shared-skills-alias");
+        std::fs::create_dir(&skills).unwrap();
+        std::fs::write(skills.join("SKILL.md"), "shared skill bytes").unwrap();
+        symlink(&skills, &alias).unwrap();
+        for id in ["worker_codex", "judgment_claude"] {
+            let source = fixture.join("profiles").join(id);
+            let destination = root.join("profiles").join(id);
+            std::fs::create_dir_all(&destination).unwrap();
+            std::fs::copy(
+                source.join("instructions.md"),
+                destination.join("instructions.md"),
+            )
+            .unwrap();
+            let mut profile: toml::Value =
+                toml::from_str(&std::fs::read_to_string(source.join("config.toml")).unwrap())
+                    .unwrap();
+            let mut paths = vec![toml::Value::String(skills.display().to_string()); 1_025];
+            paths.push(toml::Value::String(alias.display().to_string()));
+            profile
+                .as_table_mut()
+                .unwrap()
+                .insert("skill_paths".into(), toml::Value::Array(paths));
+            std::fs::write(
+                destination.join("config.toml"),
+                toml::to_string(&profile).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let loaded = super::load(&root.join("config.toml")).unwrap();
+        for path in [&skills, &alias] {
+            assert_eq!(
+                loaded
+                    .source_files
+                    .iter()
+                    .filter(|source| {
+                        matches!(source.kind, super::SourceKind::Directory)
+                            && Path::new(&source.path) == path
+                    })
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            loaded
+                .source_files
+                .iter()
+                .filter(|source| {
+                    matches!(source.kind, super::SourceKind::File)
+                        && source.contents == "shared skill bytes"
+                })
+                .count(),
+            1
+        );
     }
 
     #[test]
