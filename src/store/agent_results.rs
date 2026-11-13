@@ -9123,6 +9123,38 @@ pub(crate) mod host_validation_fixture {
         .map_err(|error| format!("host terminal fixture setup: {error}"))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Fixture binds a Worker terminal to its accepted node and Coordinator"
+    )]
+    pub(crate) fn host_validated_worker_terminal_in(
+        store: &mut ConfigStore,
+        root: &std::path::Path,
+        owner_generation: u64,
+        project_id: ProjectId,
+        ticket_run_id: TicketRunId,
+        message: RoleResultMessage,
+        agent_run_id: AgentRunId,
+        worker_node_id: &str,
+        coordinator_run_id: AgentRunId,
+    ) -> Result<InPlaceTerminalFixture, String> {
+        host_validated_result_inner(
+            store,
+            root,
+            owner_generation,
+            project_id,
+            Some(ticket_run_id),
+            Role::Worker,
+            message,
+            Some(agent_run_id),
+            Vec::new(),
+            Some(worker_node_id),
+            Some(coordinator_run_id),
+            None,
+        )
+        .map_err(|error| format!("host Worker terminal fixture setup: {error}"))
+    }
+
     pub(crate) fn close_recovery_terminal_for_test(
         store: &mut ConfigStore,
         owner_generation: u64,

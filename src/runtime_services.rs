@@ -4525,7 +4525,7 @@ impl RuntimeServices {
                 "Postmortem evidence does not reproduce the completed publication subject".into(),
             );
         }
-        let (artifacts, unavailable) = Self::stage_publication_artifacts(
+        let (artifacts, mut unavailable) = Self::stage_publication_artifacts(
             artifact_store,
             store,
             owner_generation,
@@ -4536,6 +4536,12 @@ impl RuntimeServices {
             workspace,
             &snapshot,
         );
+        if artifacts.is_empty() && unavailable.is_empty() {
+            unavailable.push(
+                "No registered TestReceipt or General validation artifacts were available for the completed implementation publication."
+                    .into(),
+            );
+        }
         let mut unique = BTreeMap::new();
         for artifact in artifacts {
             if let Some(prior) = unique.insert(artifact.artifact_id.clone(), artifact.clone())

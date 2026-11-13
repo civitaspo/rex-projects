@@ -6884,6 +6884,13 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn postmortem_discloses_absent_worker_validation_artifacts() {
+        published_publication_fixture_inner(
+            true, None, false, false, true, false, false, false, true,
+        );
+    }
+
+    #[test]
     fn single_publication_drives_host_merge_assessment_and_public_inbox() {
         // This end-to-end fixture exercises the supported Direct executor. Generic
         // literal-comment Request is now intentionally blocked before approval.
@@ -6892,7 +6899,9 @@ pub(crate) mod tests {
 
     #[test]
     fn generic_request_executor_is_blocked_before_assessment_persistence() {
-        published_publication_fixture_inner(true, None, false, false, false, false, false, true);
+        published_publication_fixture_inner(
+            true, None, false, false, false, false, false, true, false,
+        );
     }
 
     #[test]
@@ -7292,6 +7301,7 @@ pub(crate) mod tests {
         run: &crate::store::scheduler::ActiveTicketRun,
         publication_digest: &Digest,
         published_head: &str,
+        expect_missing_validation: bool,
     ) {
         let state = root.join("postmortem-evidence-state");
         std::fs::create_dir_all(&state).unwrap();
@@ -7311,7 +7321,12 @@ pub(crate) mod tests {
                 run.revision,
             )
             .unwrap();
-        let verification = snapshot.verification().unwrap().clone();
+        let verification = snapshot.verification().cloned();
+        assert_eq!(
+            verification.is_none(),
+            expect_missing_validation,
+            "fixture must exercise the requested accepted validation state"
+        );
         let template = crate::engine::host_transitions::tests::merge_work_fixture_item(
             run.project_id.clone(),
             run.ticket_run_id.clone(),
@@ -7362,7 +7377,7 @@ pub(crate) mod tests {
             .historical_implementation_publication_snapshot(generation, &work)
             .unwrap()
             .unwrap();
-        assert_eq!(historical.verification(), Some(&verification));
+        assert_eq!(historical.verification(), verification.as_ref());
         assert!(
             history
                 .historical_implementation_publication_snapshot(generation + 1, &work)
@@ -7436,37 +7451,57 @@ pub(crate) mod tests {
             .unwrap()
         };
         let items = stage(&mut history, &context);
-        assert_eq!(items[0].host_artifacts.len(), 1);
-        let locator = &items[0].host_artifacts[0];
         assert_eq!(
-            locator.artifact_id,
-            verification.test_receipt_artifacts[0].artifact_id
-        );
-        assert_eq!(
-            locator.kind,
-            crate::engine::orchestration::RoleArtifactKind::TestReceipt
-        );
-        assert_eq!(locator.source_evidence_id, verification.source_evidence_id);
-        assert_eq!(
-            items[0].host_artifact_source_evidence_ids,
-            vec![verification.source_evidence_id.clone()]
+            items[0].host_artifacts.len(),
+            usize::from(!expect_missing_validation)
         );
         let enriched = items[0].host_completion_context.as_ref().unwrap();
-        assert_eq!(
-            enriched
-                .implementation_publication
-                .verification
-                .as_ref()
-                .unwrap()["source_evidence_id"],
-            verification.source_evidence_id
-        );
-        assert!(
-            enriched
-                .implementation_publication
-                .artifact_evidence_unavailable
-                .is_some(),
-            "synthetic publication sources must remain explicitly unavailable"
-        );
+        if let Some(verification) = &verification {
+            let locator = &items[0].host_artifacts[0];
+            assert_eq!(
+                locator.artifact_id,
+                verification.test_receipt_artifacts[0].artifact_id
+            );
+            assert_eq!(
+                locator.kind,
+                crate::engine::orchestration::RoleArtifactKind::TestReceipt
+            );
+            assert_eq!(locator.source_evidence_id, verification.source_evidence_id);
+            assert_eq!(
+                items[0].host_artifact_source_evidence_ids,
+                vec![verification.source_evidence_id.clone()]
+            );
+            assert_eq!(
+                enriched
+                    .implementation_publication
+                    .verification
+                    .as_ref()
+                    .unwrap()["source_evidence_id"],
+                verification.source_evidence_id
+            );
+        } else {
+            assert!(enriched.implementation_publication.verification.is_none());
+            assert_eq!(
+                enriched
+                    .implementation_publication
+                    .artifact_evidence_unavailable
+                    .as_deref(),
+                Some(
+                    "No registered TestReceipt or General validation artifacts were available for the completed implementation publication."
+                ),
+                "Postmortem must disclose the accepted Worker publication's missing validation artifacts"
+            );
+            assert!(items[0].host_artifact_source_evidence_ids.is_empty());
+        }
+        if !expect_missing_validation {
+            assert!(
+                enriched
+                    .implementation_publication
+                    .artifact_evidence_unavailable
+                    .is_some(),
+                "synthetic publication sources must remain explicitly unavailable"
+            );
+        }
         let mut inbox = crate::agent_api::AgentWakeSnapshot {
             schema_version: 1,
             project_id: run.project_id.clone(),
@@ -7481,12 +7516,31 @@ pub(crate) mod tests {
         let consumed =
             crate::agent_api::read_inbox(&workspace, "postmortem-evidence-run", 0).unwrap();
         assert_eq!(consumed, items);
-        let bytes = std::fs::read(workspace.join(&consumed[0].host_artifacts[0].path)).unwrap();
-        assert_eq!(
-            content_digest(std::str::from_utf8(&bytes).unwrap()),
-            locator.digest.as_str()
-        );
-        assert_eq!(bytes, b"# Test receipt\n\nAll configured checks passed.\n");
+        if let Some(verification) = &verification {
+            let locator = &consumed[0].host_artifacts[0];
+            let bytes = std::fs::read(workspace.join(&locator.path)).unwrap();
+            assert_eq!(
+                content_digest(std::str::from_utf8(&bytes).unwrap()),
+                locator.digest.as_str()
+            );
+            assert_eq!(bytes, b"# Test receipt\n\nAll configured checks passed.\n");
+            assert_eq!(
+                locator.artifact_id,
+                verification.test_receipt_artifacts[0].artifact_id
+            );
+        } else {
+            assert!(consumed[0].host_artifacts.is_empty());
+            assert!(
+                consumed[0]
+                    .host_completion_context
+                    .as_ref()
+                    .unwrap()
+                    .implementation_publication
+                    .artifact_evidence_unavailable
+                    .as_ref()
+                    .is_some_and(|reasons| !reasons.is_empty())
+            );
+        }
         let mut stale = context.clone();
         stale.implementation_publication.publication_set_digest =
             Digest::parse("0".repeat(64)).unwrap();
@@ -7527,23 +7581,25 @@ pub(crate) mod tests {
                 rusqlite::params![run.ticket_run_id.as_str(), revision, evidence.to_string()],
             )
             .unwrap();
-        let object = root
-            .join("artifacts")
-            .join(&verification.test_receipt_artifacts[0].path);
-        let retained_object = state.join("retained-test-receipt");
-        std::fs::rename(&object, &retained_object).unwrap();
-        let unavailable = stage(&mut history, &context);
-        std::fs::rename(&retained_object, &object).unwrap();
-        assert!(unavailable[0].host_artifacts.is_empty());
-        assert!(
-            unavailable[0]
-                .host_completion_context
-                .as_ref()
-                .unwrap()
-                .implementation_publication
-                .artifact_evidence_unavailable
-                .is_some()
-        );
+        if let Some(verification) = &verification {
+            let object = root
+                .join("artifacts")
+                .join(&verification.test_receipt_artifacts[0].path);
+            let retained_object = state.join("retained-test-receipt");
+            std::fs::rename(&object, &retained_object).unwrap();
+            let unavailable = stage(&mut history, &context);
+            std::fs::rename(&retained_object, &object).unwrap();
+            assert!(unavailable[0].host_artifacts.is_empty());
+            assert!(
+                unavailable[0]
+                    .host_completion_context
+                    .as_ref()
+                    .unwrap()
+                    .implementation_publication
+                    .artifact_evidence_unavailable
+                    .is_some()
+            );
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -7588,6 +7644,7 @@ pub(crate) mod tests {
             obsolete_deferred_assessment,
             terminal_deferral_crash_gap,
             false,
+            false,
         );
     }
 
@@ -7604,6 +7661,7 @@ pub(crate) mod tests {
         obsolete_deferred_assessment: bool,
         terminal_deferral_crash_gap: bool,
         request_admission_check: bool,
+        zero_ref_worker_publication: bool,
     ) {
         let reject_twice = recovery_case.is_some();
         let exercise_runtime_launch = matches!(
@@ -7967,7 +8025,11 @@ pub(crate) mod tests {
                 &ticket_id,
                 &ticket_run_id,
                 1,
-                "publishing",
+                if zero_ref_worker_publication {
+                    "implementing"
+                } else {
+                    "publishing"
+                },
                 "in_progress",
             )
             .unwrap();
@@ -8094,7 +8156,11 @@ pub(crate) mod tests {
             work_nodes: vec![PreparedWorktreeReceiptNode {
                 work_node_id: root_id.clone(),
                 repository_id: repository_id.clone(),
-                worktree_path: std::path::PathBuf::from("/tmp/run-staged-1/root"),
+                worktree_path: if zero_ref_worker_publication {
+                    worker_worktree.clone()
+                } else {
+                    std::path::PathBuf::from("/tmp/run-staged-1/root")
+                },
                 branch: root_branch.into(),
                 base_sha: observed_base.clone(),
                 commit_mode: CommitMode::Native,
@@ -8212,15 +8278,252 @@ pub(crate) mod tests {
         };
 
         let first_head = "d".repeat(40);
-        let (first_publish_intent, first_publish_receipt) = publication(
-            &root_id,
-            &observed_base,
-            &first_head,
-            root_branch,
-            4,
-            "publish-root",
-        );
-        insert_succeeded_test_effect(&mut store, &first_publish_intent, &first_publish_receipt);
+        let mut zero_ref_publication = None;
+        if zero_ref_worker_publication {
+            use crate::domain::types::Role;
+            use crate::engine::orchestration::{AgentAssertion, RoleOutputKind};
+
+            let preparation = store
+                .succeeded_effect_receipt(&root_prepare_intent.operation_id)
+                .unwrap()
+                .unwrap();
+            let project_config = applied.config.projects.get(&project_id).unwrap();
+            let prepared = store
+                .prepared_worker_launch(
+                    owner_generation,
+                    2,
+                    &root_id,
+                    &preparation,
+                    project_config,
+                    &config_digest,
+                )
+                .unwrap()
+                .expect("accepted plan and prepared worktree must authorize this Worker");
+            let worker_message = crate::roles::RoleResultMessage {
+                schema_version: crate::engine::orchestration::ROLE_RESULT_SCHEMA_VERSION,
+                message_id: "zero-ref-worker-implementation".into(),
+                kind: RoleOutputKind::ImplementationReady,
+                assertion: AgentAssertion::Succeeded,
+                result_digest: None,
+                structured_result: serde_json::json!({
+                    "change_references": [{
+                        "repository": repository_id,
+                        "worktree_id": root_id,
+                        "commit_mode": "native",
+                        "base_commit": prepared.base_sha(),
+                        "previous_head": prepared.expected_head(),
+                        "branch_head": first_head,
+                        "commit_shas": [first_head],
+                    }],
+                    "completed_acceptance_items": ["foundation exists"],
+                    "unresolved_items": [],
+                    "irregularity_references": [],
+                }),
+                artifact_refs: Vec::new(),
+            };
+            let worker_message = crate::roles::RoleResultMessage {
+                result_digest: Some(
+                    Digest::parse(content_digest(
+                        &worker_message.structured_result.to_string(),
+                    ))
+                    .unwrap(),
+                ),
+                ..worker_message
+            };
+            let worker_run_id =
+                crate::domain::ids::AgentRunId::parse("zero-ref-worker-run").unwrap();
+            let worker_terminal = crate::store::agent_results::host_validation_fixture::host_validated_worker_terminal_in(
+                &mut store,
+                &std::fs::canonicalize(temp.path()).unwrap(),
+                owner_generation,
+                project_id.clone(),
+                ticket_run_id.clone(),
+                worker_message,
+                worker_run_id.clone(),
+                root_id.as_str(),
+                coordinator_run_id.clone(),
+            )
+            .unwrap();
+            let authority = store
+                .agent_launch_authority(&worker_run_id)
+                .unwrap()
+                .unwrap();
+            let mut wake_snapshot = crate::agent_api::AgentWakeSnapshot {
+                schema_version: 1,
+                project_id: project_id.clone(),
+                role_session_id: authority.role_session_id.clone(),
+                agent_run_id: worker_run_id.to_string(),
+                digest: Digest::parse("0".repeat(64)).unwrap(),
+                inputs: Vec::new(),
+                worker_correction_context: None,
+            };
+            wake_snapshot.digest = wake_snapshot.content_digest().unwrap();
+            assert_eq!(wake_snapshot.digest, authority.wake_snapshot_digest);
+            let mailbox_bytes =
+                std::fs::read(authority.control_dir.join("mailbox/descriptor.json")).unwrap();
+            let mailbox: crate::mailbox::MailboxDescriptor =
+                crate::protocol::parse_unique(&mailbox_bytes).unwrap();
+            let project_epoch: u64 = store
+                .connection
+                .query_row(
+                    "SELECT project_epoch FROM project_runtimes WHERE project_id=?1",
+                    [project_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let slot_index: u32 = store
+                .connection
+                .query_row(
+                    "SELECT COALESCE(MAX(slot_index) + 1, 0) FROM execution_slots WHERE pool='agent'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let reservation = crate::launch::AgentLaunchReservation {
+                schema_version: crate::launch::LAUNCH_SCHEMA_VERSION,
+                agent_run_id: worker_run_id.clone(),
+                project_id: project_id.clone(),
+                role: Role::Worker,
+                role_session_id: authority.role_session_id.clone(),
+                parent_run_id: authority.parent_run_id.clone(),
+                parent_role: authority.parent_role,
+                ticket_run_id: authority.ticket_run_id.clone(),
+                ticket_revision: authority.ticket_revision,
+                config_revision: authority.config_revision,
+                config_digest: authority.config_digest.clone(),
+                attempt: authority.attempt,
+                run_epoch: authority.run_epoch,
+                controller_generation: owner_generation,
+                project_epoch,
+                operation_id: authority.operation_id.clone(),
+                operation_recipe_id: authority.operation_recipe_id.clone(),
+                worker_assignment: Some(prepared.reservation_binding()),
+                rex_view_id: authority.rex_view_id.clone(),
+                runtime_binary_digest: authority.runtime_binary_digest.clone(),
+                environment_snapshot_id: authority.environment_snapshot_id.clone(),
+                profile_id: authority.profile_id.clone(),
+                profile_digest: authority.profile_digest.clone(),
+                instruction_digest: authority.instruction_digest.clone(),
+                result_schema_digest: authority.result_schema_digest.clone(),
+                wake_snapshot,
+                qualification_receipt_digest: authority.qualification_receipt_digest.clone(),
+                descriptor_path: authority.descriptor_path.clone(),
+                workspace_path: authority.workspace_path.clone(),
+                control_dir: authority.control_dir.clone(),
+                mailbox_directory: authority.control_dir.join("mailbox"),
+                mailbox_capability_digest: authority.mailbox_capability_digest.clone(),
+                mailbox_expires_at_unix: mailbox.expires_at_unix,
+                mailbox_max_request_bytes: mailbox.max_request_bytes as u64,
+                mailbox_max_pending_requests: mailbox.max_pending_requests as u32,
+                pool: "agent".into(),
+                slot_index,
+                global_capacity: 4,
+                project_capacity: 4,
+            };
+            reservation.validate().unwrap();
+            let reservation_json = crate::store::canonical_json(&reservation).unwrap();
+            store
+                .connection
+                .execute(
+                    "INSERT INTO agent_launch_reservations(agent_run_id,project_id,operation_id,controller_generation,project_epoch,reservation_digest,reservation_json,lifecycle,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,'authorized',1,1)",
+                    rusqlite::params![
+                        worker_run_id.as_str(), project_id.as_str(),
+                        authority.operation_id.as_str(), owner_generation, project_epoch,
+                        reservation.digest().unwrap().as_str(), reservation_json,
+                    ],
+                )
+                .unwrap();
+            let ingested = store
+                .store_validated_agent_result(
+                    &worker_terminal.artifacts,
+                    owner_generation,
+                    &worker_terminal.terminal,
+                    worker_terminal.message,
+                )
+                .unwrap();
+            let worker_source_revision = ingested.validated.binding.ticket_revision.unwrap().0;
+            assert_eq!(worker_source_revision, 4);
+            let worker_publication_revision = worker_source_revision + 1;
+            let (operation_id, logical_key) = crate::runtime_services::worker_publication_identity(
+                &ticket_run_id,
+                &root_id,
+                ingested.receipt.evidence_id(),
+            )
+            .unwrap();
+            let (mut worker_intent, worker_receipt) = publication(
+                &root_id,
+                prepared.base_sha(),
+                &first_head,
+                prepared.branch(),
+                worker_publication_revision,
+                operation_id.as_str(),
+            );
+            worker_intent.logical_key = logical_key;
+            let transition_payload =
+                crate::engine::factory_runtime::worker_result_transition_payload(
+                    ingested.receipt.evidence_id(),
+                    &ingested.validated.result_digest,
+                    worker_source_revision,
+                    &worker_intent.operation_id,
+                    worker_publication_revision,
+                );
+            let durable = crate::store::DurableInput {
+                producer_id: "rex-projects-agent-result".into(),
+                message_id: format!("implementation-ready:{}", ingested.receipt.evidence_id()),
+                content_digest: crate::store::durable_input_digest(
+                    "ticket_run",
+                    &transition_payload,
+                ),
+                recipient: "ticket_run".into(),
+                payload: transition_payload.clone(),
+            };
+            store
+                .commit_ticket_transition(
+                    owner_generation,
+                    &ticket_run_id,
+                    Revision(worker_source_revision),
+                    &durable,
+                    crate::engine::reducer::Input::EvidenceSubmitted,
+                    "host bound Worker output to its accepted work node before publication",
+                    &transition_payload,
+                    &[worker_intent.clone()],
+                )
+                .unwrap();
+            store
+                .connection
+                .execute(
+                    "UPDATE effects SET status='succeeded',attempt_count=1,receipt_json=?2 WHERE operation_id=?1 AND status='pending'",
+                    rusqlite::params![
+                        worker_intent.operation_id,
+                        serde_json::to_string(&worker_receipt).unwrap(),
+                    ],
+                )
+                .unwrap();
+            zero_ref_publication = Some((worker_intent, worker_receipt));
+        }
+        let (first_publish_intent, first_publish_receipt) =
+            zero_ref_publication.unwrap_or_else(|| {
+                publication(
+                    &root_id,
+                    &observed_base,
+                    &first_head,
+                    root_branch,
+                    4,
+                    "publish-root",
+                )
+            });
+        if zero_ref_worker_publication {
+            assert_eq!(
+                store
+                    .succeeded_effect_receipt(&first_publish_intent.operation_id)
+                    .unwrap()
+                    .unwrap()
+                    .receipt_json(),
+                &serde_json::to_string(&first_publish_receipt).unwrap()
+            );
+        } else {
+            insert_succeeded_test_effect(&mut store, &first_publish_intent, &first_publish_receipt);
+        }
         let config = applied.config.clone();
 
         assert!(
@@ -8549,6 +8852,21 @@ pub(crate) mod tests {
                     + 1,
                 "ReviewConverged must advance the exact revision reviewed by the child"
             );
+            if zero_ref_worker_publication {
+                assert_postmortem_artifact_handoff(
+                    &mut store,
+                    temp.path(),
+                    &crate::artifacts::ArtifactStore::open(&temp.path().join("artifacts")).unwrap(),
+                    owner_generation,
+                    &config,
+                    &config_digest,
+                    &assessing,
+                    &subject_digest,
+                    &first_head,
+                    true,
+                );
+                return;
+            }
             let post_review_coordinator_wakes = store
                 .pending_role_wake_inputs(&project_id, &coordinator_session, 16)
                 .unwrap();
@@ -14141,6 +14459,7 @@ pub(crate) mod tests {
             &assessing,
             &Digest::parse(subject_digest).unwrap(),
             &corrected_head,
+            false,
         );
         assert!(
             !crate::engine::host_transitions::consume_one_host_transition(
