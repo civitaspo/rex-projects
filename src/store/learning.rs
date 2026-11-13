@@ -8412,6 +8412,134 @@ mod tests {
     }
 
     #[test]
+    fn candidate_qualification_enqueue_checks_status_atomically_and_replays_exact_request() {
+        use crate::store::provider_qualification_runtime::{
+            ProviderQualificationRequest, ProviderQualificationTarget,
+        };
+
+        let (_temp, mut store, project, generation, _) = running_store();
+        let files = BTreeMap::from([("config.toml".to_owned(), b"fixture".to_vec())]);
+        let manifest_digest = crate::learning::manifest_digest(&files).unwrap();
+        let rows = files
+            .iter()
+            .map(|(path, bytes)| {
+                (
+                    path.clone(),
+                    Digest::parse(format!("{:x}", Sha256::digest(bytes))).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let candidate_digest = crate::learning::candidate_revision_digest(&files).unwrap();
+        let record = LearningCandidateRecord {
+            revision: CandidateRevision {
+                candidate_id: "qualification-atomicity-candidate".into(),
+                project_id: project.clone(),
+                role: Role::Worker,
+                digest: candidate_digest.clone(),
+                created_at: "2026-11-12T00:00:00Z".into(),
+                expires_at: "2026-11-13T00:00:00Z".into(),
+                status: CandidateStatus::Proposed,
+            },
+            profile_id: ProfileId::parse("qualification-atomicity-profile").unwrap(),
+            package_manifest_digest: manifest_digest,
+            package_files_json: serde_json::to_string(&files).unwrap(),
+            package_json: serde_json::to_string(&rows).unwrap(),
+            expected_pairs: 5,
+        };
+        store
+            .register_learning_candidate(generation, &record)
+            .unwrap();
+        let project_record = store.project(&project).unwrap().unwrap();
+        let request = ProviderQualificationRequest {
+            request_id: "qualification-atomicity-request".into(),
+            project_id: project.clone(),
+            role: Role::Worker,
+            profile_id: record.profile_id.clone(),
+            profile_digest: Digest::parse("a".repeat(64)).unwrap(),
+            config_revision: project_record.config_revision.0,
+            config_digest: project_record.config_digest,
+            target: ProviderQualificationTarget::Candidate {
+                candidate_id: record.revision.candidate_id.clone(),
+                candidate_digest: candidate_digest.clone(),
+            },
+        };
+
+        let tx = store.connection.transaction().unwrap();
+        super::set_candidate_revision_status(
+            &tx,
+            &project,
+            &record.revision.candidate_id,
+            &candidate_digest,
+            CandidateStatus::Expired,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert!(
+            store
+                .enqueue_provider_qualification(generation, &request)
+                .unwrap_err()
+                .contains("proposed")
+        );
+        assert!(
+            store
+                .provider_qualification_job(&request.request_id)
+                .unwrap()
+                .is_none()
+        );
+        let candidate_target_count: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM provider_qualification_candidate_targets WHERE request_id=?1",
+                [&request.request_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(candidate_target_count, 0);
+
+        let tx = store.connection.transaction().unwrap();
+        super::set_candidate_revision_status(
+            &tx,
+            &project,
+            &record.revision.candidate_id,
+            &candidate_digest,
+            CandidateStatus::Proposed,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let digest = store
+            .enqueue_provider_qualification(generation, &request)
+            .unwrap();
+        let tx = store.connection.transaction().unwrap();
+        super::set_candidate_revision_status(
+            &tx,
+            &project,
+            &record.revision.candidate_id,
+            &candidate_digest,
+            CandidateStatus::Expired,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(
+            store
+                .enqueue_provider_qualification(generation, &request)
+                .unwrap(),
+            digest
+        );
+        let mut changed = request.clone();
+        changed.target = ProviderQualificationTarget::Candidate {
+            candidate_id: record.revision.candidate_id,
+            candidate_digest: Digest::parse("e".repeat(64)).unwrap(),
+        };
+        assert!(
+            store
+                .enqueue_provider_qualification(generation, &changed)
+                .unwrap_err()
+                .contains("reused with different content")
+        );
+    }
+
+    #[test]
     fn invalid_supervisor_candidate_is_rejected_without_partial_learning_writes() {
         let fixture = learning_dispatch_fixture_with_options(
             crate::engine::orchestration::AgentAssertion::Succeeded,

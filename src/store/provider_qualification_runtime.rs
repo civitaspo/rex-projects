@@ -567,6 +567,32 @@ impl ConfigStore {
                     .into(),
             );
         }
+        if let ProviderQualificationTarget::Candidate {
+            candidate_id,
+            candidate_digest,
+        } = &request.target
+        {
+            if let Some(stored) = read_job(&tx, &request.request_id)? {
+                if stored.request == *request && stored.request_digest == digest {
+                    tx.commit().map_err(|error| error.to_string())?;
+                    return Ok(stored.request_digest);
+                }
+                return Err(
+                    "provider qualification request ID was reused with different content".into(),
+                );
+            }
+            let status: Option<String> = tx
+                .query_row(
+                    "SELECT status FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",
+                    params![request.project_id.as_str(), candidate_id, candidate_digest.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if status.as_deref() != Some("proposed") {
+                return Err("provider qualification candidate revision is not proposed".into());
+            }
+        }
         let now = now_unix()?;
         tx.execute(
             "INSERT INTO provider_qualification_jobs(request_id,project_id,role,profile_id,profile_digest,config_revision,config_digest,request_digest,status,controller_generation,launch_phase,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'queued',?9,'not_started',?10,?10) ON CONFLICT(request_id) DO NOTHING",

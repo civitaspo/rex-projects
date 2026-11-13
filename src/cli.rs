@@ -2516,29 +2516,45 @@ fn provider_command(
                     candidate_digest: candidate_digest.clone(),
                 },
             };
-            store
-                .resolve_provider_qualification_candidate(&request, &snapshot.config)
+            let replayed_job = store
+                .provider_qualification_job(&request.request_id)
                 .map_err(CliError::conflict)?;
+            if replayed_job.is_none() {
+                store
+                    .resolve_provider_qualification_candidate(&request, &snapshot.config)
+                    .map_err(CliError::conflict)?;
+            }
             let request_digest = store
                 .enqueue_provider_qualification(owner_generation, &request)
                 .map_err(CliError::conflict)?;
+            let state = replayed_job
+                .as_ref()
+                .map(|job| job.status.as_str())
+                .unwrap_or("queued");
             let report = serde_json::json!({
                 "accepted": true, "request_id": request.request_id, "request_digest": request_digest,
                 "project_id": project_id, "candidate_id": candidate, "candidate_digest": candidate_digest,
                 "profile_id": request.profile_id, "profile_digest": request.profile_digest,
                 "config_revision": snapshot.revision.0, "config_digest": snapshot.config.digest,
-                "state": "queued", "owner_generation": owner_generation,
+                "state": state, "owner_generation": owner_generation,
             });
             if json {
                 print_json(&report)
             } else {
-                println!(
-                    "Queued provider qualification {} for candidate {}.",
-                    request.request_id, candidate
-                );
-                println!(
-                    "The foreground Rex controller will run and record the bounded qualification."
-                );
+                if replayed_job.is_some() {
+                    println!(
+                        "Provider qualification {} for candidate {} is {}.",
+                        request.request_id, candidate, state
+                    );
+                } else {
+                    println!(
+                        "Queued provider qualification {} for candidate {}.",
+                        request.request_id, candidate
+                    );
+                    println!(
+                        "The foreground Rex controller will run and record the bounded qualification."
+                    );
+                }
                 Ok(())
             }
         }
@@ -4625,7 +4641,7 @@ mod tests {
         ])
         .unwrap();
 
-        let mut store = ConfigStore::open_test(&state_root).unwrap();
+        let store = ConfigStore::open_test(&state_root).unwrap();
         let job = store
             .provider_qualification_job("candidate-cli-roundtrip")
             .unwrap()
@@ -4638,6 +4654,68 @@ mod tests {
             }
         );
         assert_eq!(job.request.profile_id, profile_id);
+        drop(store);
+        let db = rusqlite::Connection::open(state_root.join("state.sqlite3")).unwrap();
+        let revision_json: String = db
+            .query_row(
+                "SELECT revision_json FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",
+                rusqlite::params![project_id.as_str(), candidate_id, candidate_digest.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut revision: CandidateRevision = serde_json::from_str(&revision_json).unwrap();
+        revision.status = CandidateStatus::Trialing;
+        db
+            .execute(
+                "UPDATE learning_candidates SET status='trialing',revision_json=?4 WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",
+                rusqlite::params![project_id.as_str(), candidate_id, candidate_digest.as_str(), serde_json::to_string(&revision).unwrap()],
+            )
+            .unwrap();
+        drop(db);
+        super::dispatch_provider_command_for_test(&[
+            "rex-projects",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--state-root",
+            state_root.to_str().unwrap(),
+            "--json",
+            "provider",
+            "qualify-candidate",
+            "--project",
+            project_id.as_str(),
+            "--candidate",
+            &candidate_id,
+            "--candidate-digest",
+            candidate_digest.as_str(),
+            "--request-id",
+            "candidate-cli-roundtrip",
+        ])
+        .unwrap();
+        let store = ConfigStore::open_test(&state_root).unwrap();
+        let replayed_job = store
+            .provider_qualification_job("candidate-cli-roundtrip")
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed_job, job);
+        drop(store);
+        let db = rusqlite::Connection::open(state_root.join("state.sqlite3")).unwrap();
+        let revision_json: String = db
+            .query_row(
+                "SELECT revision_json FROM learning_candidates WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",
+                rusqlite::params![project_id.as_str(), candidate_id, candidate_digest.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut revision: CandidateRevision = serde_json::from_str(&revision_json).unwrap();
+        revision.status = CandidateStatus::Proposed;
+        db
+            .execute(
+                "UPDATE learning_candidates SET status='proposed',revision_json=?4 WHERE project_id=?1 AND candidate_id=?2 AND digest=?3",
+                rusqlite::params![project_id.as_str(), candidate_id, candidate_digest.as_str(), serde_json::to_string(&revision).unwrap()],
+            )
+            .unwrap();
+        drop(db);
+        let mut store = ConfigStore::open_test(&state_root).unwrap();
         let replay_digest = store
             .enqueue_provider_qualification(generation, &job.request)
             .unwrap();
