@@ -182,18 +182,33 @@ pub fn profile_snapshot(
                 )
             })?;
             let canonical = std::path::Path::new(&source.canonical_path);
-            let relative = canonical.strip_prefix(&canonical_root).map_err(|_| {
+            canonical.strip_prefix(&canonical_root).map_err(|_| {
                 format!(
                     "absolute profile instruction `{configured_path}` escapes its captured profile directory"
                 )
             })?;
-            (relative.to_string_lossy().into_owned(), Some(source))
+            let lexical_relative = std::path::Path::new(&source.path)
+                .strip_prefix(&canonical_root)
+                .or_else(|_| std::path::Path::new(&source.path).strip_prefix(&logical_root))
+                .or_else(|_| configured.strip_prefix(&canonical_root))
+                .or_else(|_| configured.strip_prefix(&logical_root))
+                .map_err(|_| format!("absolute profile instruction `{configured_path}` is outside its captured profile directory"))?;
+            if lexical_relative.as_os_str().is_empty() {
+                return Err(format!(
+                    "absolute profile instruction `{configured_path}` does not name a file"
+                ));
+            }
+            (
+                lexical_relative.to_string_lossy().into_owned(),
+                Some(source),
+            )
         } else {
             let logical = logical_root.join(configured);
             let canonical = canonical_root.join(configured);
             let source = applied.source_files.iter().find(|source| {
                 matches!(source.kind, crate::config::SourceKind::File)
                     && (std::path::Path::new(&source.path) == logical
+                        || std::path::Path::new(&source.path) == canonical
                         || std::path::Path::new(&source.canonical_path) == canonical)
             });
             (configured_path.clone(), source)
@@ -204,6 +219,17 @@ pub fn profile_snapshot(
                     external_sources.and_then(|mapping| mapping.get(&source.canonical_path))
                 })
                 .cloned()
+                .or_else(|| {
+                    source.and_then(|source| {
+                        std::path::Path::new(&source.path)
+                            .strip_prefix(&canonical_root)
+                            .or_else(|_| {
+                                std::path::Path::new(&source.path).strip_prefix(&logical_root)
+                            })
+                            .ok()
+                            .map(|path| path.to_string_lossy().into_owned())
+                    })
+                })
                 .unwrap_or_else(|| snapshot_path.clone());
             package.get(&package_key).cloned()
         } else {

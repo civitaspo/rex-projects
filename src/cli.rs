@@ -2686,18 +2686,11 @@ fn stage_profile_trial_request(
         return Err(CliError::usage("candidate ID is malformed"));
     }
     let requested_digest = Digest::parse(candidate_digest).map_err(CliError::usage)?;
-    let matrix_metadata = std::fs::symlink_metadata(&matrix_file)
-        .map_err(|error| CliError::usage(format!("{}: {error}", matrix_file.display())))?;
-    if matrix_metadata.file_type().is_symlink()
-        || !matrix_metadata.is_file()
-        || matrix_metadata.len() > crate::learning_trials::INLINE_FIXTURE_MATRIX_MAX_BYTES as u64
-    {
-        return Err(CliError::usage(
-            "trial matrix must be a regular non-symlink file no larger than 512 KiB",
-        ));
-    }
-    let matrix_bytes = std::fs::read(&matrix_file)
-        .map_err(|error| CliError::usage(format!("{}: {error}", matrix_file.display())))?;
+    let matrix_bytes = read_trial_matrix_file(
+        &matrix_file,
+        crate::learning_trials::INLINE_FIXTURE_MATRIX_MAX_BYTES,
+    )
+    .map_err(CliError::usage)?;
     let matrix = crate::profile_trial_request::TrialRequestMatrix::parse(&matrix_bytes)
         .map_err(CliError::usage)?;
     let frozen_inputs = matrix.freeze().map_err(CliError::usage)?;
@@ -2878,18 +2871,22 @@ fn stage_profile_trial_request(
         .learning
         .min_distinct_trial_inputs
         .max(crate::learning::MIN_DISTINCT_INPUTS);
-    let distinct_pairs = matrix
+    let input_digests = frozen_inputs
+        .iter()
+        .map(|input| (input.input_id.as_str(), &input.input_digest))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let distinct_input_digests = matrix
         .pairs
         .iter()
-        .map(|pair| pair.input_id.as_str())
+        .filter_map(|pair| input_digests.get(pair.input_id.as_str()).copied())
         .collect::<std::collections::BTreeSet<_>>();
     if matrix.pairs.is_empty()
         || matrix.pairs.len() > max_pairs
         || matrix.pairs.len() > 10
-        || distinct_pairs.len() < min_inputs
+        || distinct_input_digests.len() < min_inputs
     {
         return Err(CliError::conflict(
-            "trial matrix exceeds configured pair budget or misses the configured distinct-input minimum",
+            "trial matrix exceeds configured pair budget or misses the configured distinct-input digest minimum",
         ));
     }
     if let Some(existing) = store
@@ -2924,20 +2921,28 @@ fn stage_profile_trial_request(
                 CliError::conflict("saved candidate qualification receipt is missing")
             })?;
         validate_trial_qualification(
+            &store,
             &old_base_qualification,
-            &project_id,
-            &base_profile_id,
-            base_profile,
-            &baseline.profile_digest,
-            &rex.instance_id,
+            &TrialQualificationExpectation {
+                project_id: &project_id,
+                profile_id: &base_profile_id,
+                profile: base_profile,
+                profile_digest: &baseline.profile_digest,
+                rex_instance: &rex.instance_id,
+                candidate_target: None,
+            },
         )?;
         validate_trial_qualification(
+            &store,
             &old_candidate_qualification,
-            &project_id,
-            &candidate_profile_id,
-            &candidate_profile,
-            &candidate_snapshot.profile_digest,
-            &rex.instance_id,
+            &TrialQualificationExpectation {
+                project_id: &project_id,
+                profile_id: &candidate_profile_id,
+                profile: &candidate_profile,
+                profile_digest: &candidate_snapshot.profile_digest,
+                rex_instance: &rex.instance_id,
+                candidate_target: Some((&candidate, &requested_digest)),
+            },
         )?;
         let lifecycle = store
             .profile_trial_authorization_lifecycle(&authorization_id)
@@ -2962,6 +2967,7 @@ fn stage_profile_trial_request(
         base_profile,
         &baseline.profile_digest,
         &rex.instance_id,
+        None,
     )?;
     let candidate_qualification = find_trial_qualification(
         &store,
@@ -2970,6 +2976,7 @@ fn stage_profile_trial_request(
         &candidate_profile,
         &candidate_snapshot.profile_digest,
         &rex.instance_id,
+        Some((&candidate, &requested_digest)),
     )?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3076,6 +3083,15 @@ fn stage_profile_trial_request(
     }
 }
 
+struct TrialQualificationExpectation<'a> {
+    project_id: &'a ProjectId,
+    profile_id: &'a crate::domain::ids::ProfileId,
+    profile: &'a crate::config::Profile,
+    profile_digest: &'a Digest,
+    rex_instance: &'a str,
+    candidate_target: Option<(&'a str, &'a Digest)>,
+}
+
 fn find_trial_qualification(
     store: &ConfigStore,
     project_id: &ProjectId,
@@ -3083,31 +3099,37 @@ fn find_trial_qualification(
     profile: &crate::config::Profile,
     profile_digest: &Digest,
     rex_instance: &str,
+    candidate_target: Option<(&str, &Digest)>,
 ) -> Result<crate::launch::ProviderQualification, CliError> {
     let receipts = store
         .verified_provider_qualifications(project_id, profile_id, profile_digest, 32)
         .map_err(CliError::conflict)?;
-    receipts.into_iter().find(|receipt| validate_trial_qualification(receipt, project_id, profile_id, profile, profile_digest, rex_instance).is_ok())
+    let expected = TrialQualificationExpectation {
+        project_id,
+        profile_id,
+        profile,
+        profile_digest,
+        rex_instance,
+        candidate_target,
+    };
+    receipts.into_iter().find(|receipt| validate_trial_qualification(store, receipt, &expected).is_ok())
         .ok_or_else(|| CliError::conflict("no verified qualification matches the exact profile runtime and current Rex instance"))
 }
 
 fn validate_trial_qualification(
+    store: &ConfigStore,
     receipt: &crate::launch::ProviderQualification,
-    project_id: &ProjectId,
-    profile_id: &crate::domain::ids::ProfileId,
-    profile: &crate::config::Profile,
-    profile_digest: &Digest,
-    rex_instance: &str,
+    expected: &TrialQualificationExpectation<'_>,
 ) -> Result<(), CliError> {
-    let identity = crate::run_step::profile_runtime_identity(profile)
+    let identity = crate::run_step::profile_runtime_identity(expected.profile)
         .map_err(|error| CliError::conflict(error.to_string()))?;
     receipt
         .validate_for_unattended_launch()
         .map_err(CliError::conflict)?;
-    if receipt.project_id != *project_id
-        || receipt.profile_id != *profile_id
-        || receipt.profile_digest != *profile_digest
-        || receipt.proof.rex_instance_id != rex_instance
+    if receipt.project_id != *expected.project_id
+        || receipt.profile_id != *expected.profile_id
+        || receipt.profile_digest != *expected.profile_digest
+        || receipt.proof.rex_instance_id != expected.rex_instance
         || receipt.adapter != identity.adapter
         || receipt.executable_path != identity.executable_path.display().to_string()
         || receipt.executable_digest != identity.executable_digest
@@ -3119,7 +3141,50 @@ fn validate_trial_qualification(
             "qualification receipt does not match the exact trial profile and current Rex instance",
         ));
     }
+    if let Some((candidate_id, candidate_digest)) = expected.candidate_target
+        && !store
+            .provider_qualification_matches_candidate_target(
+                &receipt.canonical_digest().map_err(CliError::conflict)?,
+                expected.project_id,
+                candidate_id,
+                candidate_digest,
+                expected.profile_id,
+                expected.profile_digest,
+            )
+            .map_err(CliError::conflict)?
+    {
+        return Err(CliError::conflict(
+            "qualification receipt is not bound to the exact candidate revision",
+        ));
+    }
     Ok(())
+}
+
+fn read_trial_matrix_file(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() > limit as u64 {
+        return Err("trial matrix must be a bounded regular file no larger than 512 KiB".into());
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > limit {
+        return Err("trial matrix exceeds its byte limit".into());
+    }
+    Ok(bytes)
 }
 
 fn provider_status_fields(
@@ -5020,10 +5085,30 @@ mod tests {
 
     use super::{
         Cli, Command, ProviderCommand, TicketCommand, factory_context_present,
-        read_effective_snapshot, resolve_executable, terminal_safe,
+        read_effective_snapshot, read_trial_matrix_file, resolve_executable, terminal_safe,
     };
     use crate::config;
     use crate::store::{ConfigStore, ExpectedRevision};
+
+    #[test]
+    fn trial_matrix_reader_rejects_symlinks_oversize_and_fifos() {
+        let temp = tempfile::tempdir().unwrap();
+        let regular = temp.path().join("matrix.json");
+        std::fs::write(&regular, b"{}").unwrap();
+        assert_eq!(read_trial_matrix_file(&regular, 2).unwrap(), b"{}");
+        assert!(read_trial_matrix_file(&regular, 1).is_err());
+        let symlink = temp.path().join("matrix-link.json");
+        std::os::unix::fs::symlink(&regular, &symlink).unwrap();
+        assert!(read_trial_matrix_file(&symlink, 16).is_err());
+        let fifo = temp.path().join("matrix.fifo");
+        let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        assert!(
+            read_trial_matrix_file(&fifo, 16)
+                .unwrap_err()
+                .contains("regular file")
+        );
+    }
 
     #[test]
     fn candidate_qualification_cli_requires_exact_target_and_has_no_execution_overrides() {
@@ -5099,22 +5184,34 @@ mod tests {
                 }
             }
         }
+        let judgment_profile = config_root.join("profiles/judgment_claude");
+        let real_judgment_profile = config_root.join("profiles/judgment_claude_real");
+        std::fs::rename(&judgment_profile, &real_judgment_profile).unwrap();
+        std::os::unix::fs::symlink(&real_judgment_profile, &judgment_profile).unwrap();
         let base_profile_config = config_root.join("profiles/judgment_claude/config.toml");
         let original_profile_config = std::fs::read_to_string(&base_profile_config).unwrap();
         let instruction_alias = config_root.join("profiles/judgment_claude/aliases/instruction.md");
+        std::fs::create_dir_all(instruction_alias.parent().unwrap()).unwrap();
+        let canonical_alias = instruction_alias
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .join(instruction_alias.file_name().unwrap());
         std::fs::write(
             &base_profile_config,
             original_profile_config.replace(
                 "[options]",
                 &format!(
-                    "instruction_files = [{:?}]\n\n[options]",
-                    instruction_alias.display().to_string()
+                    "instruction_files = [\"aliases/instruction.md\", {:?}]\n\n[options]",
+                    canonical_alias.display().to_string(),
                 ),
             ),
         )
         .unwrap();
-        std::fs::create_dir_all(config_root.join("profiles/judgment_claude/aliases")).unwrap();
-        std::fs::write(instruction_alias, "Alias-resolved frozen instruction.\n").unwrap();
+        let alias_target = config_root.join("profiles/judgment_claude/alias-target.md");
+        std::fs::write(&alias_target, "Alias-resolved frozen instruction.\n").unwrap();
+        std::os::unix::fs::symlink("../alias-target.md", &instruction_alias).unwrap();
         let rex_cli = temp.path().join("fixture-rex");
         std::fs::write(&rex_cli, "#!/bin/sh\nprintf '%s\\n' '{\"endpoint\":\"unix:///tmp/rex-trial-fixture.sock\",\"instance_id\":\"rex-trial-fixture\",\"host_id\":\"fixture-host\",\"rex_version\":\"fixture\",\"methods\":[]}'\n").unwrap();
         std::fs::set_permissions(&rex_cli, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -5210,13 +5307,14 @@ mod tests {
             .unwrap();
         for source in &applied.source_files {
             if matches!(source.kind, crate::config::SourceKind::File) {
-                let path = std::path::Path::new(&source.canonical_path);
-                if path.starts_with(&root)
-                    && path
+                let canonical_path = std::path::Path::new(&source.canonical_path);
+                let package_path = std::path::Path::new(&source.path);
+                if canonical_path.starts_with(&root)
+                    && canonical_path
                         .file_name()
                         .is_some_and(|name| name != OsStr::new("config.toml"))
                 {
-                    let relative = path
+                    let relative = package_path
                         .strip_prefix(&root)
                         .unwrap()
                         .to_string_lossy()
@@ -5401,11 +5499,12 @@ mod tests {
                 .to_string()
                 .contains("does not match the foreground controller identity")
         );
+        let initial_error = super::dispatch_learning_command_with_environment_for_test(&args, &env)
+            .unwrap_err()
+            .to_string();
         assert!(
-            super::dispatch_learning_command_with_environment_for_test(&args, &env)
-                .unwrap_err()
-                .to_string()
-                .contains("no verified qualification matches")
+            initial_error.contains("no verified qualification matches"),
+            "{initial_error}"
         );
         let original_config = std::fs::read(&config_path).unwrap();
         let mut changed_config = original_config.clone();
@@ -5431,10 +5530,98 @@ mod tests {
         }
         drop(db);
         let mut store = ConfigStore::open_test(&state_root).unwrap();
+        let candidate_qualification = candidate_qualification.unwrap();
+        let project_record = store.project(&project_id).unwrap().unwrap();
+        let qualification_request = crate::store::provider_qualification_runtime::ProviderQualificationRequest {
+            request_id: "trial-candidate-qualification".into(),
+            project_id: project_id.clone(),
+            role,
+            profile_id: candidate_profile_id.clone(),
+            profile_digest: candidate_qualification.profile_digest.clone(),
+            config_revision: project_record.config_revision.0,
+            config_digest: project_record.config_digest,
+            target: crate::store::provider_qualification_runtime::ProviderQualificationTarget::Candidate {
+                candidate_id: candidate_id.clone(),
+                candidate_digest: candidate_digest.clone(),
+            },
+        };
         store
-            .store_provider_qualification(generation, &candidate_qualification.unwrap())
+            .enqueue_provider_qualification(generation, &qualification_request)
             .unwrap();
+        let crate::store::provider_qualification_runtime::QualificationClaim::Claimed { .. } =
+            store
+                .claim_provider_qualification(generation, 1, 1)
+                .unwrap()
+        else {
+            panic!("candidate qualification job should be claimable");
+        };
+        store
+            .bind_provider_qualification_rex(
+                generation,
+                &qualification_request.request_id,
+                "fixture-session",
+                "qualification-window",
+                "qualification-block",
+            )
+            .unwrap();
+        store
+            .store_provider_qualification(generation, &candidate_qualification)
+            .unwrap();
+        let result_json = serde_json::to_string(&candidate_qualification).unwrap();
+        let evidence_digest = Digest::parse(format!(
+            "{:x}",
+            sha2::Sha256::digest(result_json.as_bytes())
+        ))
+        .unwrap();
+        store.finish_provider_qualification_job(
+            generation,
+            &qualification_request.request_id,
+            crate::store::provider_qualification_runtime::ProviderQualificationJobStatus::Verified,
+            &result_json,
+            &evidence_digest,
+            true,
+        ).unwrap();
+        let candidate_receipt_digest = candidate_qualification.canonical_digest().unwrap();
+        assert!(
+            store
+                .provider_qualification_matches_candidate_target(
+                    &candidate_receipt_digest,
+                    &project_id,
+                    &candidate_id,
+                    &candidate_digest,
+                    &candidate_profile_id,
+                    &candidate_qualification.profile_digest,
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .provider_qualification_matches_candidate_target(
+                    &candidate_receipt_digest,
+                    &project_id,
+                    &candidate_id,
+                    &Digest::parse("9".repeat(64)).unwrap(),
+                    &candidate_profile_id,
+                    &candidate_qualification.profile_digest,
+                )
+                .unwrap()
+        );
         drop(store);
+        let mut duplicate_content = matrix.clone();
+        for input in duplicate_content["inputs"].as_array_mut().unwrap() {
+            input["input"] = serde_json::json!({"same":true});
+        }
+        std::fs::write(
+            &matrix_path,
+            serde_json::to_vec(&duplicate_content).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            super::dispatch_learning_command_with_environment_for_test(&args, &env)
+                .unwrap_err()
+                .to_string()
+                .contains("distinct-input digest minimum")
+        );
         let mut skewed = matrix.clone();
         for pair_index in 0..10 {
             let input_id = if pair_index < 6 {
@@ -5592,7 +5779,7 @@ mod tests {
             .unwrap();
         assert_eq!((retry_auth_count, retry_request_count), (1, 1));
         drop(db);
-        let mut changed = matrix;
+        let mut changed = matrix.clone();
         changed["inputs"][0]["input"]["case"] = serde_json::json!(999);
         std::fs::write(&matrix_path, serde_json::to_vec(&changed).unwrap()).unwrap();
         let error =
@@ -5615,6 +5802,51 @@ mod tests {
             .unwrap();
         assert_eq!(auth_count, 1);
         assert_eq!(human_count, 1);
+        drop(db);
+
+        let request_id = crate::domain::ids::HumanRequestId::parse(request_id).unwrap();
+        let request = ConfigStore::read_human_request(&state_root, &request_id)
+            .unwrap()
+            .unwrap()
+            .request;
+        let refusal = crate::human_runtime::HumanDecisionIntent {
+            request_id: request_id.clone(),
+            response_id: "fixture-trial-refusal".into(),
+            expected_subject_digest: request.subject.digest().unwrap(),
+            choice: crate::human_runtime::HumanDecisionChoice::Refuse,
+            explanation: Some("Declined this candidate for the fixture regression.".into()),
+        };
+        ConfigStore::enqueue_human_decision(&state_root, &refusal, 1_000).unwrap();
+        let mut store = ConfigStore::open_test(&state_root).unwrap();
+        assert_eq!(
+            store
+                .process_human_decision(generation, &refusal.response_id, &request.subject, 1_001)
+                .unwrap(),
+            crate::store::human::HumanDecisionResult::Applied
+        );
+        assert_eq!(
+            store
+                .profile_trial_authorization_lifecycle(&auth.authorization_id)
+                .unwrap()
+                .as_deref(),
+            Some("refused"),
+        );
+        drop(store);
+
+        std::fs::write(&matrix_path, serde_json::to_vec(&matrix).unwrap()).unwrap();
+        let mut retry_args = args.to_vec();
+        let key_position = retry_args
+            .iter()
+            .position(|arg| *arg == "--request-key")
+            .unwrap();
+        retry_args[key_position + 1] = "fixture-request-key-after-refusal";
+        super::dispatch_learning_command_with_environment_for_test(&retry_args, &env).unwrap();
+        let db = rusqlite::Connection::open(state_root.join("state.sqlite3")).unwrap();
+        let lifecycles = db.prepare(
+            "SELECT lifecycle FROM profile_trial_authorizations ORDER BY created_at_unix,authorization_id",
+        ).unwrap().query_map([], |row| row.get::<_, String>(0)).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(lifecycles, ["refused", "pending"]);
     }
 
     #[test]

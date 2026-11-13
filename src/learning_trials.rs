@@ -607,6 +607,18 @@ impl ProfileTrialAuthorization {
         if distinct.len() < MIN_DISTINCT_INPUTS {
             return Err("trial matrix must cover at least five distinct inputs".into());
         }
+        let input_digests = self
+            .inputs
+            .iter()
+            .map(|input| (input.input_id.as_str(), input.input_digest.as_str()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let distinct_task_digests = distinct
+            .iter()
+            .filter_map(|input_id| input_digests.get(input_id).copied())
+            .collect::<std::collections::BTreeSet<_>>();
+        if distinct_task_digests.len() < MIN_DISTINCT_INPUTS {
+            return Err("trial matrix must cover at least five distinct task input digests".into());
+        }
         let mut pair_indexes = std::collections::BTreeSet::new();
         for pair in &self.pairs {
             if !pair_indexes.insert(pair.pair_index)
@@ -1441,6 +1453,19 @@ mod tests {
             profile_trial_review_bundle(&authorization).unwrap()
         );
         assert_eq!(authorization.pairs.len() * 2, 20);
+    }
+
+    #[test]
+    fn trial_matrix_requires_distinct_task_content_not_only_distinct_labels() {
+        let mut authorization = authorization();
+        let repeated = "{\"same\":true}".to_owned();
+        let digest = super::content_digest(repeated.as_bytes()).unwrap();
+        for input in &mut authorization.inputs {
+            input.input_json = repeated.clone();
+            input.input_digest = digest.clone();
+        }
+        let error = authorization.validate().unwrap_err();
+        assert!(error.contains("five distinct task input digests"));
     }
 
     #[test]

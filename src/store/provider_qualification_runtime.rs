@@ -220,6 +220,97 @@ impl ProviderQualificationRequest {
 }
 
 impl ConfigStore {
+    /// Confirm that a verified receipt was produced by a job pinned to this exact candidate.
+    pub fn provider_qualification_matches_candidate_target(
+        &self,
+        receipt_digest: &Digest,
+        project_id: &ProjectId,
+        candidate_id: &str,
+        candidate_digest: &Digest,
+        profile_id: &ProfileId,
+        profile_digest: &Digest,
+    ) -> Result<bool, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT request_id FROM provider_qualification_candidate_targets t \
+             JOIN provider_qualification_jobs j USING(request_id) \
+             WHERE t.project_id=?1 AND t.candidate_id=?2 AND t.candidate_digest=?3 \
+             AND j.project_id=?1 AND j.profile_id=?4 AND j.profile_digest=?5 \
+             AND j.status='verified' ORDER BY j.updated_at_unix DESC LIMIT 32",
+            )
+            .map_err(|error| error.to_string())?;
+        let ids = statement
+            .query_map(
+                params![
+                    project_id.as_str(),
+                    candidate_id,
+                    candidate_digest.as_str(),
+                    profile_id.as_str(),
+                    profile_digest.as_str()
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        for id in ids {
+            let Some(job) = read_job(&self.connection, &id)? else {
+                continue;
+            };
+            let ProviderQualificationTarget::Candidate {
+                candidate_id: bound_id,
+                candidate_digest: bound_digest,
+            } = &job.request.target
+            else {
+                continue;
+            };
+            if job.request.project_id != *project_id
+                || bound_id != candidate_id
+                || bound_digest != candidate_digest
+                || job.request.profile_id != *profile_id
+                || job.request.profile_digest != *profile_digest
+                || job.status != ProviderQualificationJobStatus::Verified
+            {
+                continue;
+            }
+            let Some(result_json) = job.result_json else {
+                continue;
+            };
+            let receipt: crate::launch::ProviderQualification =
+                crate::protocol::parse_unique(result_json.as_bytes()).map_err(|error| {
+                    format!("stored verified qualification job result is invalid: {error}")
+                })?;
+            if receipt.canonical_digest()? != *receipt_digest
+                || receipt.project_id != *project_id
+                || receipt.profile_id != *profile_id
+                || receipt.profile_digest != *profile_digest
+                || receipt.status != crate::launch::QualificationStatus::Verified
+            {
+                continue;
+            }
+            let stored: Option<(String, String)> = self.connection.query_row(
+                "SELECT receipt_digest,receipt_json FROM provider_qualifications WHERE receipt_digest=?1",
+                [receipt_digest.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional().map_err(|error| error.to_string())?;
+            let Some((stored_digest, stored_json)) = stored else {
+                continue;
+            };
+            let stored_receipt: crate::launch::ProviderQualification =
+                crate::protocol::parse_unique(stored_json.as_bytes()).map_err(|error| {
+                    format!("stored provider qualification is invalid: {error}")
+                })?;
+            if stored_digest == receipt_digest.as_str()
+                && stored_receipt == receipt
+                && stored_receipt.canonical_digest()? == *receipt_digest
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn queue_provider_qualification_reconcile(
         &mut self,
         owner_generation: u64,

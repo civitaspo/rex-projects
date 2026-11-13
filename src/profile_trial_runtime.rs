@@ -148,6 +148,25 @@ impl ProfileTrialStartEffectHandler {
         {
             return Err("profile trial capsule is not authorized for the applied config".into());
         }
+        if capsule.side == crate::learning_trials::TrialSide::Candidate
+            && (authorization.candidate_id != capsule.candidate_id
+                || authorization.candidate_digest != capsule.candidate_digest
+                || !context
+                    .store
+                    .provider_qualification_matches_candidate_target(
+                        &capsule.provider_qualification_digest,
+                        &capsule.project_id,
+                        &capsule.candidate_id,
+                        &capsule.candidate_digest,
+                        &authorization.candidate.profile_id,
+                        &authorization.candidate.profile_digest,
+                    )?)
+        {
+            return Err(
+                "candidate trial qualification is not bound to the exact authorized candidate"
+                    .into(),
+            );
+        }
         let runnable = context
             .store
             .runnable_projects(context.owner_generation)?
