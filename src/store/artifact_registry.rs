@@ -1755,6 +1755,7 @@ mod tests {
                  DROP TABLE learning_findings;
                  DROP TABLE learning_batches;
                  DROP TABLE supervisor_topic_publications;
+                 DELETE FROM schema_migrations WHERE version=21;
                  DELETE FROM schema_migrations WHERE version=20;
                  DELETE FROM schema_migrations WHERE version=19;
                  DROP TRIGGER agent_launch_phase_transitions;

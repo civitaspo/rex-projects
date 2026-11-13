@@ -38,7 +38,7 @@ pub(crate) mod provider_qualification;
 #[path = "store/rex_view_tables.rs"]
 pub(crate) mod rex_view_tables;
 
-pub const SCHEMA_VERSION: i64 = 20;
+pub const SCHEMA_VERSION: i64 = 21;
 #[path = "store/accepted_plans.rs"]
 pub mod accepted_plans;
 pub mod agent_runtime;
@@ -641,6 +641,8 @@ impl ConfigStore {
         }
         if existing_version == 20 {
             learning_store::validate_v20_topic_publications(&connection)?;
+        } else if existing_version >= 21 {
+            learning_store::validate_v21_topic_publications(&connection)?;
         }
         connection
             .execute_batch(
@@ -761,10 +763,16 @@ impl ConfigStore {
             }
             learning_store::migrate_v20_topic_publications(&connection)?;
         }
+        if existing_version < 21 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            learning_store::migrate_v21_topic_revisions(&connection)?;
+        }
         artifact_registry::validate_v12_schema(&connection)?;
         agent_launch_phase::validate_v18_schema(&connection)?;
         learning_store::validate_v19_learning_batches(&connection)?;
-        learning_store::validate_v20_topic_publications(&connection)?;
+        learning_store::validate_v21_topic_publications(&connection)?;
         Ok(Self {
             connection,
             _machine_lock: machine_lock,

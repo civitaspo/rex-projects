@@ -1,4 +1,4 @@
-//! Strict handler for the project-scoped Supervisor Topic creation effect.
+//! Strict handler for immutable project-scoped Supervisor Topic publications.
 
 use std::path::PathBuf;
 
@@ -57,7 +57,7 @@ impl TopicEffectHandler {
                 "configured Topic destination changed while a publication was pending".into(),
             ));
         }
-        let receipt = crate::topic::publish_create_only(&intent)?;
+        let receipt = crate::topic::publish_immutable(&intent)?;
         store.record_supervisor_topic_publication(owner_generation, &operation_id, &receipt)?;
         store
             .supervisor_topic_receipt(&operation_id)?
