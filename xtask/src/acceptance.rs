@@ -13,6 +13,7 @@ use rex_projects::process::{
     ProcessIdentity, ProcessIdentityQuality, ProcessOutput, ProcessRequest, inspect_process_table,
     run as run_process,
 };
+use rex_projects::run_step_spool::{RunFamilyCoverage, RunStepSpool};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -28,6 +29,8 @@ const POLL_LIMIT: Duration = Duration::from_secs(20);
 const FULL_FLOW_LIMIT: Duration = Duration::from_secs(30 * 60);
 const QUALIFICATION_LIMIT: Duration = Duration::from_secs(180);
 const COORDINATOR_STAGE_LIMIT: Duration = Duration::from_secs(180);
+const NATIVE_WORKER_READY_LIMIT: Duration = Duration::from_secs(60);
+const NATIVE_WORKER_TERMINAL_LIMIT: Duration = Duration::from_secs(360);
 const ACCEPTANCE_STAGE_ENV: &str = "REX_PROJECTS_ACCEPTANCE_STAGE";
 const COORDINATOR_INBOX_STAGE: &str = "supervisor_coordinator_inbox";
 const COORDINATOR_BLOCK_LOSS_STAGE: &str = "supervisor_coordinator_block_loss";
@@ -611,7 +614,20 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
                 serde_json::to_vec_pretty(&ready).map_err(|error| error.to_string())?,
             )
             .map_err(|error| format!("write native Worker ready observation: {error}"))?;
-            return Ok(());
+            let proof = observe_native_worker_block_loss(&request, &state_root, &worker)?;
+            fs::write(
+                request.fixture_root.join("native-worker-block-loss.json"),
+                serde_json::to_vec_pretty(&proof).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| format!("write native Worker block-loss proof: {error}"))?;
+            return if proof["status"] == "passed" {
+                Ok(())
+            } else {
+                Err(format!(
+                    "native Worker block-loss proof was {}",
+                    proof["status"]
+                ))
+            };
         }
         if bounded_coordinator_stage {
             let observations = read_public_inbox_observations(request.fixture_root)?;
@@ -4455,7 +4471,7 @@ fn invoke(
         stdout_limit: OUTPUT_LIMIT,
         stderr_tail_limit: OUTPUT_LIMIT,
     })
-    .map_err(|error| error.to_string())
+    .map_err(|error| format!("start {}: {error}", executable.display()))
 }
 
 fn require_success(label: &str, output: &ProcessOutput) -> Result<(), String> {
@@ -5031,6 +5047,577 @@ fn dashboard_agent<'a>(dashboard: &'a Value, run_id: &str) -> Option<&'a Value> 
         .find(|agent| agent["agent_run_id"] == run_id && agent["role"] == "coordinator")
 }
 
+fn dashboard_worker<'a>(dashboard: &'a Value, run_id: &str) -> Option<&'a Value> {
+    dashboard
+        .get("agents")?
+        .as_array()?
+        .iter()
+        .find(|agent| agent["agent_run_id"] == run_id && agent["role"] == "worker")
+}
+
+fn observe_native_worker_block_loss(
+    request: &Request<'_>,
+    state_root: &Path,
+    worker: &Value,
+) -> Result<Value, String> {
+    let ready_at = Instant::now();
+    let string = |key: &str| {
+        worker
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("native Worker ready evidence omitted {key}"))
+    };
+    let run_id = string("run_id")?;
+    let session_id = string("session_id")?;
+    let window_id = string("window_id")?;
+    let block_id = string("block_id")?;
+    let control_dir = PathBuf::from(string("control_dir")?);
+    let epoch = worker["reservation_epoch"]
+        .as_u64()
+        .ok_or("native Worker ready evidence omitted reservation epoch")?;
+    let wrapper = &worker["wrapper_process_identity"];
+    let provider = &worker["provider_start_observation"];
+    let wrapper_pid = wrapper["pid"]
+        .as_u64()
+        .ok_or("native Worker ready evidence omitted wrapper PID")?;
+    let wrapper_start = wrapper["start_identity"]
+        .as_str()
+        .ok_or("native Worker ready evidence omitted wrapper birth token")?;
+    let provider_pid = provider["provider_pid"]
+        .as_u64()
+        .ok_or("native Worker ready evidence omitted provider PID")?;
+    let provider_start = provider["provider_start_identity"]
+        .as_str()
+        .ok_or("native Worker ready evidence omitted provider birth token")?;
+    if session_id != request.rex_session
+        || worker["server_instance_id"] != request.expected_instance
+    {
+        return Err("native Worker ready identity differs from the pinned Rex session".into());
+    }
+    let rex = RexCliTransport::connect(
+        request.rex,
+        &[],
+        request.rex_server.to_owned(),
+        request.expected_instance.to_owned(),
+        session_id.to_owned(),
+        BTreeMap::new(),
+    )
+    .map_err(|error| format!("connect to pinned Rex identity for native block loss: {error}"))?;
+    let window = TicketWindow {
+        server_instance_id: request.expected_instance.to_owned(),
+        session_id: session_id.to_owned(),
+        window_id: window_id.to_owned(),
+        label: String::new(),
+        initial_block_id: Some(block_id.to_owned()),
+        disposition: CreateDisposition::Existing,
+    };
+    let database = Connection::open_with_flags(
+        state_root.join("state.sqlite3"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|error| format!("open native Worker state read-only: {error}"))?;
+    let initial_status = product(request, state_root, &["status", "--json"])?;
+    require_success(
+        "read native Worker controller before block loss",
+        &initial_status,
+    )?;
+    let initial_status = json_stdout(&initial_status);
+    let generation = initial_status
+        .pointer("/owner/generation")
+        .and_then(Value::as_u64)
+        .ok_or("controller status omitted native Worker generation")?;
+    let baseline = recovery_state(&database, run_id, block_id)?;
+    let (slot_pool, slot_index): (String, u64) = database
+        .query_row(
+            "SELECT pool,slot_index FROM execution_slots WHERE owner_kind='agent_run' AND owner_id=?1 AND reservation_epoch=?2",
+            params![run_id, epoch],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| format!("read native Worker reservation slot: {error}"))?;
+    if baseline.reservation_epoch != epoch
+        || baseline.state != "running"
+        || baseline.disposition != "live"
+        || baseline.generation != generation
+    {
+        return Err("native Worker state did not match its ready run and live reservation".into());
+    }
+    let ready_deadline = ready_at + NATIVE_WORKER_READY_LIMIT;
+    let terminal_deadline = ready_at + NATIVE_WORKER_TERMINAL_LIMIT;
+    let mut last_order = baseline.observation_order;
+    let mut advances = 0;
+    let spool = RunStepSpool::open(&control_dir)
+        .map_err(|error| format!("open native Worker run-step spool: {error}"))?;
+    let binding = spool
+        .read_run_family_binding()
+        .map_err(|error| format!("read native Worker run-family binding: {error}"))?;
+    if binding.agent_run_id.as_str() != run_id
+        || binding.reservation_epoch != epoch
+        || binding.wrapper_pid as u64 != wrapper_pid
+        || binding.wrapper_start_identity != wrapper_start
+    {
+        return Ok(
+            json!({"status":"inconclusive","reason":"native Worker run-family binding did not match its ready run, epoch, or wrapper","run_id":run_id,"reservation_epoch":epoch,"fault_injected":false}),
+        );
+    }
+    let (sleep_identity, mut pre_close_process_identities) = loop {
+        if Instant::now() >= ready_deadline {
+            return Ok(
+                json!({"status":"inconclusive","reason":"two live recovery observations and the exact sleep process did not arrive within the ready budget","run_id":run_id,"reservation_epoch":epoch,"fault_injected":false}),
+            );
+        }
+        let status = product(request, state_root, &["status", "--json"])?;
+        let dashboard = product(request, state_root, &["dashboard", "--json"])?;
+        require_success("read native Worker status before block loss", &status)?;
+        require_success("read native Worker dashboard before block loss", &dashboard)?;
+        let status = json_stdout(&status);
+        let dashboard = json_stdout(&dashboard);
+        let agent = dashboard_worker(&dashboard, run_id);
+        if status.pointer("/owner/active") != Some(&Value::Bool(true))
+            || status.pointer("/owner/generation").and_then(Value::as_u64)
+                != Some(baseline.generation)
+            || !agent.is_some_and(|agent| {
+                agent["state"] == "running"
+                    && agent["rex_session_id"] == session_id
+                    && agent["rex_window_id"] == window_id
+                    && agent["rex_block_id"] == block_id
+            })
+        {
+            return Ok(
+                json!({"status":"inconclusive","reason":"pinned Worker or controller identity changed before block loss","run_id":run_id,"reservation_epoch":epoch,"fault_injected":false}),
+            );
+        }
+        if !rex
+            .agent_block_is_present(&window, run_id, block_id)
+            .map_err(|error| format!("verify exact native Worker block before close: {error}"))?
+        {
+            return Ok(
+                json!({"status":"inconclusive","reason":"exact owned Worker block disappeared before requested close","run_id":run_id,"reservation_epoch":epoch,"fault_injected":false}),
+            );
+        }
+        let family = match spool.read_run_family_record() {
+            Ok(Some(family)) => family,
+            Ok(None) => {
+                std::thread::sleep(POLL_INTERVAL);
+                continue;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "read validated native Worker run-family record: {error}"
+                ));
+            }
+        };
+        if family.binding != binding
+            || family.coverage != RunFamilyCoverage::Observing
+            || family.wrapper_process.pid as u64 != wrapper_pid
+            || family.wrapper_process.start_identity != wrapper_start
+            || family.provider_root.pid as u64 != provider_pid
+            || family.provider_root.start_identity != provider_start
+        {
+            return Ok(
+                json!({"status":"inconclusive","reason":"current process-family receipt did not match the ready Worker run and epoch","run_id":run_id,"reservation_epoch":epoch,"fault_injected":false}),
+            );
+        }
+        let sleep = family
+            .process_tree
+            .iter()
+            .find(|identity| identity.command == "sleep");
+        if let Some(sleep) = sleep {
+            let pid = sleep.pid;
+            let start = sleep.start_identity.as_str();
+            let has_kernel_identity = inspect_process_table()
+                .map_err(|error| format!("inspect native Worker process family: {error:?}"))?
+                .iter()
+                .any(|process| {
+                    process.pid == pid
+                        && process.start_identity == start
+                        && process.quality == ProcessIdentityQuality::KernelBirthToken
+                });
+            let command = invoke(
+                Path::new("/bin/ps"),
+                &[
+                    OsString::from("-p"),
+                    OsString::from(pid.to_string()),
+                    OsString::from("-o"),
+                    OsString::from("command="),
+                ],
+                None,
+                None,
+                STEP_TIMEOUT,
+            )?;
+            let command = String::from_utf8_lossy(&command.stdout);
+            let argv = command.split_whitespace().collect::<Vec<_>>();
+            let command_matches =
+                matches!(argv.as_slice(), ["/bin/sleep", "300"] | ["sleep", "300"]);
+            if has_kernel_identity && command_matches {
+                let cursor = recovery_state(&database, run_id, block_id)?;
+                if cursor.generation != baseline.generation
+                    || cursor.reservation_epoch != epoch
+                    || cursor.disposition != "live"
+                    || cursor.state != "running"
+                {
+                    return Ok(
+                        json!({"status":"inconclusive","reason":"native Worker recovery cursor changed before block loss","run_id":run_id,"reservation_epoch":epoch,"fault_injected":false}),
+                    );
+                }
+                if observe_cursor_advance(&mut last_order, cursor.observation_order)? {
+                    advances += 1;
+                }
+                if advances == 2 {
+                    let sleep = serde_json::to_value(sleep).map_err(|error| {
+                        format!("serialize validated native Worker process: {error}")
+                    })?;
+                    let process_tree = serde_json::to_value(&family.process_tree)
+                        .map_err(|error| {
+                            format!("serialize validated native Worker process tree: {error}")
+                        })?
+                        .as_array()
+                        .cloned()
+                        .ok_or("validated native Worker process tree is not an array")?;
+                    break (sleep, process_tree);
+                }
+            }
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    };
+    if let Some(ready_processes) = worker["live_process_identities"].as_array() {
+        for identity in ready_processes {
+            if !pre_close_process_identities.contains(identity) {
+                pre_close_process_identities.push(identity.clone());
+            }
+        }
+    }
+    match close_native_worker_block_before_deadline(
+        ready_deadline,
+        || {
+            rex.agent_block_is_present(&window, run_id, block_id)
+                .map_err(|error| format!("recheck native Worker block before close: {error}"))
+        },
+        || {
+            rex.close_agent_block(&window, run_id, block_id)
+                .map_err(|error| format!("close exact native Worker block: {error}"))
+        },
+    ) {
+        Ok(NativeBlockCloseOutcome::Closed) => {}
+        Ok(NativeBlockCloseOutcome::BlockAbsent) => {
+            return Ok(
+                json!({"status":"inconclusive","reason":"exact Worker block was absent before close","run_id":run_id,"reservation_epoch":epoch,"fault_injected":false}),
+            );
+        }
+        Ok(NativeBlockCloseOutcome::DeadlineExpired) => {
+            return Ok(
+                json!({"status":"inconclusive","reason":"ready budget expired after exact Worker block validation","run_id":run_id,"reservation_epoch":epoch,"fault_injected":false}),
+            );
+        }
+        Err(error) => {
+            return Ok(
+                json!({"status":"inconclusive","reason":error,"run_id":run_id,"reservation_epoch":epoch,"fault_injected":null}),
+            );
+        }
+    }
+    let post_fault_context = NativePostFaultContext {
+        run_id,
+        epoch,
+        block_id,
+        slot_pool: &slot_pool,
+        slot_index,
+        pre_close_process_identities: &pre_close_process_identities,
+    };
+    let event_deadline = (Instant::now() + NATIVE_WORKER_READY_LIMIT).min(terminal_deadline);
+    loop {
+        let presence = rex.agent_block_is_present(&window, run_id, block_id);
+        if let Some(report) =
+            native_post_close_presence_error_report(&database, &post_fault_context, &presence)
+        {
+            return Ok(report);
+        }
+        let block_absent = presence.map(|present| !present).ok();
+        let facts = match native_lifecycle_facts(&database, run_id, epoch, block_id) {
+            Ok(facts) => facts,
+            Err(error) => {
+                let (_, mut report) = native_post_fault_report(
+                    &database,
+                    &post_fault_context,
+                    block_absent,
+                    &[error],
+                );
+                report["status"] = json!("incomplete");
+                return Ok(report);
+            }
+        };
+        if block_absent == Some(true) && facts.event_received {
+            break;
+        }
+        if Instant::now() >= event_deadline {
+            let (_, mut report) = native_post_fault_report(
+                &database,
+                &post_fault_context,
+                block_absent,
+                &["matching lifecycle event or public block absence was not proven within 60 seconds".into()],
+            );
+            report["status"] = json!("incomplete");
+            return Ok(report);
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    let block_absent = true;
+    loop {
+        let (terminal_proof_complete, mut report) =
+            native_post_fault_report(&database, &post_fault_context, Some(block_absent), &[]);
+        if report["observation_errors"]
+            .as_array()
+            .is_some_and(|errors| !errors.is_empty())
+        {
+            report["status"] = json!("incomplete");
+            return Ok(report);
+        }
+        if block_absent && report["local_family_absent"] == true && terminal_proof_complete {
+            report["status"] = json!("passed");
+            report["pre_close_sleep_identity"] = sleep_identity;
+            return Ok(report);
+        }
+        if Instant::now() >= terminal_deadline {
+            report["status"] = json!("incomplete");
+            return Ok(report);
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+struct NativeLifecycleFacts {
+    event_received: bool,
+    process_survived: Option<Value>,
+    exit_confirmed: bool,
+    exit_detail: Option<Value>,
+    exit_proof_digest: Option<String>,
+    slot_released: bool,
+    slot_release_digest: Option<String>,
+}
+
+struct NativePostFaultContext<'a> {
+    run_id: &'a str,
+    epoch: u64,
+    block_id: &'a str,
+    slot_pool: &'a str,
+    slot_index: u64,
+    pre_close_process_identities: &'a [Value],
+}
+
+enum NativeBlockCloseOutcome {
+    BlockAbsent,
+    DeadlineExpired,
+    Closed,
+}
+
+fn close_native_worker_block_before_deadline(
+    deadline: Instant,
+    is_present: impl FnOnce() -> Result<bool, String>,
+    close: impl FnOnce() -> Result<(), String>,
+) -> Result<NativeBlockCloseOutcome, String> {
+    if !is_present()? {
+        return Ok(NativeBlockCloseOutcome::BlockAbsent);
+    }
+    if Instant::now() >= deadline {
+        return Ok(NativeBlockCloseOutcome::DeadlineExpired);
+    }
+    close()?;
+    Ok(NativeBlockCloseOutcome::Closed)
+}
+
+fn native_post_fault_report(
+    database: &Connection,
+    context: &NativePostFaultContext<'_>,
+    public_block_absent: Option<bool>,
+    initial_errors: &[String],
+) -> (bool, Value) {
+    let NativePostFaultContext {
+        run_id,
+        epoch,
+        block_id,
+        slot_pool,
+        slot_index,
+        pre_close_process_identities,
+    } = context;
+    let mut observation_errors = initial_errors.to_vec();
+    let facts = match native_lifecycle_facts(database, run_id, *epoch, block_id) {
+        Ok(facts) => Some(facts),
+        Err(error) => {
+            observation_errors.push(error);
+            None
+        }
+    };
+    let run_state: Option<String> = match database
+        .query_row(
+            "SELECT state FROM agent_runs WHERE agent_run_id=?1",
+            [run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+    {
+        Ok(state) => state,
+        Err(error) => {
+            observation_errors.push(format!("read native Worker terminal run state: {error}"));
+            None
+        }
+    };
+    let launch_state: Option<String> = match database
+        .query_row(
+            "SELECT state FROM agent_launch_state WHERE agent_run_id=?1",
+            [run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+    {
+        Ok(state) => state,
+        Err(error) => {
+            observation_errors.push(format!("read native Worker terminal launch state: {error}"));
+            None
+        }
+    };
+    let current_slot_owner: Result<Option<Value>, String> = database
+        .query_row("SELECT owner_kind,owner_id,reservation_epoch,disposition FROM execution_slots WHERE pool=?1 AND slot_index=?2", params![slot_pool, *slot_index], |row| Ok(json!({"owner_kind":row.get::<_,String>(0)?,"owner_id":row.get::<_,String>(1)?,"reservation_epoch":row.get::<_,u64>(2)?,"disposition":row.get::<_,String>(3)?})))
+        .optional()
+        .map_err(|error| format!("read current native Worker slot owner: {error}"));
+    let current_slot_owner = match current_slot_owner {
+        Ok(owner) => owner,
+        Err(error) => {
+            observation_errors.push(error);
+            None
+        }
+    };
+    let local_family_absent = match inspect_process_table() {
+        Ok(current_processes) => Some(pre_close_process_identities.iter().all(|identity| {
+            let pid = identity["pid"].as_u64().unwrap_or_default() as u32;
+            let start = identity["start_identity"].as_str().unwrap_or_default();
+            !current_processes
+                .iter()
+                .any(|process| process.pid == pid && process.start_identity == start)
+        })),
+        Err(error) => {
+            observation_errors.push(format!(
+                "inspect native Worker family after block loss: {error:?}"
+            ));
+            None
+        }
+    };
+    let terminal_proof_complete = facts.as_ref().is_some_and(|facts| {
+        native_terminal_proof_complete(facts, run_state.as_deref(), launch_state.as_deref())
+    });
+    let facts = facts.as_ref();
+    let report = json!({
+        "run_id":run_id,
+        "reservation_epoch":epoch,
+        "block_id":block_id,
+        "lifecycle_facts":{
+            "event_received":facts.map(|facts| facts.event_received),
+            "process_survived":facts.and_then(|facts| facts.process_survived.clone()),
+            "exit_confirmed":facts.map(|facts| facts.exit_confirmed),
+            "process_tree_absent":facts.and_then(|facts| facts.exit_detail.as_ref()).and_then(|detail| detail["process_tree_absent"].as_bool()),
+            "process_tree_digest":facts.and_then(|facts| facts.exit_detail.as_ref()).and_then(|detail| detail["process_tree_digest"].as_str()),
+            "exit_proof_digest":facts.and_then(|facts| facts.exit_proof_digest.as_deref()),
+            "slot_release_digest":facts.and_then(|facts| facts.slot_release_digest.as_deref()),
+            "slot_released":facts.map(|facts| facts.slot_released)
+        },
+        "public_block_absent":public_block_absent,
+        "terminal_proof_complete":terminal_proof_complete,
+        "run_state":run_state,
+        "launch_state":launch_state,
+        "current_slot_owner":current_slot_owner,
+        "pre_close_process_identities":pre_close_process_identities,
+        "local_family_absent":local_family_absent,
+        "fault_injected":true,
+        "reason":observation_errors.first(),
+        "status":if observation_errors.is_empty() {"observing"} else {"incomplete"},
+        "observation_errors":observation_errors
+    });
+    (terminal_proof_complete, report)
+}
+
+fn native_post_close_presence_error_report<E: std::fmt::Display>(
+    database: &Connection,
+    context: &NativePostFaultContext<'_>,
+    presence: &Result<bool, E>,
+) -> Option<Value> {
+    let Err(error) = presence else {
+        return None;
+    };
+    let (_, mut report) = native_post_fault_report(
+        database,
+        context,
+        None,
+        &[format!("verify native Worker block after close: {error}")],
+    );
+    report["status"] = json!("incomplete");
+    Some(report)
+}
+
+fn native_terminal_proof_complete(
+    facts: &NativeLifecycleFacts,
+    run_state: Option<&str>,
+    launch_state: Option<&str>,
+) -> bool {
+    facts.event_received
+        && facts.exit_confirmed
+        && facts.exit_detail.as_ref().is_some_and(|detail| {
+            detail["process_tree_absent"] == true
+                && detail["process_tree_digest"].as_str().is_some()
+        })
+        && facts.exit_proof_digest.is_some()
+        && facts.exit_proof_digest == facts.slot_release_digest
+        && facts.slot_released
+        && run_state == Some("cancelled")
+        && launch_state == Some("cancelled")
+}
+
+fn native_lifecycle_facts(
+    database: &Connection,
+    run_id: &str,
+    epoch: u64,
+    block_id: &str,
+) -> Result<NativeLifecycleFacts, String> {
+    let mut statement = database
+        .prepare("SELECT fact_type,detail_json,proof_digest FROM agent_block_lifecycle_facts WHERE agent_run_id=?1 AND reservation_epoch=?2 AND rex_block_id=?3")
+        .map_err(|error| format!("prepare immutable native lifecycle fact query: {error}"))?;
+    let rows = statement
+        .query_map(params![run_id, epoch, block_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(|error| format!("query immutable native lifecycle facts: {error}"))?;
+    let mut facts = NativeLifecycleFacts {
+        event_received: false,
+        process_survived: None,
+        exit_confirmed: false,
+        exit_detail: None,
+        exit_proof_digest: None,
+        slot_released: false,
+        slot_release_digest: None,
+    };
+    for row in rows {
+        let (fact_type, detail, proof_digest) =
+            row.map_err(|error| format!("read immutable native lifecycle fact: {error}"))?;
+        let detail: Value = serde_json::from_str(&detail)
+            .map_err(|error| format!("parse native lifecycle detail: {error}"))?;
+        match fact_type.as_str() {
+            "event_received" => facts.event_received = true,
+            "process_survived" => facts.process_survived = Some(detail),
+            "exit_confirmed" => {
+                facts.exit_confirmed = true;
+                facts.exit_detail = Some(detail);
+                facts.exit_proof_digest = proof_digest;
+            }
+            "slot_released" => {
+                facts.slot_released = true;
+                facts.slot_release_digest = proof_digest;
+            }
+            _ => {}
+        }
+    }
+    Ok(facts)
+}
+
 fn parse_rex_window(stdout: &[u8]) -> Result<(String, String), String> {
     let value: Value = serde_json::from_slice(stdout)
         .map_err(|error| format!("Rex window creation returned invalid JSON: {error}"))?;
@@ -5083,7 +5670,50 @@ fn emit_report(fixture_root: &Path, report: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rex_projects::adapters::rex::owned_agent_block_label;
     use rex_projects::engine::orchestration::{RoleArtifactReference, RoleOutputKind};
+
+    #[cfg(target_os = "macos")]
+    fn production_process_start_identity(pid: u32) -> String {
+        use std::ffi::{c_int, c_void};
+        #[repr(C)]
+        struct ProcBsdInfo {
+            _prefix: [u32; 12],
+            _command: [i8; 16],
+            _name: [i8; 32],
+            _middle: [u32; 5],
+            _nice: i32,
+            start_seconds: u64,
+            start_microseconds: u64,
+        }
+        unsafe extern "C" {
+            fn proc_pidinfo(
+                pid: c_int,
+                flavor: c_int,
+                arg: u64,
+                buffer: *mut c_void,
+                size: c_int,
+            ) -> c_int;
+        }
+        let mut info = std::mem::MaybeUninit::<ProcBsdInfo>::zeroed();
+        let size = std::mem::size_of::<ProcBsdInfo>() as c_int;
+        let found = unsafe { proc_pidinfo(pid as c_int, 3, 0, info.as_mut_ptr().cast(), size) };
+        assert_eq!(found, size);
+        let info = unsafe { info.assume_init() };
+        format!("{}:{}", info.start_seconds, info.start_microseconds)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn production_process_start_identity(pid: u32) -> String {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        stat.rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(19)
+            .unwrap()
+            .to_owned()
+    }
 
     fn fixture_body_receipt(
         approved_body_digest: rex_projects::domain::ids::Digest,
@@ -5142,6 +5772,510 @@ mod tests {
             Some(NATIVE_WORKER_BLOCK_LOSS_STAGE.into())
         );
         assert!(parse_acceptance_stage(Some("unknown-stage".into())).is_err());
+    }
+
+    #[test]
+    fn native_worker_dashboard_lookup_uses_production_run_key_and_owned_label() {
+        let dashboard = json!({"agents":[{
+            "agent_run_id":"agent-8a74cf92b3d564907f3caab948be4b0e",
+            "role":"worker",
+            "state":"running"
+        }]});
+        let worker = dashboard_worker(&dashboard, "agent-8a74cf92b3d564907f3caab948be4b0e")
+            .expect("saved production dashboard shape identifies the live Worker");
+        assert_eq!(worker["state"], "running");
+        assert!(dashboard_worker(&dashboard, "missing-run").is_none());
+        assert_eq!(
+            owned_agent_block_label("agent-8a74cf92b3d564907f3caab948be4b0e").unwrap(),
+            "rex-projects-run-9e13a3f483531832d02dc440"
+        );
+    }
+
+    #[test]
+    fn native_lifecycle_proof_requires_all_exact_epoch_facts_after_slot_reuse() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let writable = Connection::open(&path).unwrap();
+        writable
+            .execute_batch(
+                "CREATE TABLE agent_runs(agent_run_id TEXT PRIMARY KEY);
+                 CREATE TABLE execution_slots(pool TEXT,slot_index INTEGER,owner_kind TEXT,owner_id TEXT,reservation_epoch INTEGER,disposition TEXT);
+                 CREATE TABLE agent_block_lifecycle_facts(
+                    fact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_run_id TEXT NOT NULL REFERENCES agent_runs(agent_run_id),
+                    reservation_epoch INTEGER NOT NULL CHECK(reservation_epoch > 0),
+                    rex_block_id TEXT NOT NULL,
+                    fact_type TEXT NOT NULL CHECK(fact_type IN ('event_received','process_survived','exit_confirmed','slot_released')),
+                    observed_at_unix INTEGER NOT NULL CHECK(observed_at_unix >= 0),
+                    proof_digest TEXT CHECK(proof_digest IS NULL OR length(proof_digest)=64),
+                    detail_json TEXT NOT NULL CHECK(length(detail_json) <= 65536),
+                    UNIQUE(agent_run_id,reservation_epoch,rex_block_id,fact_type,observed_at_unix)
+                 );
+                 INSERT INTO agent_runs VALUES('run-old');
+                 INSERT INTO execution_slots VALUES('worker',2,'agent_run','run-new',9,'live');",
+            )
+            .unwrap();
+        let digest = "d".repeat(64);
+        writable
+            .execute(
+                "INSERT INTO agent_block_lifecycle_facts(agent_run_id,reservation_epoch,rex_block_id,fact_type,observed_at_unix,proof_digest,detail_json) VALUES
+                 ('run-old',8,'block-old','event_received',1,NULL,'{}'),
+                 ('run-old',8,'block-old','process_survived',2,?1,'{\"surviving_process_count\":1}'),
+                 ('run-old',8,'block-old','exit_confirmed',3,?1,'{\"process_tree_absent\":true,\"process_tree_digest\":\"' || ?1 || '\"}'),
+                 ('run-old',8,'block-old','slot_released',4,?1,'{\"process_tree_digest\":\"' || ?1 || '\"}')",
+                [&digest],
+            )
+            .unwrap();
+        drop(writable);
+
+        let readonly =
+            Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let facts = native_lifecycle_facts(&readonly, "run-old", 8, "block-old").unwrap();
+        assert!(native_terminal_proof_complete(
+            &facts,
+            Some("cancelled"),
+            Some("cancelled")
+        ));
+        assert_eq!(
+            facts.process_survived.as_ref().unwrap()["surviving_process_count"],
+            1
+        );
+        assert!(!native_terminal_proof_complete(
+            &facts,
+            Some("running"),
+            Some("cancelled")
+        ));
+        assert!(
+            !native_lifecycle_facts(&readonly, "run-old", 9, "block-old")
+                .unwrap()
+                .event_received
+        );
+        assert!(
+            !native_lifecycle_facts(&readonly, "run-old", 8, "other-block")
+                .unwrap()
+                .event_received
+        );
+        let readiness_only = NativeLifecycleFacts {
+            event_received: false,
+            process_survived: None,
+            exit_confirmed: false,
+            exit_detail: None,
+            exit_proof_digest: None,
+            slot_released: false,
+            slot_release_digest: None,
+        };
+        assert!(!native_terminal_proof_complete(
+            &readiness_only,
+            Some("running"),
+            Some("running")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_block_loss_acceptance_runs_through_rex_transport_and_lifecycle_storage() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use rex_projects::domain::ids::{AgentRunId, Digest};
+        use rex_projects::run_step_spool::{
+            RunFamilyBinding, RunFamilyCoverage, RunFamilyRecord, RunStepSpool,
+        };
+
+        let temporary = tempfile::tempdir().unwrap();
+        if std::env::var_os("REX_PROJECTS_NATIVE_BLOCK_LOSS_TEST_CHILD").is_none() {
+            let isolated_state = temporary.path().join("xdg-state");
+            fs::create_dir(&isolated_state).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "acceptance::tests::native_block_loss_acceptance_runs_through_rex_transport_and_lifecycle_storage",
+                ])
+                .env("REX_PROJECTS_NATIVE_BLOCK_LOSS_TEST_CHILD", "1")
+                .env("REX_PROJECTS_NATIVE_BLOCK_LOSS_TEST_ROOT", temporary.path())
+                .env("XDG_STATE_HOME", isolated_state)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let fixture =
+            PathBuf::from(std::env::var_os("REX_PROJECTS_NATIVE_BLOCK_LOSS_TEST_ROOT").unwrap());
+        fs::create_dir_all(&fixture).unwrap();
+        let state_root = fixture.join("state");
+        let control_dir = fixture.join("control");
+        fs::create_dir(&state_root).unwrap();
+        fs::create_dir(&control_dir).unwrap();
+        let product_cli = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("rex-projects");
+        assert!(
+            product_cli.is_file(),
+            "build the real rex-projects CLI first"
+        );
+        let xtask_executable = std::env::current_exe().unwrap();
+        let run_id = "agent-8a74cf92b3d564907f3caab948be4b0e";
+        let block_id = "block-test";
+        let session_id = "session-test";
+        let window_id = "window-test";
+        let instance_id = "instance-test";
+        let endpoint = "unix:///fixture/rex.sock";
+        let config_request = Request {
+            cli: &product_cli,
+            rex: Path::new("/usr/bin/true"),
+            rex_server: endpoint,
+            rex_session: session_id,
+            expected_instance: instance_id,
+            fixture_root: &fixture,
+        };
+        prepare_profiles(
+            &config_request,
+            &xtask_executable,
+            &product_cli,
+            ProfilePreparation::default(),
+        )
+        .unwrap();
+        let config_path = fixture.join("config.toml");
+        fs::write(
+            &config_path,
+            config_text(&config_request, &xtask_executable, false),
+        )
+        .unwrap();
+        let mut store = rex_projects::store::ConfigStore::open(&state_root).unwrap();
+        let generation = store
+            .start_owner(&rex_projects::store::OwnerMetadata {
+                owner_nonce: "native-block-loss-test-owner".into(),
+                state_root: state_root.display().to_string(),
+                config_source: config_path.display().to_string(),
+                process_start_identity: production_process_start_identity(std::process::id()),
+                executable_path: xtask_executable.display().to_string(),
+                executable_digest: "a".repeat(64),
+                rex_endpoint: Some(endpoint.into()),
+                rex_server_identity: Some(instance_id.into()),
+                rex_session_id: Some(session_id.into()),
+                rex_block_id: Some(block_id.into()),
+            })
+            .unwrap();
+        drop(store);
+        let database_path = state_root.join("state.sqlite3");
+        let writable = Connection::open(&database_path).unwrap();
+        writable.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        writable.execute("INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,finite_turn,launch_operation_id,rex_session_id,rex_window_id,rex_block_id,state,controller_generation,started_at_unix) VALUES (?1,'operations_project','fixture',1,?2,'fixture-worker','worker',1,'native-block-loss-test-operation',?3,?4,?5,'running',?6,1)", params![run_id,"b".repeat(64),session_id,window_id,block_id,generation]).unwrap();
+        writable.execute("INSERT INTO execution_slots(pool,slot_index,owner_kind,owner_id,reservation_epoch,controller_generation,disposition) VALUES ('agent',1,'agent_run',?1,4,?2,'live')", params![run_id,generation]).unwrap();
+        writable.execute("INSERT INTO agent_run_recovery_observations(agent_run_id,controller_generation,reservation_epoch,observation_order,observed_at_unix) VALUES (?1,?2,4,1,1)", params![run_id,generation]).unwrap();
+        writable.execute("INSERT INTO agent_launch_state(agent_run_id,state,last_observed_at_unix,updated_at_unix) VALUES (?1,'running',1,1)", [run_id]).unwrap();
+        drop(writable);
+
+        let mut sleep = std::process::Command::new("/bin/sleep")
+            .arg("300")
+            .spawn()
+            .unwrap();
+        let sleep_identity = (0..20)
+            .find_map(|_| {
+                let identity = inspect_process_table()
+                    .unwrap()
+                    .into_iter()
+                    .find(|process| process.pid == sleep.id())?;
+                (identity.quality == ProcessIdentityQuality::KernelBirthToken).then_some(identity)
+            })
+            .expect("test sleep process has a kernel birth token");
+        let current_identity = inspect_process_table()
+            .unwrap()
+            .into_iter()
+            .find(|process| process.pid == std::process::id())
+            .expect("test process has an OS identity");
+        let label = owned_agent_block_label(run_id).unwrap();
+        let closed_marker = fixture.join("closed");
+        let rex_view = fixture.join("rex-view.json");
+        let rex_absent_view = fixture.join("rex-absent-view.json");
+        let start_marker = fixture.join("started");
+        fs::write(
+            &rex_view,
+            serde_json::to_vec(&json!({"session_id":session_id,"windows":[{"window_id":window_id,"layers":[{"blocks":[{"block_id":block_id,"label":label,"flavor":"shell"}]}]}]})).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &rex_absent_view,
+            serde_json::to_vec(&json!({"session_id":session_id,"windows":[{"window_id":window_id,"layers":[{"blocks":[]}]}]})).unwrap(),
+        )
+        .unwrap();
+        let rex_script = fixture.join("rex");
+        fs::write(
+            &rex_script,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *\"whoami --json\"*) printf '%s\\n' '{{\"endpoint\":\"{endpoint}\",\"instance_id\":\"{instance_id}\",\"host_id\":\"host-test\",\"rex_version\":\"test\"}}' ;;\n  *\"api list --json\"*) printf '%s\\n' '{{\"methods\":{{\"session.view\":{{}},\"session.new_window\":{{}},\"session.new_split\":{{}},\"session.focus_block\":{{}},\"session.zoom_block\":{{}},\"block.close\":{{}}}}}}' ;;\n  *\"api call session.view\"*) : > {started:?}; if [ -f {closed:?} ]; then cat {absent:?}; else cat {view:?}; fi ;;\n  *\"api call block.close\"*) : > {closed:?}; printf '{{}}\\n' ;;\n  *) exit 3 ;;\nesac\n",
+                started = start_marker.display().to_string(),
+                closed = closed_marker.display().to_string(),
+                absent = rex_absent_view.display().to_string(),
+                view = rex_view.display().to_string(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&rex_script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            std::process::Command::new(&rex_script)
+                .args(["whoami", "--json"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+
+        let worker = json!({
+            "run_id":run_id,
+            "server_instance_id":instance_id,
+            "session_id":session_id,
+            "window_id":window_id,
+            "block_id":block_id,
+            "control_dir":control_dir,
+            "reservation_epoch":4,
+            "wrapper_process_identity":{"pid":current_identity.pid,"start_identity":current_identity.start_identity},
+            "provider_start_observation":{"provider_pid":sleep_identity.pid,"provider_start_identity":sleep_identity.start_identity},
+            "live_process_identities":[sleep_identity],
+        });
+        let binding = RunFamilyBinding {
+            schema_version: 1,
+            agent_run_id: AgentRunId::parse(run_id).unwrap(),
+            reservation_epoch: 4,
+            authority_digest: Digest::parse("b".repeat(64)).unwrap(),
+            descriptor_digest: Digest::parse("c".repeat(64)).unwrap(),
+            wrapper_pid: current_identity.pid,
+            wrapper_start_identity: current_identity.start_identity.clone(),
+            rex_launch_anchor: None,
+        };
+        let process_tree = vec![sleep_identity.clone()];
+        let family = RunFamilyRecord {
+            schema_version: 2,
+            binding: binding.clone(),
+            observed_at_unix: 1,
+            coverage: RunFamilyCoverage::Observing,
+            wrapper_process: current_identity,
+            provider_root: sleep_identity,
+            provider_executable_path: PathBuf::from("/bin/sleep"),
+            provider_executable_digest: Digest::parse("d".repeat(64)).unwrap(),
+            process_tree_digest: Digest::parse(format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&process_tree).unwrap())
+            ))
+            .unwrap(),
+            process_tree,
+        };
+        let spool = RunStepSpool::open(&control_dir).unwrap();
+        spool.publish_run_family_binding_once(&binding).unwrap();
+        spool.write_run_family_record(&family).unwrap();
+        assert_eq!(
+            spool.read_run_family_record().unwrap(),
+            Some(family.clone())
+        );
+
+        let mut invalid_digest_family = family.clone();
+        invalid_digest_family.process_tree_digest = Digest::parse("e".repeat(64)).unwrap();
+        let invalid_records = [
+            (
+                "incomplete",
+                br#"{"schema_version":2,"coverage":"observing","process_tree":[]}"#.to_vec(),
+            ),
+            (
+                "incorrect-digest",
+                serde_json::to_vec(&invalid_digest_family).unwrap(),
+            ),
+        ];
+        let request = Request {
+            cli: &product_cli,
+            rex: &rex_script,
+            rex_server: endpoint,
+            rex_session: session_id,
+            expected_instance: instance_id,
+            fixture_root: &fixture,
+        };
+        for (case, invalid_record) in invalid_records {
+            let invalid_control_dir = fixture.join(format!("invalid-control-{case}"));
+            fs::create_dir(&invalid_control_dir).unwrap();
+            let invalid_spool = RunStepSpool::open(&invalid_control_dir).unwrap();
+            invalid_spool
+                .publish_run_family_binding_once(&binding)
+                .unwrap();
+            fs::write(
+                invalid_spool.directory().join("run-family.json"),
+                invalid_record,
+            )
+            .unwrap();
+            let invalid_worker = json!({
+                "run_id":run_id,
+                "server_instance_id":instance_id,
+                "session_id":session_id,
+                "window_id":window_id,
+                "block_id":block_id,
+                "control_dir":invalid_control_dir,
+                "reservation_epoch":4,
+                "wrapper_process_identity":{"pid":binding.wrapper_pid,"start_identity":binding.wrapper_start_identity},
+                "provider_start_observation":{"provider_pid":family.provider_root.pid,"provider_start_identity":family.provider_root.start_identity},
+                "live_process_identities":[family.provider_root],
+            });
+            assert!(
+                observe_native_worker_block_loss(&request, &state_root, &invalid_worker)
+                    .unwrap_err()
+                    .contains("read validated native Worker run-family record")
+            );
+            assert!(
+                !closed_marker.exists(),
+                "invalid cumulative process evidence must stop before Rex block.close"
+            );
+        }
+        let updater_db = database_path.clone();
+        let updater_closed = closed_marker.clone();
+        let updater_started = start_marker.clone();
+        let updater = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut order = 1;
+            while Instant::now() < deadline && !updater_closed.exists() {
+                if updater_started.exists()
+                    && let Ok(database) = Connection::open(&updater_db)
+                {
+                    order += 1;
+                    let _ = database.execute("UPDATE agent_run_recovery_observations SET observation_order=?1 WHERE agent_run_id=?2", params![order, run_id]);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if updater_closed.exists() {
+                let database = Connection::open(&updater_db).unwrap();
+                database.execute_batch(
+                    "INSERT INTO agent_block_lifecycle_facts(agent_run_id,reservation_epoch,rex_block_id,fact_type,observed_at_unix,proof_digest,detail_json) VALUES
+                     ('agent-8a74cf92b3d564907f3caab948be4b0e',4,'block-test','event_received',1,NULL,'{}'),
+                     ('agent-8a74cf92b3d564907f3caab948be4b0e',4,'block-test','process_survived',2,NULL,'{\"surviving_process_count\":1}');",
+                ).unwrap();
+                if sleep.try_wait().ok().flatten().is_none() {
+                    let _ = sleep.kill();
+                }
+                let _ = sleep.wait();
+                let digest = "e".repeat(64);
+                database.execute(
+                    "INSERT INTO agent_block_lifecycle_facts(agent_run_id,reservation_epoch,rex_block_id,fact_type,observed_at_unix,proof_digest,detail_json) VALUES ('agent-8a74cf92b3d564907f3caab948be4b0e',4,'block-test','exit_confirmed',3,?1,?2),('agent-8a74cf92b3d564907f3caab948be4b0e',4,'block-test','slot_released',4,?1,?3)",
+                    params![digest, format!("{{\"process_tree_absent\":true,\"process_tree_digest\":\"{digest}\"}}"), format!("{{\"process_tree_digest\":\"{digest}\"}}")],
+                ).unwrap();
+                database.execute_batch("UPDATE agent_runs SET state='cancelled' WHERE agent_run_id='agent-8a74cf92b3d564907f3caab948be4b0e'; UPDATE agent_launch_state SET state='cancelled' WHERE agent_run_id='agent-8a74cf92b3d564907f3caab948be4b0e'; UPDATE execution_slots SET disposition='released' WHERE owner_id='agent-8a74cf92b3d564907f3caab948be4b0e';").unwrap();
+            }
+            sleep
+        });
+
+        let result = observe_native_worker_block_loss(&request, &state_root, &worker);
+        if !closed_marker.exists() {
+            fs::write(fixture.join("stop-updater"), "").unwrap();
+        }
+        let mut sleep = updater.join().unwrap();
+        if sleep.try_wait().ok().flatten().is_none() {
+            let _ = sleep.kill();
+        }
+        let _ = sleep.wait();
+        let proof = result.unwrap();
+        assert_eq!(proof["status"], "passed", "{proof}");
+        assert_eq!(proof["lifecycle_facts"]["event_received"], true);
+        assert!(proof["lifecycle_facts"]["process_survived"].is_object());
+        assert_eq!(proof["lifecycle_facts"]["exit_confirmed"], true);
+        assert_eq!(proof["lifecycle_facts"]["slot_released"], true);
+        assert_eq!(proof["current_slot_owner"]["owner_id"], run_id);
+
+        let report_db = Connection::open(&database_path).unwrap();
+        let report_context = NativePostFaultContext {
+            run_id,
+            epoch: 5,
+            block_id,
+            slot_pool: "agent",
+            slot_index: 1,
+            pre_close_process_identities: &[],
+        };
+        let (_, timeout_report) =
+            native_post_fault_report(&report_db, &report_context, Some(true), &[]);
+        assert_eq!(timeout_report["lifecycle_facts"]["event_received"], false);
+        assert_eq!(
+            timeout_report["lifecycle_facts"]["process_survived"],
+            Value::Null
+        );
+        assert_eq!(timeout_report["lifecycle_facts"]["exit_confirmed"], false);
+        assert_eq!(timeout_report["lifecycle_facts"]["slot_released"], false);
+        assert_eq!(timeout_report["public_block_absent"], true);
+        assert_eq!(timeout_report["terminal_proof_complete"], false);
+        assert_eq!(timeout_report["current_slot_owner"]["owner_id"], run_id);
+        assert_eq!(timeout_report["run_state"], "cancelled");
+
+        let post_close_error_report = native_post_close_presence_error_report(
+            &report_db,
+            &report_context,
+            &Err::<bool, String>("Rex query failed".into()),
+        )
+        .unwrap();
+        assert!(
+            closed_marker.exists(),
+            "the exact close succeeded before the post-close observation failure"
+        );
+        assert_eq!(post_close_error_report["status"], "incomplete");
+        assert_eq!(post_close_error_report["public_block_absent"], Value::Null);
+        assert_eq!(
+            post_close_error_report["reason"],
+            "verify native Worker block after close: Rex query failed"
+        );
+        for fact in [
+            "event_received",
+            "process_survived",
+            "exit_confirmed",
+            "slot_released",
+        ] {
+            assert!(
+                post_close_error_report["lifecycle_facts"]
+                    .get(fact)
+                    .is_some(),
+                "missing {fact}: {post_close_error_report}"
+            );
+        }
+        assert_eq!(post_close_error_report["terminal_proof_complete"], false);
+    }
+
+    #[test]
+    fn native_block_close_skips_injection_when_presence_check_exhausts_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(10);
+        let mut close_called = false;
+        let outcome = close_native_worker_block_before_deadline(
+            deadline,
+            || {
+                std::thread::sleep(Duration::from_millis(20));
+                Ok(true)
+            },
+            || {
+                close_called = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(outcome, NativeBlockCloseOutcome::DeadlineExpired));
+        assert!(!close_called);
+    }
+
+    #[test]
+    fn native_post_fault_report_keeps_required_facts_when_state_database_is_unavailable() {
+        let database = Connection::open_in_memory().unwrap();
+        let context = NativePostFaultContext {
+            run_id: "run-test",
+            epoch: 1,
+            block_id: "block-test",
+            slot_pool: "agent",
+            slot_index: 0,
+            pre_close_process_identities: &[],
+        };
+        let (_, report) = native_post_fault_report(&database, &context, None, &[]);
+        assert_eq!(report["status"], "incomplete");
+        assert_eq!(report["terminal_proof_complete"], false);
+        for fact in [
+            "event_received",
+            "process_survived",
+            "exit_confirmed",
+            "slot_released",
+        ] {
+            assert_eq!(report["lifecycle_facts"][fact], Value::Null, "{report}");
+        }
+        assert!(!report["observation_errors"].as_array().unwrap().is_empty());
     }
 
     #[test]
