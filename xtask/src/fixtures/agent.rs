@@ -1499,6 +1499,113 @@ fn prompt_ticket(prompt: &str) -> Result<(String, u64), String> {
     Ok(ticket)
 }
 
+fn supervisor_learning_batch_message(
+    inbox: &FixtureInbox,
+    run_id: &str,
+    project_id: &str,
+) -> Result<Option<AgentMessage>, String> {
+    let batches = inbox
+        .inputs
+        .iter()
+        .filter(|item| item.get("source_type").and_then(Value::as_str) == Some("learning_batch"))
+        .collect::<Vec<_>>();
+    let [wake] = batches.as_slice() else {
+        return if batches.is_empty() {
+            Ok(None)
+        } else {
+            Err("Supervisor fixture inbox contains multiple learning batch wakes".into())
+        };
+    };
+
+    let payload = wake
+        .get("payload_json")
+        .ok_or("Supervisor learning batch wake omitted its payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("supervisor_learning_batch")
+        || payload.get("project_id").and_then(Value::as_str) != Some(project_id)
+    {
+        return Err("Supervisor learning batch payload differs from its Project or kind".into());
+    }
+    let batch_id = payload
+        .get("batch_id")
+        .and_then(Value::as_str)
+        .ok_or("Supervisor learning batch payload omitted its batch ID")?;
+    let batch_digest = payload
+        .get("batch_digest")
+        .and_then(Value::as_str)
+        .ok_or("Supervisor learning batch payload omitted its batch digest")?;
+    rex_projects::domain::ids::Digest::parse(batch_digest.to_owned())?;
+    if wake.get("source_id").and_then(Value::as_str) != Some(batch_id)
+        || batch_id != format!("learning-{batch_digest}")
+    {
+        return Err("Supervisor learning batch source identity does not match its payload".into());
+    }
+    let config_revision = payload
+        .get("config_revision")
+        .and_then(Value::as_u64)
+        .ok_or("Supervisor learning batch payload omitted its configuration revision")?;
+    let config_digest = payload
+        .get("config_digest")
+        .and_then(Value::as_str)
+        .ok_or("Supervisor learning batch payload omitted its configuration digest")?;
+    rex_projects::domain::ids::Digest::parse(config_digest.to_owned())?;
+    let wake_revision = wake
+        .get("source_revision")
+        .and_then(Value::as_u64)
+        .filter(|revision| *revision > 0)
+        .ok_or("Supervisor learning batch wake omitted its positive source revision")?;
+    let findings = payload
+        .get("findings")
+        .and_then(Value::as_array)
+        .ok_or("Supervisor learning batch payload omitted its Finding list")?;
+    let checkpoint: std::collections::BTreeMap<String, String> = serde_json::from_value(
+        payload
+            .get("prior_checkpoint")
+            .cloned()
+            .ok_or("Supervisor learning batch payload omitted its prior checkpoint")?,
+    )
+    .map_err(|error| format!("parse prior Supervisor learning checkpoint: {error}"))?;
+
+    let mut digest_input = payload.clone();
+    let object = digest_input
+        .as_object_mut()
+        .ok_or("Supervisor learning batch payload is not an object")?;
+    object.remove("batch_id");
+    object.remove("batch_digest");
+    let calculated_digest = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&digest_input).map_err(|error| error.to_string())?)
+    );
+    if calculated_digest != batch_digest {
+        return Err("Supervisor learning batch payload differs from its batch digest".into());
+    }
+
+    let decision = json!({
+        "batch_id":batch_id,
+        "batch_digest":batch_digest,
+        "config_revision":config_revision,
+        "observations":[format!("The deterministic fixture reviewed the bound learning batch at wake revision {wake_revision} containing {} Finding(s); it proposed no reusable profile or Topic change.", findings.len())],
+        "topic_changes":[],
+        "checkpoint":checkpoint,
+        "improvements":[],
+        "candidate_change":null
+    });
+    validate_payload(RoleOutputKind::LearningDecision, &decision)?;
+    let bytes = serde_json::to_vec(&decision)
+        .map_err(|error| format!("serialize Supervisor learning decision: {error}"))?;
+    Ok(Some(AgentMessage {
+        schema_version: 1,
+        message_id: format!(
+            "fixture-supervisor-learning-{:x}",
+            Sha256::digest(run_id.as_bytes())
+        ),
+        kind: RoleOutputKind::LearningDecision,
+        assertion: AgentAssertion::Succeeded,
+        structured_result: decision,
+        result_digest: format!("{:x}", Sha256::digest(bytes)),
+        artifact_refs: Vec::new(),
+    }))
+}
+
 fn next_message(
     context: &AgentContext,
     invocation: &FixtureInvocation,
@@ -1614,6 +1721,14 @@ fn next_message(
                 result_digest: format!("{:x}", Sha256::digest(bytes)),
                 artifact_refs: Vec::new(),
             });
+        }
+        if let Some(decision) = supervisor_learning_batch_message(
+            inbox,
+            &invocation.run_id,
+            &invocation.scope.project_id,
+        )? {
+            ledger_tx.commit().map_err(|error| error.to_string())?;
+            return Ok(decision);
         }
         if !inbox.is_periodic_review_only() {
             return Err("Supervisor fixture has no eligible normalized ticket observation in its public inbox".into());
