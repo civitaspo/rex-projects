@@ -11,7 +11,12 @@ a directory containing a root `SKILL.md`; relative paths must remain inside
 the profile directory. Absolute paths may refer to separately managed skill
 directories only when their files are present in the exact candidate package
 mapping. Trial workspaces receive these files under `.agents/skills/` for
-Codex or `.claude/skills/` for Claude Code. Skill contents are separate from
+Codex or `.claude/skills/` for Claude Code, retaining the captured canonical
+directory name. Directory names must follow the portable
+[Agent Skills format](https://agentskills.io/specification#name-field):
+1 to 64 lowercase letters, digits, and single interior hyphens. Selected names
+must be unique; Claude's reserved `synced` and `anthropic-skills` names are
+rejected. Skill contents are separate from
 the profile instruction text rendered into the role contract.
 
 Trial skills must fit the existing inline fixture limits after composition

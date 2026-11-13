@@ -5165,11 +5165,13 @@ mod tests {
         std::fs::create_dir_all(config_root.join("profiles")).unwrap();
         let skill_root_a = config_root.join("external-skills/ops-a");
         let skill_root_b = config_root.join("external-skills/ops-b");
+        let skill_root_alias = config_root.join("external-skills/skill-alias");
         std::fs::create_dir_all(skill_root_a.join("references")).unwrap();
         std::fs::create_dir_all(&skill_root_b).unwrap();
+        std::os::unix::fs::symlink(&skill_root_a, &skill_root_alias).unwrap();
         std::fs::write(
             skill_root_a.join("SKILL.md"),
-            "---\nname: frozen-a\ndescription: fixture skill\n---\nFROZEN_SKILL_BODY_MARKER\n",
+            "---\nname: ops-a\ndescription: fixture skill\n---\nFROZEN_SKILL_BODY_MARKER\n",
         )
         .unwrap();
         std::fs::write(
@@ -5179,7 +5181,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             skill_root_b.join("SKILL.md"),
-            "---\nname: frozen-b\ndescription: second fixture skill\n---\nSecond body.\n",
+            "---\nname: ops-b\ndescription: second fixture skill\n---\nSecond body.\n",
         )
         .unwrap();
         std::fs::copy(
@@ -5219,7 +5221,7 @@ mod tests {
                 &format!(
                     "instruction_files = [\"aliases/instruction.md\", {:?}]\nskill_paths = [{:?}, {:?}]\n\n[options]",
                     canonical_alias.display().to_string(),
-                    skill_root_a.display().to_string(),
+                    skill_root_alias.display().to_string(),
                     skill_root_b.display().to_string(),
                 ),
             ),
@@ -5409,20 +5411,24 @@ mod tests {
             captured_nested_text
         );
         assert_eq!(frozen_candidate.skill_trees.len(), 2);
-        let mut escaping_relative_root = candidate.clone();
-        escaping_relative_root.skill_paths = vec!["../../external-skills/ops-a".into()];
-        let escaping_error = crate::profile_trial_request::profile_snapshot(
+        assert_eq!(
+            frozen_candidate.skill_trees[&skill_a_key].directory_name,
+            "ops-a"
+        );
+        let mut uncaptured_relative_root = candidate.clone();
+        uncaptured_relative_root.skill_paths = vec!["../../external-skills/ops-a".into()];
+        let uncaptured_error = crate::profile_trial_request::profile_snapshot(
             &applied,
             &candidate_profile_id,
             &base_profile_id,
-            &escaping_relative_root,
+            &uncaptured_relative_root,
             Some(&files),
             Some(&external_sources),
         )
         .unwrap_err();
         assert!(
-            escaping_error.contains("escapes its captured profile directory"),
-            "{escaping_error}"
+            uncaptured_error.contains("absent from the captured source manifest"),
+            "{uncaptured_error}"
         );
         let mut unsupported_file_root = candidate.clone();
         unsupported_file_root.skill_paths =
@@ -5903,20 +5909,15 @@ mod tests {
             crate::domain::types::AgentAdapter::ClaudeCode => ".claude/skills",
         };
         assert_eq!(
-            std::fs::read_to_string(
-                workspace
-                    .join(provider_root)
-                    .join(&skill_a_key)
-                    .join("SKILL.md")
-            )
-            .unwrap(),
+            std::fs::read_to_string(workspace.join(provider_root).join("ops-a").join("SKILL.md"))
+                .unwrap(),
             captured_skill_text
         );
         assert_eq!(
             std::fs::read_to_string(
                 workspace
                     .join(provider_root)
-                    .join(&skill_a_key)
+                    .join("ops-a")
                     .join("references/checks.md")
             )
             .unwrap(),

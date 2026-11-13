@@ -218,6 +218,7 @@ pub struct TrialProfileSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FrozenTrialSkillTree {
+    pub directory_name: String,
     pub files: BTreeMap<String, String>,
 }
 
@@ -261,9 +262,9 @@ pub fn trial_workspace_seed(
     {
         return Err("trial fixture collides with the provider skill directory".into());
     }
-    for (root_key, tree) in &profile.skill_trees {
+    for tree in profile.skill_trees.values() {
         for (relative, contents) in &tree.files {
-            let target = format!("{provider_root}/{root_key}/{relative}");
+            let target = format!("{provider_root}/{}/{relative}", tree.directory_name);
             if combined
                 .files
                 .keys()
@@ -318,7 +319,28 @@ pub(crate) fn validate_trial_profile_snapshot(
     }
     let mut total = 0usize;
     let mut count = 0usize;
+    let mut directory_names = std::collections::BTreeSet::new();
     for tree in snapshot.skill_trees.values() {
+        if tree.directory_name.is_empty()
+            || tree.directory_name.len() > 64
+            || !tree
+                .directory_name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            || tree.directory_name.starts_with('-')
+            || tree.directory_name.ends_with('-')
+            || tree.directory_name.contains("--")
+        {
+            return Err("captured skill directory name must use 1 to 64 lowercase letters, digits, and single interior hyphens".into());
+        }
+        if !directory_names.insert(tree.directory_name.to_lowercase()) {
+            return Err("selected skill directory names collide".into());
+        }
+        if profile.adapter == crate::domain::types::AgentAdapter::ClaudeCode
+            && matches!(tree.directory_name.as_str(), "synced" | "anthropic-skills")
+        {
+            return Err("captured skill directory name is reserved by Claude Code".into());
+        }
         if !tree.files.contains_key("SKILL.md") {
             return Err("each selected trial skill directory must contain SKILL.md".into());
         }
@@ -1530,8 +1552,15 @@ mod tests {
                 (
                     super::trial_skill_root_key(path).unwrap(),
                     super::FrozenTrialSkillTree {
+                        directory_name: path.rsplit('/').next().unwrap().into(),
                         files: BTreeMap::from([
-                            ("SKILL.md".into(), format!("content for {path}")),
+                            (
+                                "SKILL.md".into(),
+                                format!(
+                                    "---\nname: {}\ndescription: fixture skill\n---\ncontent for {path}",
+                                    path.rsplit('/').next().unwrap()
+                                ),
+                            ),
                             ("references/details.md".into(), "nested reference".into()),
                         ]),
                     },
@@ -1570,11 +1599,15 @@ mod tests {
             let profile = snapshot_with_skills(adapter);
             let composed = super::trial_workspace_seed(&profile, &fixture).unwrap();
             assert_eq!(composed.files.len(), 4);
-            for (root_key, tree) in &profile.skill_trees {
+            for (configured, directory_name) in [("skills/alpha", "alpha"), ("skills/beta", "beta")]
+            {
+                let tree = &profile.skill_trees[&super::trial_skill_root_key(configured).unwrap()];
                 for (relative, contents) in &tree.files {
                     assert_eq!(
-                        composed.files[&format!("{provider_root}/{root_key}/{relative}")],
-                        *contents
+                        composed
+                            .files
+                            .get(&format!("{provider_root}/{directory_name}/{relative}")),
+                        Some(contents)
                     );
                 }
             }
@@ -1589,6 +1622,43 @@ mod tests {
                 .unwrap_err()
                 .contains("collides")
         );
+        let mut duplicate_names = snapshot_with_skills("codex");
+        for tree in duplicate_names.skill_trees.values_mut() {
+            tree.directory_name = "same".into();
+        }
+        assert!(
+            super::trial_workspace_seed(&duplicate_names, &fixture)
+                .unwrap_err()
+                .contains("names collide")
+        );
+        for invalid in ["../escape", "Upper", "a--b", &"a".repeat(65)] {
+            let mut invalid_name = snapshot_with_skills("codex");
+            invalid_name
+                .skill_trees
+                .values_mut()
+                .next()
+                .unwrap()
+                .directory_name = invalid.into();
+            assert!(
+                super::trial_workspace_seed(&invalid_name, &fixture)
+                    .unwrap_err()
+                    .contains("directory name must use")
+            );
+        }
+        for reserved in ["synced", "anthropic-skills"] {
+            let mut reserved_name = snapshot_with_skills("claude_code");
+            reserved_name
+                .skill_trees
+                .values_mut()
+                .next()
+                .unwrap()
+                .directory_name = reserved.into();
+            assert!(
+                super::trial_workspace_seed(&reserved_name, &fixture)
+                    .unwrap_err()
+                    .contains("reserved by Claude Code")
+            );
+        }
         let mut changed_candidate = snapshot_with_skills("codex");
         let changed_tree = changed_candidate.skill_trees.values_mut().next().unwrap();
         changed_tree

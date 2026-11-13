@@ -282,24 +282,22 @@ fn freeze_skill_trees(
     let mut canonical_roots = BTreeSet::new();
     for configured in &profile.skill_paths {
         let configured_path = std::path::Path::new(configured);
-        let lexical_root = if configured_path.is_absolute() {
+        let logical_root = if configured_path.is_absolute() {
             configured_path.to_path_buf()
         } else {
             canonical_profile_root.join(configured_path)
         };
-        let lexical_root = normalize_absolute_lexical(&lexical_root)?;
+        let logical_root = logical_root.display().to_string();
         let root_source = applied.source_files.iter().find(|source| {
             matches!(source.kind, crate::config::SourceKind::Directory)
-                && (normalize_absolute_lexical(std::path::Path::new(&source.path)).ok().as_ref()
-                    == Some(&lexical_root)
-                    || normalize_absolute_lexical(
-                        std::path::Path::new(&source.canonical_path),
-                    )
-                    .ok()
-                    .as_ref()
-                        == Some(&lexical_root))
+                && source.path == logical_root
         }).ok_or_else(|| format!("selected skill root `{configured}` is absent from the captured source manifest or is not a directory"))?;
         let canonical_root = std::path::PathBuf::from(&root_source.canonical_path);
+        let directory_name = canonical_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("captured skill root has no UTF-8 directory name")?
+            .to_owned();
         if !configured_path.is_absolute() && !canonical_root.starts_with(canonical_profile_root) {
             return Err(format!(
                 "relative selected skill root `{configured}` escapes its captured profile directory"
@@ -308,7 +306,7 @@ fn freeze_skill_trees(
         if !canonical_roots.insert(canonical_root.clone()) {
             return Err("selected skill roots alias the same captured directory".into());
         }
-        let mut files = BTreeMap::new();
+        let mut files: BTreeMap<String, (std::path::PathBuf, String)> = BTreeMap::new();
         for source in &applied.source_files {
             if !matches!(source.kind, crate::config::SourceKind::File) {
                 continue;
@@ -372,10 +370,14 @@ fn freeze_skill_trees(
             };
             let contents = String::from_utf8(bytes)
                 .map_err(|_| format!("selected skill `{relative}` is not UTF-8"))?;
-            if files.insert(relative.clone(), contents).is_some() {
-                return Err(format!(
-                    "selected skill contains duplicate path `{relative}`"
-                ));
+            if let Some((existing_canonical, existing_contents)) = files.get(&relative) {
+                if existing_canonical != canonical || existing_contents != &contents {
+                    return Err(format!(
+                        "selected skill contains conflicting path `{relative}`"
+                    ));
+                }
+            } else {
+                files.insert(relative, (canonical.to_owned(), contents));
             }
         }
         if !files.contains_key("SKILL.md") {
@@ -385,34 +387,22 @@ fn freeze_skill_trees(
         }
         let root_key = crate::learning_trials::trial_skill_root_key(configured)?;
         if trees
-            .insert(root_key, FrozenTrialSkillTree { files })
+            .insert(
+                root_key,
+                FrozenTrialSkillTree {
+                    directory_name,
+                    files: files
+                        .into_iter()
+                        .map(|(relative, (_, contents))| (relative, contents))
+                        .collect(),
+                },
+            )
             .is_some()
         {
             return Err("selected skill roots have duplicate identities".into());
         }
     }
     Ok(trees)
-}
-
-fn normalize_absolute_lexical(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
-    if !path.is_absolute() {
-        return Err("captured source root is not absolute".into());
-    }
-    let mut normalized = std::path::PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            std::path::Component::RootDir => normalized.push(component.as_os_str()),
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err("selected skill root traverses above its filesystem root".into());
-                }
-            }
-            std::path::Component::Normal(part) => normalized.push(part),
-        }
-    }
-    Ok(normalized)
 }
 
 pub fn make_authorization(
@@ -455,6 +445,167 @@ pub fn make_authorization(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    fn snapshot_fixture() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture");
+        std::fs::copy(fixture.join("config.toml"), temp.path().join("config.toml")).unwrap();
+        for id in ["worker_codex", "judgment_claude"] {
+            let source = fixture.join("profiles").join(id);
+            let target = temp.path().join("profiles").join(id);
+            std::fs::create_dir_all(&target).unwrap();
+            for file in ["config.toml", "instructions.md"] {
+                std::fs::copy(source.join(file), target.join(file)).unwrap();
+            }
+        }
+        temp
+    }
+
+    #[cfg(unix)]
+    fn prepend_profile_fields(root: &std::path::Path, id: &str, fields: &str) {
+        let path = root.join("profiles").join(id).join("config.toml");
+        let original = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(path, format!("{fields}\n{original}")).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn captured_skill_root_uses_exact_logical_path_after_symlink_changes() {
+        let temp = snapshot_fixture();
+        let root = temp.path();
+        let profile_root = root.join("profiles/worker_codex").canonicalize().unwrap();
+        std::fs::create_dir_all(profile_root.join("nested/child")).unwrap();
+        for (directory, marker) in [("nested/ops", "NESTED"), ("ops", "TOP")] {
+            let directory = profile_root.join(directory);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("SKILL.md"), marker).unwrap();
+        }
+        let alias = profile_root.join("zlink");
+        std::os::unix::fs::symlink(profile_root.join("nested/child"), &alias).unwrap();
+        prepend_profile_fields(root, "worker_codex", "skill_paths = [\"zlink/../ops\"]");
+        prepend_profile_fields(
+            root,
+            "judgment_claude",
+            &format!(
+                "skill_paths = [{:?}]",
+                profile_root.join("ops").display().to_string()
+            ),
+        );
+        let applied = crate::config::load(&root.join("config.toml")).unwrap();
+        std::fs::remove_file(alias).unwrap();
+        let id = super::ProfileId::parse("worker_codex").unwrap();
+        let profile = &applied.profiles[&id];
+        let snapshot = super::profile_snapshot(&applied, &id, &id, profile, None, None).unwrap();
+        let key = crate::learning_trials::trial_skill_root_key("zlink/../ops").unwrap();
+        assert_eq!(snapshot.skill_trees[&key].files["SKILL.md"], "NESTED");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn captured_skill_root_rejects_relative_profile_escape() {
+        let temp = snapshot_fixture();
+        let root = temp.path();
+        let outside = root.join("external/ops");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("SKILL.md"), "outside skill").unwrap();
+        prepend_profile_fields(
+            root,
+            "worker_codex",
+            "skill_paths = [\"../../external/ops\"]",
+        );
+        let applied = crate::config::load(&root.join("config.toml")).unwrap();
+        let id = super::ProfileId::parse("worker_codex").unwrap();
+        let error = super::profile_snapshot(&applied, &id, &id, &applied.profiles[&id], None, None)
+            .unwrap_err();
+        assert!(
+            error.contains("escapes its captured profile directory"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn captured_skill_files_coalesce_verified_instruction_aliases() {
+        use sha2::{Digest as _, Sha256};
+
+        let temp = snapshot_fixture();
+        let root = temp.path();
+        let profile_root = root.join("profiles/worker_codex").canonicalize().unwrap();
+        std::fs::create_dir_all(profile_root.join("ops/references")).unwrap();
+        std::fs::write(profile_root.join("ops/SKILL.md"), "skill body").unwrap();
+        std::fs::write(
+            profile_root.join("ops/references/checks.md"),
+            "shared reference",
+        )
+        .unwrap();
+        let alias = profile_root.join("instruction-alias.md");
+        std::os::unix::fs::symlink(profile_root.join("ops/references/checks.md"), &alias).unwrap();
+        prepend_profile_fields(
+            root,
+            "worker_codex",
+            "skill_paths = [\"ops\"]\ninstruction_files = [\"instruction-alias.md\"]",
+        );
+        let applied = crate::config::load(&root.join("config.toml")).unwrap();
+        let id = super::ProfileId::parse("worker_codex").unwrap();
+        let profile = &applied.profiles[&id];
+        let snapshot = super::profile_snapshot(&applied, &id, &id, profile, None, None).unwrap();
+        let key = crate::learning_trials::trial_skill_root_key("ops").unwrap();
+        assert_eq!(snapshot.skill_trees[&key].files.len(), 2);
+        assert_eq!(
+            snapshot.skill_trees[&key].files["references/checks.md"],
+            "shared reference"
+        );
+        let package = applied
+            .source_files
+            .iter()
+            .filter_map(|source| {
+                if source.kind != crate::config::SourceKind::File {
+                    return None;
+                }
+                let relative = std::path::Path::new(&source.path)
+                    .strip_prefix(&profile_root)
+                    .ok()?;
+                Some((
+                    relative.to_str().unwrap().to_owned(),
+                    source.contents.as_bytes().to_vec(),
+                ))
+            })
+            .collect();
+        let candidate =
+            super::profile_snapshot(&applied, &id, &id, profile, Some(&package), None).unwrap();
+        assert_eq!(candidate.skill_trees, snapshot.skill_trees);
+
+        let mut invalid = applied.clone();
+        let source = invalid
+            .source_files
+            .iter_mut()
+            .find(|source| source.path == alias.display().to_string())
+            .unwrap();
+        source.contents = "unverified reference".into();
+        assert!(
+            super::profile_snapshot(&invalid, &id, &id, profile, None, None)
+                .unwrap_err()
+                .contains("does not match its source manifest")
+        );
+
+        let mut conflicting = applied.clone();
+        let source = conflicting
+            .source_files
+            .iter_mut()
+            .find(|source| source.path == alias.display().to_string())
+            .unwrap();
+        source.contents = "conflicting reference".into();
+        source.bytes = source.contents.len() as u64;
+        source.sha256 =
+            super::Digest::parse(format!("{:x}", Sha256::digest(source.contents.as_bytes())))
+                .unwrap();
+        assert!(
+            super::profile_snapshot(&conflicting, &id, &id, profile, None, None)
+                .unwrap_err()
+                .contains("conflicting path")
+        );
+    }
+
     #[test]
     fn documented_matrix_has_valid_frozen_inputs_and_standard_coverage() {
         let matrix = super::TrialRequestMatrix::parse(include_bytes!(
