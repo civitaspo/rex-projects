@@ -8734,12 +8734,33 @@ pub(crate) mod host_validation_fixture {
         host_validated_result_with_agent_run_id(role, message, None)
     }
 
+    pub(crate) fn host_validated_result_with_config(
+        role: Role,
+        message: RoleResultMessage,
+        config: crate::config::Config,
+    ) -> Result<TestValidatedResultFixture, String> {
+        let mut fixture = host_validated_result_setup(role, message, None, Some(config))?;
+        let ingested = fixture.store.store_validated_agent_result(
+            &fixture.artifacts,
+            fixture.owner_generation,
+            &fixture.terminal,
+            fixture.message,
+        )?;
+        Ok(TestValidatedResultFixture {
+            _temp: fixture.temp,
+            store: fixture.store,
+            artifacts: fixture.artifacts,
+            owner_generation: fixture.owner_generation,
+            ingested,
+        })
+    }
+
     pub(crate) fn host_validated_result_with_agent_run_id(
         role: Role,
         message: RoleResultMessage,
         agent_run_id: Option<AgentRunId>,
     ) -> Result<TestValidatedResultFixture, String> {
-        let mut fixture = host_validated_result_setup(role, message, agent_run_id)?;
+        let mut fixture = host_validated_result_setup(role, message, agent_run_id, None)?;
         let ingested = fixture.store.store_validated_agent_result(
             &fixture.artifacts,
             fixture.owner_generation,
@@ -8759,7 +8780,7 @@ pub(crate) mod host_validation_fixture {
         role: Role,
         message: RoleResultMessage,
     ) -> Result<TestTerminalResultFixture, String> {
-        let fixture = host_validated_result_setup(role, message, None)?;
+        let fixture = host_validated_result_setup(role, message, None, None)?;
         Ok(TestTerminalResultFixture {
             _temp: fixture.temp,
             store: fixture.store,
@@ -8786,19 +8807,44 @@ pub(crate) mod host_validation_fixture {
         role: Role,
         message: RoleResultMessage,
         agent_run_id_override: Option<AgentRunId>,
+        config_override: Option<crate::config::Config>,
     ) -> Result<HostValidatedResultSetup, String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let root = std::fs::canonicalize(temp.path()).map_err(|error| error.to_string())?;
         let mut store = ConfigStore::open_test(&root)?;
-        let config_digest = "a".repeat(64);
-        let applied = AppliedConfig {
-            config: serde_json::from_value(serde_json::json!({"schema_version":1,"adapters":{"tickets":{"kind":"command","command":["test"]}},"projects":{}})).map_err(|error| error.to_string())?,
-            profiles: std::collections::BTreeMap::new(),
-            source_root: root.display().to_string(),
-            source_files: vec![SourceFile { kind: SourceKind::File, path: root.join("config.toml").display().to_string(), canonical_path: root.join("config.toml").display().to_string(), sha256: digest(b"config" )?, bytes: 6, contents: "fixture".into() }],
-            digest: Digest::parse(config_digest.clone())?,
+        let snapshot = if let Some(config) = config_override {
+            let fixture_config = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples/fixture/config.toml");
+            let mut snapshot = crate::config::load(&fixture_config)?;
+            let source = snapshot
+                .source_files
+                .iter_mut()
+                .find(|source| {
+                    matches!(source.kind, SourceKind::File)
+                        && std::path::Path::new(&source.path) == fixture_config
+                })
+                .ok_or("fixture config source is missing")?;
+            source.contents = toml::to_string(&config).map_err(|error| error.to_string())?;
+            source.bytes = source.contents.len() as u64;
+            source.sha256 = digest(source.contents.as_bytes())?;
+            snapshot.config = config;
+            snapshot.digest = Digest::parse(crate::config::digest_manifest(
+                &snapshot.config,
+                &snapshot.profiles,
+                &snapshot.source_files,
+            )?)?;
+            snapshot
+        } else {
+            AppliedConfig {
+                config: serde_json::from_value(serde_json::json!({"schema_version":1,"adapters":{"tickets":{"kind":"command","command":["test"]}},"projects":{}})).map_err(|error| error.to_string())?,
+                profiles: std::collections::BTreeMap::new(),
+                source_root: root.display().to_string(),
+                source_files: vec![SourceFile { kind: SourceKind::File, path: root.join("config.toml").display().to_string(), canonical_path: root.join("config.toml").display().to_string(), sha256: digest(b"config")?, bytes: 6, contents: "fixture".into() }],
+                digest: Digest::parse("a".repeat(64))?,
+            }
         };
-        let applied = store.apply_snapshot("fixture", &applied, ExpectedRevision::Bootstrap)?;
+        let config_digest = snapshot.digest.to_string();
+        let applied = store.apply_snapshot("fixture", &snapshot, ExpectedRevision::Bootstrap)?;
         let project_id = ProjectId::parse("fixture-project")?;
         store.insert_project(&ProjectRecord {
             id: project_id.clone(),

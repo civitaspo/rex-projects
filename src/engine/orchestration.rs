@@ -917,7 +917,7 @@ role_payload!(LearningDecisionPayload {
     topic_changes: Vec<crate::topic::TopicChange>,
     checkpoint: BTreeMap<String, String>,
     improvements: Vec<String>,
-    candidate_change: Option<BTreeMap<String, String>>,
+    candidate_change: Option<crate::learning::ProfileCandidateProposal>,
 });
 role_payload!(ProfileTrialResultPayload {
     candidate_digest: Digest,
