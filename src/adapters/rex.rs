@@ -1596,35 +1596,15 @@ impl RexCliTransport {
     }
 
     fn command(&self, args: &[OsString]) -> Result<crate::process::ProcessOutput, RexError> {
-        let mut full_args = vec![
-            "--server".into(),
-            self.endpoint.clone().into(),
-            "--autostart=false".into(),
-            "--timeout".into(),
-            format!("{}s", self.timeout.as_secs()).into(),
-        ];
-        full_args.extend_from_slice(args);
-        let output = run(ProcessRequest {
-            executable: self.executable.clone(),
-            args: full_args,
-            stdin: Vec::new(),
-            cwd: None,
-            clear_environment: false,
-            environment: self.environment.clone(),
-            timeout: self.timeout + Duration::from_secs(2),
-            shutdown_grace: self.shutdown_grace,
-            stdout_limit: 4 * 1024 * 1024,
-            stderr_tail_limit: 64 * 1024,
-        })
-        .map_err(|_| RexError::Process)?;
-        if output.timed_out
-            || !output.cleanup_confirmed
-            || !output.status.is_some_and(|status| status.success())
-            || output.stdout_truncated
-        {
-            return Err(RexError::Process);
-        }
-        Ok(output)
+        run_rex_cli(
+            &self.executable,
+            &self.endpoint,
+            &self.environment,
+            self.timeout,
+            self.shutdown_grace,
+            rex_cli_operation(args),
+            args.to_vec(),
+        )
     }
 }
 
@@ -1738,6 +1718,12 @@ struct WhoAmI {
 enum RexCliOperation {
     WhoAmI,
     ApiList,
+    ApiCall,
+    Capture,
+    Kill,
+    New,
+    SessionList,
+    Other,
 }
 
 impl RexCliOperation {
@@ -1745,7 +1731,27 @@ impl RexCliOperation {
         match self {
             Self::WhoAmI => "whoami",
             Self::ApiList => "api list",
+            Self::ApiCall => "api call",
+            Self::Capture => "capture",
+            Self::Kill => "kill",
+            Self::New => "new",
+            Self::SessionList => "session ls",
+            Self::Other => "command",
         }
+    }
+}
+
+fn rex_cli_operation(args: &[OsString]) -> RexCliOperation {
+    let arg = |index: usize| args.get(index).and_then(|value| value.to_str());
+    match (arg(0), arg(1)) {
+        (Some("whoami"), _) => RexCliOperation::WhoAmI,
+        (Some("api"), Some("list")) => RexCliOperation::ApiList,
+        (Some("api"), Some("call")) => RexCliOperation::ApiCall,
+        (Some("capture"), _) => RexCliOperation::Capture,
+        (Some("kill"), _) => RexCliOperation::Kill,
+        (Some("new"), _) => RexCliOperation::New,
+        (Some("session"), Some("ls")) => RexCliOperation::SessionList,
+        _ => RexCliOperation::Other,
     }
 }
 
@@ -1811,6 +1817,26 @@ fn raw_cli(
     operation: RexCliOperation,
     args: &[&str],
 ) -> Result<crate::process::ProcessOutput, RexError> {
+    run_rex_cli(
+        executable,
+        endpoint,
+        environment,
+        timeout,
+        shutdown_grace,
+        operation,
+        args.iter().map(OsString::from).collect(),
+    )
+}
+
+fn run_rex_cli(
+    executable: &Path,
+    endpoint: &str,
+    environment: &BTreeMap<OsString, OsString>,
+    timeout: Duration,
+    shutdown_grace: Duration,
+    operation: RexCliOperation,
+    args: Vec<OsString>,
+) -> Result<crate::process::ProcessOutput, RexError> {
     let mut full = vec![
         "--server".into(),
         endpoint.into(),
@@ -1818,7 +1844,7 @@ fn raw_cli(
         "--timeout".into(),
         format!("{}s", timeout.as_secs()).into(),
     ];
-    full.extend(args.iter().map(OsString::from));
+    full.extend(args);
     let result = run(ProcessRequest {
         executable: executable.to_path_buf(),
         args: full,
@@ -2338,6 +2364,148 @@ mod tests {
             assert!(!rendered.contains("endpoint-secret-marker"));
             assert!(!rendered.contains("stderr-secret-marker"));
             assert!(!rendered.contains("environment-secret-marker"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qualification_reports_bounded_new_failure_after_empty_reconciliation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = "unix:///tmp/qualification-endpoint-secret-marker.sock";
+        let script = dir.path().join("rex qualification failure fixture");
+        let new_count = dir.path().join("new-count");
+        let whoami = serde_json::json!({
+            "endpoint": endpoint,
+            "instance_id": "instance-1",
+            "host_id": "host-1",
+            "rex_version": "1.2.3"
+        });
+        let methods = serde_json::json!({"methods": {
+            "session.view": {},
+            "session.new_window": {},
+            "session.new_split": {},
+            "session.focus_block": {},
+            "session.zoom_block": {},
+            "block.close": {}
+        }});
+        let body = format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *\"whoami --json\"*) printf '%s\\n' '{}' ;;\n  *\"api list --json\"*) printf '%s\\n' '{}' ;;\n  *\"new rex-projects-provider-qualification\"*) printf x >> \"$REX_TEST_NEW_COUNT\"; printf '%s\\n' 'stderr-secret-marker' >&2; exit 23 ;;\n  *\"session ls --json\"*) printf '%s\\n' '{{\"sessions\":[]}}' ;;\n  *) exit 39 ;;\nesac\n",
+            whoami, methods
+        );
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let environment = BTreeMap::from([(
+            OsString::from("REX_TEST_NEW_COUNT"),
+            new_count.as_os_str().to_owned(),
+        )]);
+        let transport = RexCliTransport::connect(
+            &script,
+            &[],
+            endpoint.into(),
+            "instance-1".into(),
+            "session-1".into(),
+            environment,
+        )
+        .unwrap();
+        let spec = AgentBlockSpec {
+            run_id: "qualification-op-1".into(),
+            command: PathBuf::from("/usr/bin/true"),
+            args: vec![],
+            cwd: dir.path().to_path_buf(),
+            path_prepend: vec![],
+        };
+
+        let error = transport
+            .create_disposable_qualification_session("qualification-op-1", &spec)
+            .unwrap_err();
+
+        assert_eq!(
+            std::fs::read_to_string(new_count).unwrap(),
+            "x",
+            "an unresolved creation is never retried"
+        );
+        assert_eq!(
+            error.to_string(),
+            "Rex CLI new process result rejected (timed_out=false, cleanup_confirmed=true, exit_code=Some(23), exit_signal=None, stdout_truncated=false)"
+        );
+        let debug = format!("{error:?}");
+        for rendered in [error.to_string().as_str(), debug.as_str()] {
+            assert!(!rendered.contains("stderr-secret-marker"));
+            assert!(!rendered.contains("qualification-endpoint-secret-marker"));
+            assert!(!rendered.contains(dir.path().to_string_lossy().as_ref()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qualification_preserves_reconciliation_failure_without_retrying_new() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("rex qualification reconcile fixture");
+        let new_count = dir.path().join("new-count");
+        let endpoint = "unix:///tmp/qualification-reconcile-endpoint-secret-marker.sock";
+        let whoami = serde_json::json!({
+            "endpoint": endpoint,
+            "instance_id": "instance-1",
+            "host_id": "host-1",
+            "rex_version": "1.2.3"
+        });
+        let methods = serde_json::json!({"methods": {
+            "session.view": {},
+            "session.new_window": {},
+            "session.new_split": {},
+            "session.focus_block": {},
+            "session.zoom_block": {},
+            "block.close": {}
+        }});
+        let body = format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *\"whoami --json\"*) printf '%s\\n' '{}' ;;\n  *\"api list --json\"*) printf '%s\\n' '{}' ;;\n  *\"new rex-projects-provider-qualification\"*) printf x >> \"$REX_TEST_NEW_COUNT\"; exit 23 ;;\n  *\"session ls --json\"*) printf '%s\\n' 'reconcile-stderr-secret-marker' >&2; exit 31 ;;\n  *) exit 39 ;;\nesac\n",
+            whoami, methods
+        );
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let environment = BTreeMap::from([(
+            OsString::from("REX_TEST_NEW_COUNT"),
+            new_count.as_os_str().to_owned(),
+        )]);
+        let transport = RexCliTransport::connect(
+            &script,
+            &[],
+            endpoint.into(),
+            "instance-1".into(),
+            "session-1".into(),
+            environment,
+        )
+        .unwrap();
+        let spec = AgentBlockSpec {
+            run_id: "qualification-op-1".into(),
+            command: PathBuf::from("/usr/bin/true"),
+            args: vec![],
+            cwd: dir.path().to_path_buf(),
+            path_prepend: vec![],
+        };
+
+        let error = transport
+            .create_disposable_qualification_session("qualification-op-1", &spec)
+            .unwrap_err();
+
+        assert_eq!(
+            std::fs::read_to_string(new_count).unwrap(),
+            "x",
+            "an unconfirmed creation is never retried"
+        );
+        assert_eq!(
+            error.to_string(),
+            "Rex CLI session ls process result rejected (timed_out=false, cleanup_confirmed=true, exit_code=Some(31), exit_signal=None, stdout_truncated=false)"
+        );
+        let debug = format!("{error:?}");
+        for rendered in [error.to_string().as_str(), debug.as_str()] {
+            assert!(!rendered.contains("reconcile-stderr-secret-marker"));
+            assert!(!rendered.contains("qualification-reconcile-endpoint-secret-marker"));
+            assert!(!rendered.contains(dir.path().to_string_lossy().as_ref()));
         }
     }
 
