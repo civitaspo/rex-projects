@@ -47,6 +47,13 @@ impl TopicEffectHandler {
             return Err("outbox request differs from the immutable Topic intent".into());
         }
         if let Some(receipt) = store.supervisor_topic_receipt(&operation_id)? {
+            store
+                .validate_topic_sources_at(
+                    &intent.project_id,
+                    &intent.destination_root,
+                    &intent.sources,
+                )
+                .map_err(crate::topic::TopicPublicationError::SourceUnavailable)?;
             return Ok(receipt);
         }
         if let Some(reason) = store.supervisor_topic_conflict_reason(&operation_id)? {
@@ -57,6 +64,13 @@ impl TopicEffectHandler {
                 "configured Topic destination changed while a publication was pending".into(),
             ));
         }
+        store
+            .validate_topic_sources_at(
+                &intent.project_id,
+                &intent.destination_root,
+                &intent.sources,
+            )
+            .map_err(crate::topic::TopicPublicationError::SourceUnavailable)?;
         let receipt = crate::topic::publish_immutable(&intent)?;
         store.record_supervisor_topic_publication(owner_generation, &operation_id, &receipt)?;
         store
@@ -91,6 +105,16 @@ impl EffectHandler for TopicEffectHandler {
                     receipt: serde_json::json!({
                         "operation_id": operation_id.as_str(),
                         "state": "conflict",
+                        "reason": reason,
+                    })
+                    .to_string(),
+                })
+            }
+            Err(crate::topic::TopicPublicationError::SourceUnavailable(reason)) => {
+                Ok(EffectObservation::Pending {
+                    receipt: serde_json::json!({
+                        "operation_id": request.intent.operation_id,
+                        "state": "source_unavailable",
                         "reason": reason,
                     })
                     .to_string(),
