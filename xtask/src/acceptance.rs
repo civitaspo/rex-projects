@@ -10,8 +10,9 @@ use rex_projects::adapters::rex::{
 };
 use rex_projects::launch::{ObservedProviderStart, ObservedWrapperIdentity};
 use rex_projects::process::{
-    ProcessIdentity, ProcessIdentityQuality, ProcessOutput, ProcessRequest, inspect_process_table,
-    run as run_process,
+    ProcessIdentity, ProcessIdentityQuality, ProcessOutput, ProcessRequest, ProcessSignal,
+    executable_path_for_identity, inspect_process_table, process_identity_for_pid,
+    run as run_process, signal_process_if_observed,
 };
 use rex_projects::run_step_spool::{RunFamilyCoverage, RunStepSpool};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -40,6 +41,7 @@ const HOST_COMMIT_WORKER_REWORK_STAGE: &str = "host_commit_worker_rework_inbox";
 const HOST_COMMIT_VERIFICATION_REVIEWER_STAGE: &str = "host_commit_verification_reviewer_inbox";
 const WORKER_RECOVERY_INBOX_STAGE: &str = "worker_recovery_inbox";
 const NATIVE_WORKER_BLOCK_LOSS_STAGE: &str = "native_worker_block_loss";
+const NATIVE_WORKER_MISSED_EVENT_BLOCK_LOSS_STAGE: &str = "native_worker_missed_event_block_loss";
 const REQUEST_MERGE_STAGE: &str = "request_merge";
 const NATIVE_WORKER_CODEX_ENV: &str = "REX_PROJECTS_NATIVE_WORKER_CODEX";
 const ACCEPTANCE_FREEZE_MARKER_ENV: &str = "REX_PROJECTS_ACCEPTANCE_FREEZE_MARKER";
@@ -97,6 +99,7 @@ fn parse_acceptance_stage(value: Option<String>) -> Result<Option<String>, Strin
                 || stage == HOST_COMMIT_WORKER_REWORK_STAGE
                 || stage == HOST_COMMIT_VERIFICATION_REVIEWER_STAGE
                 || stage == NATIVE_WORKER_BLOCK_LOSS_STAGE
+                || stage == NATIVE_WORKER_MISSED_EVENT_BLOCK_LOSS_STAGE
                 || stage == REQUEST_MERGE_STAGE =>
         {
             Ok(Some(stage))
@@ -110,7 +113,10 @@ fn parse_acceptance_stage(value: Option<String>) -> Result<Option<String>, Strin
 fn qualification_roles_for_stage(stage: Option<&str>) -> &'static [&'static str] {
     if stage == Some(REQUEST_MERGE_STAGE) {
         &PROVIDER_ROLES
-    } else if stage == Some(NATIVE_WORKER_BLOCK_LOSS_STAGE) {
+    } else if matches!(
+        stage,
+        Some(NATIVE_WORKER_BLOCK_LOSS_STAGE | NATIVE_WORKER_MISSED_EVENT_BLOCK_LOSS_STAGE)
+    ) {
         &["planner", "worker", "supervisor", "coordinator"]
     } else if matches!(
         stage,
@@ -305,8 +311,13 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
     let host_commit_reviewer_inbox_stage =
         stage.as_deref() == Some(HOST_COMMIT_REVIEWER_INBOX_STAGE) || worker_review_rework_stage;
     let worker_recovery_inbox_stage = stage.as_deref() == Some(WORKER_RECOVERY_INBOX_STAGE);
-    let native_worker_block_loss_stage = stage.as_deref() == Some(NATIVE_WORKER_BLOCK_LOSS_STAGE);
-    let native_worker_codex = if native_worker_block_loss_stage {
+    let native_worker_stage = matches!(
+        stage.as_deref(),
+        Some(NATIVE_WORKER_BLOCK_LOSS_STAGE | NATIVE_WORKER_MISSED_EVENT_BLOCK_LOSS_STAGE)
+    );
+    let native_worker_missed_event_stage =
+        stage.as_deref() == Some(NATIVE_WORKER_MISSED_EVENT_BLOCK_LOSS_STAGE);
+    let native_worker_codex = if native_worker_stage {
         Some(validate_native_worker_codex_path()?)
     } else {
         None
@@ -314,7 +325,7 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
     let worker_connection_stage = coordinator_worker_inbox_stage
         || host_commit_reviewer_inbox_stage
         || worker_recovery_inbox_stage
-        || native_worker_block_loss_stage;
+        || native_worker_stage;
     let provider_roles = qualification_roles_for_stage(stage.as_deref());
     fs::create_dir_all(request.fixture_root).map_err(|error| error.to_string())?;
     let state_root = request.fixture_root.join("state");
@@ -342,7 +353,7 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
                 || coordinator_worker_inbox_stage
                 || worker_recovery_inbox_stage
                 || request_merge_stage
-                || native_worker_block_loss_stage,
+                || native_worker_stage,
             worker_recovery_stage: worker_recovery_inbox_stage,
             worker_review_rework_stage,
             worker_verification_stage,
@@ -358,14 +369,14 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
         config_text_for_stage(
             &request,
             &executable,
-            native_worker_block_loss_stage,
+            native_worker_stage,
             request_merge_stage,
         ),
     )
     .map_err(|error| format!("write fixture config: {error}"))?;
     let seeded_ticket = seed_operations_ticket(&request, &executable)?;
     trace.push(json!({"step":"external_ticket_seeded_through_adapter_protocol","status":"observed","evidence":seeded_ticket}));
-    if native_worker_block_loss_stage {
+    if native_worker_stage {
         write_native_worker_setup_freeze(
             &request,
             &cli_identity,
@@ -375,6 +386,7 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
             native_worker_codex
                 .as_deref()
                 .expect("native Worker Codex path was validated"),
+            stage.as_deref().expect("native Worker stage was selected"),
         )?;
     }
     let validate = product(&request, &state_root, &["config", "validate", "--json"])?;
@@ -600,7 +612,7 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
             trace.push(json!({"step":"project_lifecycle_observed","status":"running","evidence":last_status}));
             lifecycle_traced = true;
         }
-        if native_worker_block_loss_stage
+        if native_worker_stage
             && let Some(worker) = observe_running_native_worker(&request, &state_root)?
         {
             let ready = json!({
@@ -614,9 +626,23 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
                 serde_json::to_vec_pretty(&ready).map_err(|error| error.to_string())?,
             )
             .map_err(|error| format!("write native Worker ready observation: {error}"))?;
-            let proof = observe_native_worker_block_loss(&request, &state_root, &worker)?;
+            let proof = observe_native_worker_block_loss(
+                &request,
+                &state_root,
+                &worker,
+                if native_worker_missed_event_stage {
+                    NativeBlockLossScenario::MissedEvent
+                } else {
+                    NativeBlockLossScenario::DeliveredEvent
+                },
+            )?;
+            let proof_filename = if native_worker_missed_event_stage {
+                "native-worker-missed-event-block-loss.json"
+            } else {
+                "native-worker-block-loss.json"
+            };
             fs::write(
-                request.fixture_root.join("native-worker-block-loss.json"),
+                request.fixture_root.join(proof_filename),
                 serde_json::to_vec_pretty(&proof).map_err(|error| error.to_string())?,
             )
             .map_err(|error| format!("write native Worker block-loss proof: {error}"))?;
@@ -1966,7 +1992,10 @@ fn bounded_stage_contract_valid(
     native_worker_ready: bool,
 ) -> bool {
     coordinator_stage_valid
-        && (stage != Some(NATIVE_WORKER_BLOCK_LOSS_STAGE) || native_worker_ready)
+        && (!matches!(
+            stage,
+            Some(NATIVE_WORKER_BLOCK_LOSS_STAGE | NATIVE_WORKER_MISSED_EVENT_BLOCK_LOSS_STAGE)
+        ) || native_worker_ready)
 }
 
 fn native_worker_ready_marker_is_valid(path: &Path) -> bool {
@@ -4174,6 +4203,7 @@ fn write_native_worker_setup_freeze(
     config_path: &Path,
     seeded_ticket: &Value,
     codex_path: &Path,
+    stage: &str,
 ) -> Result<(), String> {
     let marker = std::env::var_os(ACCEPTANCE_FREEZE_MARKER_ENV)
         .map(PathBuf::from)
@@ -4204,7 +4234,7 @@ fn write_native_worker_setup_freeze(
         "rex_endpoint":request.rex_server,
         "rex_session_id":request.rex_session,
         "fixture_root":request.fixture_root,
-        "stage":NATIVE_WORKER_BLOCK_LOSS_STAGE,
+        "stage":stage,
         "config_path":config_path,
         "config_sha256":format!("{:x}", Sha256::digest(fs::read(config_path).map_err(|error| error.to_string())?)),
         "controller_xdg_state_home":request.fixture_root.join("xdg-state"),
@@ -5059,6 +5089,7 @@ fn observe_native_worker_block_loss(
     request: &Request<'_>,
     state_root: &Path,
     worker: &Value,
+    scenario: NativeBlockLossScenario,
 ) -> Result<Value, String> {
     let ready_at = Instant::now();
     let string = |key: &str| {
@@ -5288,16 +5319,70 @@ fn observe_native_worker_block_loss(
             }
         }
     }
-    let post_fault_context = NativePostFaultContext {
+    let mut post_fault_context = NativePostFaultContext {
         run_id,
         epoch,
         block_id,
         slot_pool: &slot_pool,
         slot_index,
         pre_close_process_identities: &pre_close_process_identities,
+        reader_fault: None,
     };
+    let mut reader_absent_close_deadline = None;
+    if scenario == NativeBlockLossScenario::MissedEvent {
+        match kill_owned_events_reader(request, state_root, generation, session_id) {
+            Ok(fault) => {
+                post_fault_context.reader_fault = Some(fault.evidence);
+                reader_absent_close_deadline = Some(fault.close_deadline);
+                if let Some(error) = fault.failure {
+                    let (_, mut report) =
+                        native_post_fault_report(&database, &post_fault_context, None, &[error]);
+                    report["status"] = json!("incomplete");
+                    return Ok(report);
+                }
+            }
+            Err(error) => {
+                return Ok(json!({
+                    "status":"incomplete",
+                    "reason":error,
+                    "fault_injected":false,
+                    "run_id":run_id,
+                    "reservation_epoch":epoch,
+                    "block_id":block_id,
+                    "lifecycle_facts":{"event_received":false,"process_survived":null,"exit_confirmed":false,"slot_released":false}
+                }));
+            }
+        }
+    }
     match close_native_worker_block_before_deadline(
-        ready_deadline,
+        reader_absent_close_deadline
+            .map_or(ready_deadline, |deadline| deadline.min(ready_deadline)),
+        || {
+            if scenario == NativeBlockLossScenario::MissedEvent {
+                verify_worker_still_live_after_reader_fault(
+                    request,
+                    state_root,
+                    &database,
+                    &rex,
+                    &window,
+                    &post_fault_context,
+                    generation,
+                    session_id,
+                    &control_dir,
+                    &binding,
+                    wrapper_pid as u32,
+                    wrapper_start,
+                    provider_pid as u32,
+                    provider_start,
+                    sleep_identity["pid"].as_u64().unwrap_or_default() as u32,
+                    sleep_identity["start_identity"]
+                        .as_str()
+                        .unwrap_or_default(),
+                )
+            } else {
+                Ok(())
+            }
+        },
         || {
             rex.agent_block_is_present(&window, run_id, block_id)
                 .map_err(|error| format!("recheck native Worker block before close: {error}"))
@@ -5309,21 +5394,136 @@ fn observe_native_worker_block_loss(
     ) {
         Ok(NativeBlockCloseOutcome::Closed) => {}
         Ok(NativeBlockCloseOutcome::BlockAbsent) => {
+            if post_fault_context.reader_fault.is_some() {
+                let (_, mut report) = native_post_fault_report(
+                    &database,
+                    &post_fault_context,
+                    Some(true),
+                    &["exact Worker block was already absent before the one allowed close".into()],
+                );
+                report["status"] = json!("incomplete");
+                report["close_attempted_once"] = json!(false);
+                report["block_close_outcome"] = json!("not_attempted");
+                return Ok(report);
+            }
             return Ok(
                 json!({"status":"inconclusive","reason":"exact Worker block was absent before close","run_id":run_id,"reservation_epoch":epoch,"fault_injected":false}),
             );
         }
         Ok(NativeBlockCloseOutcome::DeadlineExpired) => {
+            if post_fault_context.reader_fault.is_some() {
+                let (_, mut report) = native_post_fault_report(
+                    &database,
+                    &post_fault_context,
+                    None,
+                    &[
+                        "five-second reader-absent close deadline expired before block close"
+                            .into(),
+                    ],
+                );
+                report["status"] = json!("incomplete");
+                report["close_attempted_once"] = json!(false);
+                report["block_close_outcome"] = json!("not_attempted_deadline_expired");
+                return Ok(report);
+            }
             return Ok(
                 json!({"status":"inconclusive","reason":"ready budget expired after exact Worker block validation","run_id":run_id,"reservation_epoch":epoch,"fault_injected":false}),
             );
+        }
+        Ok(NativeBlockCloseOutcome::ClosedAfterDeadline) => {
+            let (_, mut report) = native_post_fault_report(
+                &database,
+                &post_fault_context,
+                None,
+                &[
+                    "block.close returned after the five-second reader-absent close deadline"
+                        .into(),
+                ],
+            );
+            report["status"] = json!("incomplete");
+            report["close_attempted_once"] = json!(true);
+            report["block_close_outcome"] = json!("returned_after_deadline");
+            return Ok(report);
         }
         Err(error) => {
             let (_, mut report) =
                 native_post_fault_report(&database, &post_fault_context, None, &[error]);
             report["status"] = json!("incomplete");
             report["fault_injected"] = Value::Null;
+            if post_fault_context.reader_fault.is_some() {
+                report["close_attempted_once"] = Value::Null;
+                report["block_close_outcome"] = json!("unknown_after_attempt");
+            }
             return Ok(report);
+        }
+    }
+    if scenario == NativeBlockLossScenario::MissedEvent {
+        let (Some(_close_deadline), Some(reader_fault)) = (
+            reader_absent_close_deadline,
+            post_fault_context.reader_fault.as_ref(),
+        ) else {
+            let (_, mut report) = native_post_fault_report(
+                &database,
+                &post_fault_context,
+                None,
+                &["missed-event reader fault evidence was incomplete after block.close".into()],
+            );
+            report["status"] = json!("incomplete");
+            return Ok(report);
+        };
+        let Some(controller_pid) = reader_fault["controller_pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+        else {
+            let (_, mut report) = native_post_fault_report(
+                &database,
+                &post_fault_context,
+                None,
+                &["reader fault evidence omitted controller PID".into()],
+            );
+            report["status"] = json!("incomplete");
+            return Ok(report);
+        };
+        let Some(controller_start_identity) = reader_fault["controller_start_identity"].as_str()
+        else {
+            let (_, mut report) = native_post_fault_report(
+                &database,
+                &post_fault_context,
+                None,
+                &["reader fault evidence omitted controller birth identity".into()],
+            );
+            report["status"] = json!("incomplete");
+            return Ok(report);
+        };
+        let replacement_deadline = match replacement_reader_wait_deadline(
+            _close_deadline,
+            Instant::now(),
+            terminal_deadline,
+        ) {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                let (_, mut report) =
+                    native_post_fault_report(&database, &post_fault_context, None, &[error]);
+                report["status"] = json!("incomplete");
+                return Ok(report);
+            }
+        };
+        if let Err(error) = wait_for_replacement_events_reader(
+            request,
+            state_root,
+            generation,
+            session_id,
+            replacement_deadline,
+            controller_pid,
+            controller_start_identity,
+        ) {
+            let (_, mut report) =
+                native_post_fault_report(&database, &post_fault_context, None, &[error]);
+            report["status"] = json!("incomplete");
+            return Ok(report);
+        }
+        if let Some(reader_fault) = post_fault_context.reader_fault.as_mut() {
+            reader_fault["replacement_seen_after_close"] = json!(true);
         }
     }
     let event_deadline = (Instant::now() + NATIVE_WORKER_READY_LIMIT).min(terminal_deadline);
@@ -5348,7 +5548,11 @@ fn observe_native_worker_block_loss(
                 return Ok(report);
             }
         };
-        if block_absent == Some(true) && facts.event_received {
+        let event_condition = match scenario {
+            NativeBlockLossScenario::DeliveredEvent => facts.event_received,
+            NativeBlockLossScenario::MissedEvent => !facts.event_received,
+        };
+        if block_absent == Some(true) && event_condition {
             break;
         }
         if Instant::now() >= event_deadline {
@@ -5356,7 +5560,7 @@ fn observe_native_worker_block_loss(
                 &database,
                 &post_fault_context,
                 block_absent,
-                &["matching lifecycle event or public block absence was not proven within 60 seconds".into()],
+                &["expected lifecycle event state or public block absence was not proven within 60 seconds".into()],
             );
             report["status"] = json!("incomplete");
             return Ok(report);
@@ -5365,7 +5569,7 @@ fn observe_native_worker_block_loss(
     }
     let block_absent = true;
     loop {
-        let (terminal_proof_complete, mut report) =
+        let (_, mut report) =
             native_post_fault_report(&database, &post_fault_context, Some(block_absent), &[]);
         if report["observation_errors"]
             .as_array()
@@ -5374,6 +5578,21 @@ fn observe_native_worker_block_loss(
             report["status"] = json!("incomplete");
             return Ok(report);
         }
+        let facts = match native_lifecycle_facts(&database, run_id, epoch, block_id) {
+            Ok(facts) => facts,
+            Err(error) => {
+                report["status"] = json!("incomplete");
+                report["observation_errors"] = json!([error]);
+                return Ok(report);
+            }
+        };
+        let terminal_proof_complete = native_terminal_proof_complete_for_event(
+            &facts,
+            report["run_state"].as_str(),
+            report["launch_state"].as_str(),
+            scenario == NativeBlockLossScenario::DeliveredEvent,
+        );
+        report["terminal_proof_complete"] = json!(terminal_proof_complete);
         if block_absent && report["local_family_absent"] == true && terminal_proof_complete {
             report["status"] = json!("passed");
             report["pre_close_sleep_identity"] = sleep_identity;
@@ -5397,6 +5616,545 @@ struct NativeLifecycleFacts {
     slot_release_digest: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeBlockLossScenario {
+    DeliveredEvent,
+    MissedEvent,
+}
+
+struct OwnedEventsReader {
+    identity: ProcessIdentity,
+    command: String,
+    image_sha256: String,
+}
+
+struct NativeReaderFault {
+    evidence: Value,
+    close_deadline: Instant,
+    failure: Option<String>,
+}
+
+fn owned_events_reader(
+    request: &Request<'_>,
+    controller: &ProcessIdentity,
+    endpoint: &str,
+    session_id: &str,
+    current: &[ProcessIdentity],
+) -> Result<Option<OwnedEventsReader>, String> {
+    let rex_path = fs::canonicalize(request.rex)
+        .map_err(|error| format!("resolve pinned Rex image: {error}"))?;
+    let rex_digest = format!(
+        "{:x}",
+        Sha256::digest(fs::read(&rex_path).map_err(|error| {
+            format!("read pinned Rex image {}: {error}", rex_path.display())
+        })?)
+    );
+    let command_fragment = format!("-S {endpoint} events -s {session_id} --json");
+    let mut matches = Vec::new();
+    for candidate in current.iter().filter(|process| {
+        process.parent_pid == controller.pid
+            && process.quality == ProcessIdentityQuality::KernelBirthToken
+    }) {
+        let Some(image_path) = executable_path_for_identity(candidate)
+            .map_err(|error| format!("resolve Rex event child image: {error:?}"))?
+        else {
+            continue;
+        };
+        let Ok(image_bytes) = fs::read(&image_path) else {
+            continue;
+        };
+        let image_sha256 = format!("{:x}", Sha256::digest(image_bytes));
+        if image_sha256 != rex_digest {
+            continue;
+        }
+        let command = invoke(
+            Path::new("/bin/ps"),
+            &[
+                OsString::from("-p"),
+                OsString::from(candidate.pid.to_string()),
+                OsString::from("-o"),
+                OsString::from("command="),
+            ],
+            None,
+            None,
+            STEP_TIMEOUT,
+        )?;
+        let flattened_command = String::from_utf8_lossy(&command.stdout).trim().to_owned();
+        if !flattened_command.starts_with(rex_path.to_string_lossy().as_ref())
+            || !flattened_command.contains(&command_fragment)
+        {
+            continue;
+        }
+        matches.push(OwnedEventsReader {
+            identity: candidate.clone(),
+            command: flattened_command,
+            image_sha256,
+        });
+    }
+    if matches.len() > 1 {
+        return Err("multiple direct pinned Rex event readers matched the owned session".into());
+    }
+    Ok(matches.pop())
+}
+
+fn runtime_owner_projection_matches(
+    request: &Request<'_>,
+    state_root: &Path,
+    generation: u64,
+) -> Result<ProcessIdentity, String> {
+    let path = state_root.join("runtime-owner.json");
+    let bytes = fs::read(&path).map_err(|error| {
+        format!(
+            "read controller owner projection {}: {error}",
+            path.display()
+        )
+    })?;
+    let owner: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse controller owner projection: {error}"))?;
+    let pid = owner["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .ok_or("controller owner projection omitted PID")?;
+    let start_identity = owner["process_start_identity"]
+        .as_str()
+        .ok_or("controller owner projection omitted process birth identity")?;
+    let expected_product_digest = format!(
+        "{:x}",
+        Sha256::digest(
+            fs::read(request.cli).map_err(|error| format!("read pinned product CLI: {error}"))?
+        )
+    );
+    let expected_product_path = fs::canonicalize(request.cli)
+        .map_err(|error| format!("resolve pinned product CLI path: {error}"))?;
+    let projected_product_path = owner["executable_path"]
+        .as_str()
+        .ok_or("controller owner projection omitted executable path")?;
+    if owner["schema_version"] != 1
+        || owner["generation"].as_u64() != Some(generation)
+        || owner["state_root"].as_str() != Some(state_root.to_string_lossy().as_ref())
+        || owner["rex_endpoint"].as_str() != Some(request.rex_server)
+        || owner["rex_server_identity"].as_str() != Some(request.expected_instance)
+        || owner["rex_session_id"].as_str() != Some(request.rex_session)
+        || owner["executable_digest"].as_str() != Some(expected_product_digest.as_str())
+        || fs::canonicalize(projected_product_path).ok().as_ref() != Some(&expected_product_path)
+    {
+        return Err(
+            "controller owner projection does not match the pinned product and Rex identity".into(),
+        );
+    }
+    let identity = process_identity_for_pid(pid)
+        .map_err(|error| format!("inspect controller process birth identity: {error:?}"))?
+        .filter(|identity| {
+            identity.start_identity == start_identity
+                && identity.quality == ProcessIdentityQuality::KernelBirthToken
+        })
+        .ok_or("controller process no longer matches its owner projection")?;
+    let executable = executable_path_for_identity(&identity)
+        .map_err(|error| format!("resolve controller executable: {error:?}"))?
+        .ok_or("controller executable changed during identity check")?;
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(
+            fs::read(executable)
+                .map_err(|error| format!("read controller executable image: {error}"))?
+        )
+    );
+    if digest != expected_product_digest {
+        return Err("controller executable image differs from the pinned product digest".into());
+    }
+    Ok(identity)
+}
+
+fn verify_public_controller_status(
+    request: &Request<'_>,
+    state_root: &Path,
+    generation: u64,
+    controller: &ProcessIdentity,
+) -> Result<(), String> {
+    let output = product(request, state_root, &["status", "--json"])?;
+    require_success(
+        "recheck controller status before Rex reader signal",
+        &output,
+    )?;
+    let status = json_stdout(&output);
+    if status.pointer("/owner/active") != Some(&Value::Bool(true))
+        || status.pointer("/owner/generation").and_then(Value::as_u64) != Some(generation)
+        || status.pointer("/owner/pid").and_then(Value::as_u64) != Some(controller.pid as u64)
+        || status
+            .pointer("/owner/rex_endpoint")
+            .and_then(Value::as_str)
+            != Some(request.rex_server)
+        || status
+            .pointer("/owner/rex_server_instance")
+            .and_then(Value::as_str)
+            != Some(request.expected_instance)
+        || status.pointer("/owner/rex_session").and_then(Value::as_str) != Some(request.rex_session)
+    {
+        return Err("public controller status changed before Rex reader signal".into());
+    }
+    Ok(())
+}
+
+fn kill_owned_events_reader(
+    request: &Request<'_>,
+    state_root: &Path,
+    generation: u64,
+    session_id: &str,
+) -> Result<NativeReaderFault, String> {
+    let controller = runtime_owner_projection_matches(request, state_root, generation)?;
+    let current = inspect_process_table()
+        .map_err(|error| format!("inspect processes before Rex reader fault: {error:?}"))?;
+    let reader = owned_events_reader(
+        request,
+        &controller,
+        request.rex_server,
+        session_id,
+        &current,
+    )?
+    .ok_or("no direct child matched the pinned Rex event reader command")?;
+
+    let checked_controller = runtime_owner_projection_matches(request, state_root, generation)?;
+    verify_public_controller_status(request, state_root, generation, &checked_controller)?;
+    let checked_processes = inspect_process_table()
+        .map_err(|error| format!("recheck processes before Rex reader fault: {error:?}"))?;
+    let checked_reader = owned_events_reader(
+        request,
+        &checked_controller,
+        request.rex_server,
+        session_id,
+        &checked_processes,
+    )?
+    .ok_or("pinned Rex event reader changed before the requested fault")?;
+    if checked_controller.pid != controller.pid
+        || checked_controller.start_identity != controller.start_identity
+        || checked_reader.identity.pid != reader.identity.pid
+        || checked_reader.identity.start_identity != reader.identity.start_identity
+        || checked_reader.command != reader.command
+        || checked_reader.image_sha256 != reader.image_sha256
+    {
+        return Err("controller or pinned Rex event reader identity changed before signal".into());
+    }
+    let fault_at = Instant::now();
+    let close_deadline = fault_at + Duration::from_secs(5);
+    let mut evidence = json!({
+        "fault":"single_pid_sigterm",
+        "signal_attempted":true,
+        "signal_result":"unknown",
+        "pid":reader.identity.pid,
+        "start_identity":reader.identity.start_identity,
+        "image_sha256":reader.image_sha256,
+        "flattened_command":reader.command,
+        "original_identity_absent":false,
+        "replacement_seen_before_close":false,
+        "controller_pid":checked_controller.pid,
+        "controller_start_identity":checked_controller.start_identity,
+        "reader_absent_close_limit_seconds":5
+    });
+    let signalled = match signal_process_if_observed(
+        &reader.identity,
+        &checked_processes,
+        ProcessSignal::Terminate,
+    ) {
+        Ok(signalled) => signalled,
+        Err(error) => {
+            evidence["signal_result"] = json!("unknown");
+            return Ok(NativeReaderFault {
+                evidence,
+                close_deadline,
+                failure: Some(format!("signal exact pinned Rex event reader: {error:?}")),
+            });
+        }
+    };
+    evidence["signal_result"] = json!(if signalled { "sent" } else { "already_absent" });
+    if !signalled {
+        return Ok(NativeReaderFault {
+            evidence,
+            close_deadline,
+            failure: Some("pinned Rex event reader exited before the requested signal".into()),
+        });
+    }
+    loop {
+        let current = match inspect_process_table() {
+            Ok(current) => current,
+            Err(error) => {
+                return Ok(NativeReaderFault {
+                    evidence,
+                    close_deadline,
+                    failure: Some(format!("inspect after Rex reader fault: {error:?}")),
+                });
+            }
+        };
+        let original_live = current.iter().any(|process| {
+            process.pid == reader.identity.pid
+                && process.start_identity == reader.identity.start_identity
+        });
+        if !original_live {
+            evidence["original_identity_absent"] = json!(true);
+            let controller = match runtime_owner_projection_matches(request, state_root, generation)
+            {
+                Ok(controller) => controller,
+                Err(error) => {
+                    return Ok(NativeReaderFault {
+                        evidence,
+                        close_deadline,
+                        failure: Some(error),
+                    });
+                }
+            };
+            if controller.pid != checked_controller.pid
+                || controller.start_identity != checked_controller.start_identity
+            {
+                return Ok(NativeReaderFault {
+                    evidence,
+                    close_deadline,
+                    failure: Some("controller identity changed after Rex reader fault".into()),
+                });
+            }
+            let replacement = match owned_events_reader(
+                request,
+                &controller,
+                request.rex_server,
+                session_id,
+                &current,
+            ) {
+                Ok(replacement) => replacement,
+                Err(error) => {
+                    return Ok(NativeReaderFault {
+                        evidence,
+                        close_deadline,
+                        failure: Some(error),
+                    });
+                }
+            };
+            if replacement.is_none() {
+                return Ok(NativeReaderFault {
+                    evidence,
+                    close_deadline,
+                    failure: None,
+                });
+            }
+            evidence["replacement_seen_before_close"] = json!(true);
+            return Ok(NativeReaderFault {
+                evidence,
+                close_deadline,
+                failure: Some(
+                    "replacement Rex event reader appeared before the block could be closed".into(),
+                ),
+            });
+        }
+        if Instant::now() >= close_deadline {
+            return Ok(NativeReaderFault {
+                evidence,
+                close_deadline,
+                failure: Some(
+                    "original Rex event reader did not exit within the bounded reconnect gap"
+                        .into(),
+                ),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_for_replacement_events_reader(
+    request: &Request<'_>,
+    state_root: &Path,
+    generation: u64,
+    session_id: &str,
+    deadline: Instant,
+    expected_controller_pid: u32,
+    expected_controller_start_identity: &str,
+) -> Result<(), String> {
+    wait_for_condition_before(
+        deadline,
+        POLL_INTERVAL,
+        Instant::now,
+        std::thread::sleep,
+        || {
+            let controller = runtime_owner_projection_matches(request, state_root, generation)?;
+            if controller.pid != expected_controller_pid
+                || controller.start_identity != expected_controller_start_identity
+            {
+                return Err(
+                    "replacement event reader would belong to a different controller".into(),
+                );
+            }
+            verify_public_controller_status(request, state_root, generation, &controller)?;
+            let current = inspect_process_table()
+                .map_err(|error| format!("inspect replacement Rex event reader: {error:?}"))?;
+            Ok(owned_events_reader(
+                request,
+                &controller,
+                request.rex_server,
+                session_id,
+                &current,
+            )?
+            .is_some())
+        },
+        "same controller did not start a live pinned Rex event reader within the readiness budget",
+    )
+}
+
+fn wait_for_condition_before(
+    deadline: Instant,
+    interval: Duration,
+    mut now: impl FnMut() -> Instant,
+    mut pause: impl FnMut(Duration),
+    mut condition: impl FnMut() -> Result<bool, String>,
+    timeout_message: &str,
+) -> Result<(), String> {
+    loop {
+        let satisfied = condition()?;
+        if now() >= deadline {
+            return Err(timeout_message.into());
+        }
+        if satisfied {
+            return Ok(());
+        }
+        pause(interval);
+    }
+}
+
+fn replacement_reader_wait_deadline(
+    close_deadline: Instant,
+    close_returned_at: Instant,
+    terminal_deadline: Instant,
+) -> Result<Instant, String> {
+    if close_returned_at >= close_deadline {
+        return Err("block.close returned outside the reader-absent gap".into());
+    }
+    Ok((close_returned_at + NATIVE_WORKER_READY_LIMIT).min(terminal_deadline))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_worker_still_live_after_reader_fault(
+    request: &Request<'_>,
+    state_root: &Path,
+    database: &Connection,
+    rex: &RexCliTransport,
+    window: &TicketWindow,
+    context: &NativePostFaultContext<'_>,
+    generation: u64,
+    session_id: &str,
+    control_dir: &Path,
+    binding: &rex_projects::run_step_spool::RunFamilyBinding,
+    wrapper_pid: u32,
+    wrapper_start: &str,
+    provider_pid: u32,
+    provider_start: &str,
+    sleep_pid: u32,
+    sleep_start: &str,
+) -> Result<(), String> {
+    let fault = context
+        .reader_fault
+        .as_ref()
+        .ok_or("post-fault Worker verification lacks reader fault evidence")?;
+    let expected_controller_pid = fault["controller_pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .ok_or("reader fault evidence omitted controller PID")?;
+    let expected_controller_start = fault["controller_start_identity"]
+        .as_str()
+        .ok_or("reader fault evidence omitted controller birth identity")?;
+    let status = product(request, state_root, &["status", "--json"])?;
+    let dashboard = product(request, state_root, &["dashboard", "--json"])?;
+    require_success("verify controller after Rex reader fault", &status)?;
+    require_success("verify Worker after Rex reader fault", &dashboard)?;
+    let status = json_stdout(&status);
+    let dashboard = json_stdout(&dashboard);
+    if status.pointer("/owner/active") != Some(&Value::Bool(true))
+        || status.pointer("/owner/generation").and_then(Value::as_u64) != Some(generation)
+        || !dashboard_worker(&dashboard, context.run_id).is_some_and(|agent| {
+            agent["state"] == "running"
+                && agent["rex_session_id"] == session_id
+                && agent["rex_window_id"] == window.window_id
+                && agent["rex_block_id"] == context.block_id
+        })
+    {
+        return Err("controller or exact Worker state changed after the Rex reader fault".into());
+    }
+    let recovery = recovery_state(database, context.run_id, context.block_id)?;
+    if recovery.generation != generation
+        || recovery.reservation_epoch != context.epoch
+        || recovery.disposition != "live"
+        || recovery.state != "running"
+        || recovery.event_received
+    {
+        return Err("Worker run or live reservation changed after the Rex reader fault".into());
+    }
+    let current = inspect_process_table()
+        .map_err(|error| format!("verify Worker process family after reader fault: {error:?}"))?;
+    let controller = runtime_owner_projection_matches(request, state_root, generation)?;
+    if controller.pid != expected_controller_pid
+        || controller.start_identity != expected_controller_start
+    {
+        return Err(
+            "Worker recovery moved to a different controller after the reader fault".into(),
+        );
+    }
+    verify_public_controller_status(request, state_root, generation, &controller)?;
+    if !exact_process_identities_are_live(
+        &[
+            (wrapper_pid, wrapper_start),
+            (provider_pid, provider_start),
+            (sleep_pid, sleep_start),
+        ],
+        &current,
+    ) {
+        return Err(
+            "Worker wrapper, provider, or foreground process exited after the Rex reader fault"
+                .into(),
+        );
+    }
+    let family = RunStepSpool::open(control_dir)
+        .map_err(|error| format!("reopen Worker run-step spool after reader fault: {error}"))?
+        .read_run_family_record()
+        .map_err(|error| format!("read Worker family after Rex reader fault: {error}"))?
+        .ok_or("Worker process-family receipt disappeared after reader fault")?;
+    if &family.binding != binding
+        || family.coverage != RunFamilyCoverage::Observing
+        || family.wrapper_process.pid != wrapper_pid
+        || family.wrapper_process.start_identity != wrapper_start
+        || family.provider_root.pid != provider_pid
+        || family.provider_root.start_identity != provider_start
+    {
+        return Err("Worker family receipt changed after the Rex reader fault".into());
+    }
+    if !rex
+        .agent_block_is_present(window, context.run_id, context.block_id)
+        .map_err(|error| format!("verify Worker block after reader fault: {error}"))?
+    {
+        return Err("exact Worker block disappeared before the one allowed close".into());
+    }
+    let process_table = inspect_process_table()
+        .map_err(|error| format!("recheck event reader before block close: {error:?}"))?;
+    if owned_events_reader(
+        request,
+        &controller,
+        request.rex_server,
+        session_id,
+        &process_table,
+    )?
+    .is_some()
+    {
+        return Err("replacement event reader appeared before exact block close".into());
+    }
+    Ok(())
+}
+
+fn exact_process_identities_are_live(
+    expected: &[(u32, &str)],
+    current: &[ProcessIdentity],
+) -> bool {
+    expected.iter().all(|(pid, start)| {
+        current.iter().any(|process| {
+            process.pid == *pid
+                && process.start_identity == *start
+                && process.quality == ProcessIdentityQuality::KernelBirthToken
+        })
+    })
+}
+
 struct NativePostFaultContext<'a> {
     run_id: &'a str,
     epoch: u64,
@@ -5404,19 +6162,27 @@ struct NativePostFaultContext<'a> {
     slot_pool: &'a str,
     slot_index: u64,
     pre_close_process_identities: &'a [Value],
+    reader_fault: Option<Value>,
 }
 
+#[derive(Debug)]
 enum NativeBlockCloseOutcome {
     BlockAbsent,
     DeadlineExpired,
+    ClosedAfterDeadline,
     Closed,
 }
 
 fn close_native_worker_block_before_deadline(
     deadline: Instant,
+    before_close: impl FnOnce() -> Result<(), String>,
     is_present: impl FnOnce() -> Result<bool, String>,
     close: impl FnOnce() -> Result<(), String>,
 ) -> Result<NativeBlockCloseOutcome, String> {
+    if Instant::now() >= deadline {
+        return Ok(NativeBlockCloseOutcome::DeadlineExpired);
+    }
+    before_close()?;
     if !is_present()? {
         return Ok(NativeBlockCloseOutcome::BlockAbsent);
     }
@@ -5424,7 +6190,11 @@ fn close_native_worker_block_before_deadline(
         return Ok(NativeBlockCloseOutcome::DeadlineExpired);
     }
     close()?;
-    Ok(NativeBlockCloseOutcome::Closed)
+    Ok(if Instant::now() > deadline {
+        NativeBlockCloseOutcome::ClosedAfterDeadline
+    } else {
+        NativeBlockCloseOutcome::Closed
+    })
 }
 
 fn native_post_fault_report(
@@ -5440,6 +6210,7 @@ fn native_post_fault_report(
         slot_pool,
         slot_index,
         pre_close_process_identities,
+        reader_fault,
     } = context;
     let mut observation_errors = initial_errors.to_vec();
     let facts = match native_lifecycle_facts(database, run_id, *epoch, block_id) {
@@ -5529,6 +6300,7 @@ fn native_post_fault_report(
         "pre_close_process_identities":pre_close_process_identities,
         "local_family_absent":local_family_absent,
         "fault_injected":true,
+        "reader_fault":reader_fault,
         "reason":observation_errors.first(),
         "status":if observation_errors.is_empty() {"observing"} else {"incomplete"},
         "observation_errors":observation_errors
@@ -5559,7 +6331,16 @@ fn native_terminal_proof_complete(
     run_state: Option<&str>,
     launch_state: Option<&str>,
 ) -> bool {
-    facts.event_received
+    native_terminal_proof_complete_for_event(facts, run_state, launch_state, true)
+}
+
+fn native_terminal_proof_complete_for_event(
+    facts: &NativeLifecycleFacts,
+    run_state: Option<&str>,
+    launch_state: Option<&str>,
+    expected_event_received: bool,
+) -> bool {
+    facts.event_received == expected_event_received
         && facts.exit_confirmed
         && facts.exit_detail.as_ref().is_some_and(|detail| {
             detail["process_tree_absent"] == true
@@ -5775,6 +6556,20 @@ mod tests {
             parse_acceptance_stage(Some(NATIVE_WORKER_BLOCK_LOSS_STAGE.into())).unwrap(),
             Some(NATIVE_WORKER_BLOCK_LOSS_STAGE.into())
         );
+        assert_eq!(
+            parse_acceptance_stage(Some(NATIVE_WORKER_MISSED_EVENT_BLOCK_LOSS_STAGE.into()))
+                .unwrap(),
+            Some(NATIVE_WORKER_MISSED_EVENT_BLOCK_LOSS_STAGE.into())
+        );
+        assert_eq!(
+            qualification_roles_for_stage(Some(NATIVE_WORKER_MISSED_EVENT_BLOCK_LOSS_STAGE)),
+            &["planner", "worker", "supervisor", "coordinator"]
+        );
+        assert!(!bounded_stage_contract_valid(
+            Some(NATIVE_WORKER_MISSED_EVENT_BLOCK_LOSS_STAGE),
+            true,
+            false
+        ));
         assert!(parse_acceptance_stage(Some("unknown-stage".into())).is_err());
     }
 
@@ -5839,6 +6634,27 @@ mod tests {
             &facts,
             Some("cancelled"),
             Some("cancelled")
+        ));
+        let missed_event_facts = NativeLifecycleFacts {
+            event_received: false,
+            process_survived: facts.process_survived.clone(),
+            exit_confirmed: facts.exit_confirmed,
+            exit_detail: facts.exit_detail.clone(),
+            exit_proof_digest: facts.exit_proof_digest.clone(),
+            slot_released: facts.slot_released,
+            slot_release_digest: facts.slot_release_digest.clone(),
+        };
+        assert!(native_terminal_proof_complete_for_event(
+            &missed_event_facts,
+            Some("cancelled"),
+            Some("cancelled"),
+            false
+        ));
+        assert!(!native_terminal_proof_complete_for_event(
+            &facts,
+            Some("cancelled"),
+            Some("cancelled"),
+            false
         ));
         assert_eq!(
             facts.process_survived.as_ref().unwrap()["surviving_process_count"],
@@ -6130,9 +6946,14 @@ mod tests {
                 "live_process_identities":[family.provider_root],
             });
             assert!(
-                observe_native_worker_block_loss(&request, &state_root, &invalid_worker)
-                    .unwrap_err()
-                    .contains("read validated native Worker run-family record")
+                observe_native_worker_block_loss(
+                    &request,
+                    &state_root,
+                    &invalid_worker,
+                    NativeBlockLossScenario::DeliveredEvent,
+                )
+                .unwrap_err()
+                .contains("read validated native Worker run-family record")
             );
             assert!(
                 !closed_marker.exists(),
@@ -6175,7 +6996,12 @@ mod tests {
             sleep
         });
 
-        let result = observe_native_worker_block_loss(&request, &state_root, &worker);
+        let result = observe_native_worker_block_loss(
+            &request,
+            &state_root,
+            &worker,
+            NativeBlockLossScenario::DeliveredEvent,
+        );
         if !closed_marker.exists() {
             fs::write(fixture.join("stop-updater"), "").unwrap();
         }
@@ -6222,6 +7048,7 @@ mod tests {
             slot_pool: "agent",
             slot_index: 1,
             pre_close_process_identities: &[],
+            reader_fault: None,
         };
         let (_, timeout_report) =
             native_post_fault_report(&report_db, &report_context, Some(true), &[]);
@@ -6275,6 +7102,7 @@ mod tests {
         let mut close_called = false;
         let outcome = close_native_worker_block_before_deadline(
             deadline,
+            || Ok(()),
             || {
                 std::thread::sleep(Duration::from_millis(20));
                 Ok(true)
@@ -6290,6 +7118,119 @@ mod tests {
     }
 
     #[test]
+    fn native_block_close_stops_when_worker_identity_disappears_before_close() {
+        let mut close_called = false;
+        let expected = [(11, "wrapper"), (12, "provider"), (13, "sleep")];
+        let current = vec![
+            fixture_process_identity(11, "wrapper"),
+            fixture_process_identity(12, "provider"),
+        ];
+        let outcome = close_native_worker_block_before_deadline(
+            Instant::now() + Duration::from_secs(1),
+            || {
+                exact_process_identities_are_live(&expected, &current)
+                    .then_some(())
+                    .ok_or_else(|| {
+                        "Worker provider or foreground birth identity disappeared".into()
+                    })
+            },
+            || Ok(true),
+            || {
+                close_called = true;
+                Ok(())
+            },
+        );
+        assert_eq!(
+            outcome.unwrap_err(),
+            "Worker provider or foreground birth identity disappeared"
+        );
+        assert!(!close_called, "a stale Worker block must not be closed");
+    }
+
+    fn fixture_process_identity(pid: u32, start_identity: &str) -> ProcessIdentity {
+        ProcessIdentity {
+            pid,
+            parent_pid: 1,
+            process_group_id: 1,
+            start_identity: start_identity.into(),
+            command: "fixture".into(),
+            quality: ProcessIdentityQuality::KernelBirthToken,
+        }
+    }
+
+    #[test]
+    fn native_block_close_records_when_the_close_call_returns_after_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(5);
+        let mut close_called = false;
+        let outcome = close_native_worker_block_before_deadline(
+            deadline,
+            || Ok(()),
+            || Ok(true),
+            || {
+                close_called = true;
+                std::thread::sleep(Duration::from_millis(10));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(close_called);
+        assert!(matches!(
+            outcome,
+            NativeBlockCloseOutcome::ClosedAfterDeadline
+        ));
+    }
+
+    #[test]
+    fn replacement_reader_wait_accepts_a_delayed_reader_after_the_close_gap() {
+        let fault_at = Instant::now();
+        let close_deadline = fault_at + Duration::from_secs(5);
+        let close_returned_at = fault_at + Duration::from_secs(1);
+        let replacement_ready_at = fault_at + Duration::from_millis(5_800);
+        let terminal_deadline = fault_at + NATIVE_WORKER_TERMINAL_LIMIT;
+        let replacement_deadline =
+            replacement_reader_wait_deadline(close_deadline, close_returned_at, terminal_deadline)
+                .unwrap();
+        assert!(replacement_ready_at > close_deadline);
+        assert!(replacement_ready_at < replacement_deadline);
+        assert_eq!(
+            replacement_deadline,
+            close_returned_at + NATIVE_WORKER_READY_LIMIT
+        );
+        assert!(
+            replacement_reader_wait_deadline(close_deadline, close_deadline, terminal_deadline)
+                .is_err()
+        );
+        let fake_now = std::cell::Cell::new(close_returned_at);
+        wait_for_condition_before(
+            replacement_deadline,
+            Duration::from_millis(20),
+            || fake_now.get(),
+            |interval| fake_now.set(fake_now.get() + interval),
+            || Ok(fake_now.get() >= replacement_ready_at),
+            "replacement reader was not observed within the readiness budget",
+        )
+        .unwrap();
+        assert!(fake_now.get() >= replacement_ready_at);
+
+        let late_probe_now = std::cell::Cell::new(close_returned_at);
+        assert_eq!(
+            wait_for_condition_before(
+                replacement_deadline,
+                Duration::from_millis(20),
+                || late_probe_now.get(),
+                |interval| late_probe_now.set(late_probe_now.get() + interval),
+                || {
+                    late_probe_now.set(replacement_deadline + Duration::from_millis(1));
+                    Ok(true)
+                },
+                "replacement reader observation exceeded the readiness budget",
+            )
+            .unwrap_err(),
+            "replacement reader observation exceeded the readiness budget"
+        );
+    }
+
+    #[test]
     fn native_post_fault_report_keeps_required_facts_when_state_database_is_unavailable() {
         let database = Connection::open_in_memory().unwrap();
         let context = NativePostFaultContext {
@@ -6299,6 +7240,7 @@ mod tests {
             slot_pool: "agent",
             slot_index: 0,
             pre_close_process_identities: &[],
+            reader_fault: None,
         };
         let (_, report) = native_post_fault_report(&database, &context, None, &[]);
         assert_eq!(report["status"], "incomplete");
@@ -6650,6 +7592,11 @@ mod tests {
         ));
         assert!(bounded_stage_contract_valid(
             Some(NATIVE_WORKER_BLOCK_LOSS_STAGE),
+            true,
+            true
+        ));
+        assert!(bounded_stage_contract_valid(
+            Some(NATIVE_WORKER_MISSED_EVENT_BLOCK_LOSS_STAGE),
             true,
             true
         ));
