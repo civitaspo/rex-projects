@@ -6313,6 +6313,7 @@ mod tests {
                 instruction_digest: digest_serialized(&snapshot_files),
                 profile_config_json,
                 instruction_files: snapshot_files,
+                skill_trees: BTreeMap::new(),
             }
         };
         let baseline = make_snapshot(false, "base");

@@ -58,7 +58,7 @@ impl InlineFixtureV1 {
         let mut total = 0usize;
         let mut paths = std::collections::BTreeSet::new();
         for (path, contents) in &self.files {
-            if !valid_relative_path(path)
+            if !valid_trial_relative_path(path)
                 || path
                     .split('/')
                     .any(|part| part.eq_ignore_ascii_case(".git"))
@@ -209,6 +209,141 @@ pub struct TrialProfileSnapshot {
     pub profile_config_json: String,
     /// Exact profile instruction bytes loaded by the host, keyed by safe relative path.
     pub instruction_files: BTreeMap<String, Vec<u8>>,
+    /// Exact selected skill trees captured from the applied configuration manifest.
+    /// Empty is omitted to preserve schema-1 authorization and capsule digests.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub skill_trees: BTreeMap<String, FrozenTrialSkillTree>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenTrialSkillTree {
+    pub files: BTreeMap<String, String>,
+}
+
+/// Stable safe identity for a configured skill root, independent of its workspace path.
+pub fn trial_skill_root_key(configured_root: &str) -> Result<String, String> {
+    if configured_root.is_empty() || configured_root.len() > 4096 || configured_root.contains('\0')
+    {
+        return Err("configured skill root is malformed".into());
+    }
+    let digest = content_digest(configured_root.as_bytes())?;
+    Ok(format!("skill-{}", &digest.as_str()[..24]))
+}
+
+/// Compose the immutable original fixture and frozen skill payload for one provider workspace.
+/// The original fixture digest stays authoritative; the capsule binds this deterministic result.
+pub fn trial_workspace_seed(
+    profile: &TrialProfileSnapshot,
+    original: &InlineFixtureV1,
+) -> Result<InlineFixtureV1, String> {
+    original.validate()?;
+    validate_trial_profile_snapshot(profile)?;
+    let typed: crate::config::Profile =
+        crate::protocol::parse_unique(profile.profile_config_json.as_bytes())?;
+    let provider_root = match typed.adapter {
+        crate::domain::types::AgentAdapter::Codex => ".agents/skills",
+        crate::domain::types::AgentAdapter::ClaudeCode => ".claude/skills",
+    };
+    let mut combined = original.clone();
+    let provider_config_dir = provider_root.split('/').next().unwrap_or(provider_root);
+    let provider_skill_dir = provider_root.split('/').nth(1).unwrap_or("skills");
+    if !profile.skill_trees.is_empty()
+        && original.files.keys().any(|existing| {
+            let mut parts = existing.split('/');
+            parts
+                .next()
+                .is_some_and(|part| part.eq_ignore_ascii_case(provider_config_dir))
+                && parts
+                    .next()
+                    .is_none_or(|part| part.eq_ignore_ascii_case(provider_skill_dir))
+        })
+    {
+        return Err("trial fixture collides with the provider skill directory".into());
+    }
+    for (root_key, tree) in &profile.skill_trees {
+        for (relative, contents) in &tree.files {
+            let target = format!("{provider_root}/{root_key}/{relative}");
+            if combined
+                .files
+                .keys()
+                .any(|existing| workspace_paths_collide(existing, &target))
+            {
+                return Err(
+                    "frozen trial skill files collide with the fixture or each other".into(),
+                );
+            }
+            if combined.files.insert(target, contents.clone()).is_some() {
+                return Err("frozen trial skill files collide with the fixture".into());
+            }
+        }
+    }
+    combined.validate()?;
+    Ok(combined)
+}
+
+fn workspace_paths_collide(left: &str, right: &str) -> bool {
+    let left = left.to_lowercase();
+    let right = right.to_lowercase();
+    left == right
+        || left.starts_with(&format!("{right}/"))
+        || right.starts_with(&format!("{left}/"))
+}
+
+pub(crate) fn validate_trial_profile_snapshot(
+    snapshot: &TrialProfileSnapshot,
+) -> Result<(), String> {
+    let profile: crate::config::Profile =
+        crate::protocol::parse_unique(snapshot.profile_config_json.as_bytes())?;
+    if crate::store::canonical_json(&profile)? != snapshot.profile_config_json
+        || crate::store::agent_profile_digest(&profile)? != snapshot.profile_digest
+        || digest_serialized(&snapshot.instruction_files)? != snapshot.instruction_digest
+    {
+        return Err("frozen profile snapshot identity is invalid".into());
+    }
+    let expected = profile
+        .skill_paths
+        .iter()
+        .map(|path| trial_skill_root_key(path))
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+    if expected.len() != profile.skill_paths.len()
+        || expected
+            != snapshot
+                .skill_trees
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+    {
+        return Err("frozen skill roots do not match the selected profile".into());
+    }
+    let mut total = 0usize;
+    let mut count = 0usize;
+    for tree in snapshot.skill_trees.values() {
+        if !tree.files.contains_key("SKILL.md") {
+            return Err("each selected trial skill directory must contain SKILL.md".into());
+        }
+        for (path, contents) in &tree.files {
+            if !valid_trial_relative_path(path)
+                || path
+                    .split('/')
+                    .any(|part| part.eq_ignore_ascii_case(".git"))
+                || path
+                    .split('/')
+                    .any(|part| part.eq_ignore_ascii_case("rex-projects-control"))
+            {
+                return Err("frozen skill tree contains a forbidden or malformed path".into());
+            }
+            count = count.checked_add(1).ok_or("skill file count overflow")?;
+            total = total
+                .checked_add(path.len())
+                .and_then(|sum| sum.checked_add(contents.len()))
+                .ok_or("skill byte count overflow")?;
+        }
+    }
+    if count > INLINE_FIXTURE_MAX_FILES || total > INLINE_FIXTURE_MAX_BYTES {
+        return Err("frozen trial skills exceed inline fixture bounds".into());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -541,11 +676,12 @@ impl ProfileTrialAuthorization {
         if total_input_bytes > 256 * 1024 {
             return Err("frozen trial input matrix exceeds its aggregate byte limit".into());
         }
-        let total_fixture_bytes = self.inputs.iter().try_fold(0usize, |total, input| {
-            input.fixture_seed.validate()?;
-            let bytes =
-                input
-                    .fixture_seed
+        let mut combined_fixture_totals = Vec::new();
+        for profile in [&self.baseline, &self.candidate] {
+            let total = self.inputs.iter().try_fold(0usize, |total, input| {
+                input.fixture_seed.validate()?;
+                let combined = trial_workspace_seed(profile, &input.fixture_seed)?;
+                let bytes = combined
                     .files
                     .iter()
                     .try_fold(0usize, |sum, (path, contents)| {
@@ -553,11 +689,18 @@ impl ProfileTrialAuthorization {
                             .and_then(|sum| sum.checked_add(contents.len()))
                             .ok_or_else(|| "trial fixture matrix byte count overflow".to_owned())
                     })?;
-            total
-                .checked_add(bytes)
-                .ok_or_else(|| "trial fixture matrix byte count overflow".to_owned())
-        })?;
-        if total_fixture_bytes > INLINE_FIXTURE_MATRIX_MAX_BYTES {
+                total
+                    .checked_add(bytes)
+                    .ok_or_else(|| "trial fixture matrix byte count overflow".to_owned())
+            })?;
+            combined_fixture_totals.push(total);
+        }
+        if combined_fixture_totals
+            .into_iter()
+            .max()
+            .unwrap_or_default()
+            > INLINE_FIXTURE_MATRIX_MAX_BYTES
+        {
             return Err("frozen trial fixture matrix exceeds the 512 KiB reviewable limit".into());
         }
         let total_evaluator_bytes = self.inputs.iter().try_fold(0usize, |total, input| {
@@ -666,7 +809,7 @@ impl ProfileTrialAuthorization {
                 || profile
                     .instruction_files
                     .keys()
-                    .any(|path| !valid_relative_path(path))
+                    .any(|path| !valid_trial_relative_path(path))
                 || crate::store::canonical_json(&typed_profile)? != profile.profile_config_json
                 || crate::store::agent_profile_digest(&typed_profile)? != profile.profile_digest
                 || digest_serialized(&profile.instruction_files)? != profile.instruction_digest
@@ -674,6 +817,12 @@ impl ProfileTrialAuthorization {
                 return Err(
                     "frozen profile exceeds size or path limits or has mismatched digests".into(),
                 );
+            }
+            validate_trial_profile_snapshot(profile)?;
+        }
+        for input in &self.inputs {
+            for profile in [&self.baseline, &self.candidate] {
+                trial_workspace_seed(profile, &input.fixture_seed)?;
             }
         }
         validate_candidate_profile_changes(&self.baseline, &self.candidate)?;
@@ -896,6 +1045,8 @@ impl ProfileTrialLaunchCapsule {
                 .map(Vec::len)
                 .sum::<usize>()
                 > MAX_TRIAL_INSTRUCTION_BYTES
+            || validate_trial_profile_snapshot(&self.profile).is_err()
+            || trial_workspace_seed(&self.profile, &self.fixture_seed).is_err()
         {
             return Err("profile trial launch capsule is invalid or exceeds its bounds".into());
         }
@@ -1161,6 +1312,9 @@ fn validate_candidate_profile_changes(
     baseline: &TrialProfileSnapshot,
     candidate: &TrialProfileSnapshot,
 ) -> Result<(), String> {
+    if baseline.skill_trees != candidate.skill_trees {
+        return Err("trial candidate may not change selected skill content".into());
+    }
     let mut base: serde_json::Value =
         crate::protocol::parse_unique(baseline.profile_config_json.as_bytes())?;
     let mut proposed: serde_json::Value =
@@ -1203,7 +1357,7 @@ fn valid_token(value: &str, max: usize) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
 }
 
-fn valid_relative_path(value: &str) -> bool {
+pub(crate) fn valid_trial_relative_path(value: &str) -> bool {
     !value.is_empty()
         && !value.starts_with('/')
         && !(value.len() >= 2
@@ -1263,6 +1417,7 @@ mod tests {
             instruction_digest: digest_serialized(&files).unwrap(),
             profile_config_json,
             instruction_files: files,
+            skill_trees: BTreeMap::new(),
         }
     }
 
@@ -1322,6 +1477,131 @@ mod tests {
             max_attempts_per_side: 1,
             expires_at_unix: 100,
         }
+    }
+
+    #[test]
+    fn schema1_empty_skill_wire_and_authorization_identity_match_legacy_fixtures() {
+        const LEGACY_SNAPSHOT_JSON: &str = r#"{"profile_id":"worker","profile_digest":"f383a6795ebe17f33f0640e9dc68946cbeb75d3cf0fb0563a8c59f7003f1fd39","instruction_digest":"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","profile_config_json":"{\"adapter\":\"codex\",\"command\":[\"agent\"],\"commit_mode\":\"auto\",\"description\":\"base\",\"effort\":\"low\",\"instruction_files\":[],\"learned_guidance\":null,\"model\":\"fixture-model\",\"options\":null,\"skill_paths\":[],\"turn_timeout_seconds\":30}","instruction_files":{}}"#;
+        let snapshot: TrialProfileSnapshot = serde_json::from_str(LEGACY_SNAPSHOT_JSON).unwrap();
+        assert_eq!(
+            serde_json::to_string(&snapshot).unwrap(),
+            LEGACY_SNAPSHOT_JSON
+        );
+        assert!(snapshot.skill_trees.is_empty());
+        assert_eq!(
+            digest_serialized(&snapshot).unwrap().as_str(),
+            "df62d51e69193b8a33c9ea0594db6c595b50ae908c12bbdf243bf12b49eb0da6"
+        );
+        let authorization = authorization();
+        let authorization_wire = serde_json::to_value(&authorization).unwrap();
+        assert!(authorization_wire["baseline"].get("skill_trees").is_none());
+        assert!(authorization_wire["candidate"].get("skill_trees").is_none());
+        let decoded: ProfileTrialAuthorization =
+            serde_json::from_value(authorization_wire).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(
+            authorization.digest().unwrap().as_str(),
+            "c4cc7df54edfa5f4734309657a8cc673e5dfd399d645051a700dfa39d57acf20"
+        );
+    }
+
+    fn snapshot_with_skills(adapter: &str) -> TrialProfileSnapshot {
+        let paths = vec!["skills/alpha".to_owned(), "skills/beta".to_owned()];
+        let config = serde_json::json!({
+            "adapter": adapter,
+            "command": ["agent"],
+            "description": "profile",
+            "model": "fixture-model",
+            "effort": "low",
+            "turn_timeout_seconds": 30,
+            "instruction_files": [],
+            "skill_paths": paths,
+            "commit_mode": "auto",
+            "learned_guidance": null,
+            "options": null
+        });
+        let profile: crate::config::Profile = serde_json::from_value(config).unwrap();
+        let files = BTreeMap::new();
+        let profile_config_json = crate::store::canonical_json(&profile).unwrap();
+        let skill_trees = profile
+            .skill_paths
+            .iter()
+            .map(|path| {
+                (
+                    super::trial_skill_root_key(path).unwrap(),
+                    super::FrozenTrialSkillTree {
+                        files: BTreeMap::from([
+                            ("SKILL.md".into(), format!("content for {path}")),
+                            ("references/details.md".into(), "nested reference".into()),
+                        ]),
+                    },
+                )
+            })
+            .collect();
+        TrialProfileSnapshot {
+            profile_id: ProfileId::parse("worker").unwrap(),
+            profile_digest: crate::store::agent_profile_digest(&profile).unwrap(),
+            instruction_digest: digest_serialized(&files).unwrap(),
+            profile_config_json,
+            instruction_files: files,
+            skill_trees,
+        }
+    }
+
+    #[test]
+    fn frozen_skill_trees_compose_per_provider_without_overwriting_fixture_files() {
+        let empty_profile = snapshot(None, "base");
+        let legacy_provider_path_fixture = super::InlineFixtureV1 {
+            schema_version: 1,
+            files: BTreeMap::from([(
+                ".agents/skills/user-skill/SKILL.md".into(),
+                "existing fixture content".into(),
+            )]),
+        };
+        assert_eq!(
+            super::trial_workspace_seed(&empty_profile, &legacy_provider_path_fixture).unwrap(),
+            legacy_provider_path_fixture
+        );
+        let fixture = super::InlineFixtureV1::empty();
+        for (adapter, provider_root) in [
+            ("codex", ".agents/skills"),
+            ("claude_code", ".claude/skills"),
+        ] {
+            let profile = snapshot_with_skills(adapter);
+            let composed = super::trial_workspace_seed(&profile, &fixture).unwrap();
+            assert_eq!(composed.files.len(), 4);
+            for (root_key, tree) in &profile.skill_trees {
+                for (relative, contents) in &tree.files {
+                    assert_eq!(
+                        composed.files[&format!("{provider_root}/{root_key}/{relative}")],
+                        *contents
+                    );
+                }
+            }
+        }
+        let profile = snapshot_with_skills("codex");
+        let mut colliding_fixture = super::InlineFixtureV1::empty();
+        colliding_fixture
+            .files
+            .insert(".Agents/skills/user/SKILL.md".into(), "preexisting".into());
+        assert!(
+            super::trial_workspace_seed(&profile, &colliding_fixture)
+                .unwrap_err()
+                .contains("collides")
+        );
+        let mut changed_candidate = snapshot_with_skills("codex");
+        let changed_tree = changed_candidate.skill_trees.values_mut().next().unwrap();
+        changed_tree
+            .files
+            .insert("SKILL.md".into(), "changed candidate skill".into());
+        assert!(
+            super::validate_candidate_profile_changes(
+                &snapshot_with_skills("codex"),
+                &changed_candidate,
+            )
+            .unwrap_err()
+            .contains("may not change selected skill content")
+        );
     }
 
     #[test]
@@ -1544,5 +1824,13 @@ mod tests {
         assert_eq!(first.operation_id, resumed.operation_id);
         assert_eq!(first.attempt_id, resumed.attempt_id);
         assert!(first.effects_disabled);
+        assert_eq!(
+            first.digest().unwrap().as_str(),
+            "302226ef87ba482fc0beb8cf31ac01c94e1d44f95d83c597d9d3adee1ffc512a"
+        );
+        let capsule_json = serde_json::to_value(&first).unwrap();
+        assert!(capsule_json["profile"].get("skill_trees").is_none());
+        let decoded: ProfileTrialLaunchCapsule = serde_json::from_value(capsule_json).unwrap();
+        decoded.validate().unwrap();
     }
 }

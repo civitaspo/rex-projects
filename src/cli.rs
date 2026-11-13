@@ -2780,11 +2780,6 @@ fn stage_profile_trial_request(
         .map_err(|error| CliError::conflict(error.to_string()))?,
     )
     .map_err(|error| CliError::conflict(error.to_string()))?;
-    if !candidate_profile.skill_paths.is_empty() {
-        return Err(CliError::conflict(
-            "trial staging does not yet support candidate skill_paths",
-        ));
-    }
     let metadata: crate::learning::ProfileCandidateMetadata = crate::protocol::parse_unique(
         package
             .files
@@ -5168,6 +5163,25 @@ mod tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture");
         let config_root = temp.path().join("config");
         std::fs::create_dir_all(config_root.join("profiles")).unwrap();
+        let skill_root_a = config_root.join("external-skills/ops-a");
+        let skill_root_b = config_root.join("external-skills/ops-b");
+        std::fs::create_dir_all(skill_root_a.join("references")).unwrap();
+        std::fs::create_dir_all(&skill_root_b).unwrap();
+        std::fs::write(
+            skill_root_a.join("SKILL.md"),
+            "---\nname: frozen-a\ndescription: fixture skill\n---\nFROZEN_SKILL_BODY_MARKER\n",
+        )
+        .unwrap();
+        std::fs::write(
+            skill_root_a.join("references/checks.md"),
+            "FROZEN_NESTED_REFERENCE\n",
+        )
+        .unwrap();
+        std::fs::write(
+            skill_root_b.join("SKILL.md"),
+            "---\nname: frozen-b\ndescription: second fixture skill\n---\nSecond body.\n",
+        )
+        .unwrap();
         std::fs::copy(
             fixture_root.join("config.toml"),
             config_root.join("config.toml"),
@@ -5203,8 +5217,10 @@ mod tests {
             original_profile_config.replace(
                 "[options]",
                 &format!(
-                    "instruction_files = [\"aliases/instruction.md\", {:?}]\n\n[options]",
+                    "instruction_files = [\"aliases/instruction.md\", {:?}]\nskill_paths = [{:?}, {:?}]\n\n[options]",
                     canonical_alias.display().to_string(),
+                    skill_root_a.display().to_string(),
+                    skill_root_b.display().to_string(),
                 ),
             ),
         )
@@ -5300,6 +5316,7 @@ mod tests {
             repository_ids: BTreeSet::new(),
         });
         let mut files = BTreeMap::new();
+        let mut external_sources = BTreeMap::new();
         let root = config_root
             .join("profiles")
             .join(base_profile_id.as_str())
@@ -5321,8 +5338,142 @@ mod tests {
                         .into_owned();
                     files.insert(relative, source.contents.as_bytes().to_vec());
                 }
+                for skill_root in [&skill_root_a, &skill_root_b] {
+                    let canonical_skill_root = skill_root.canonicalize().unwrap();
+                    if let Ok(relative) = canonical_path.strip_prefix(&canonical_skill_root) {
+                        let relative = relative
+                            .to_str()
+                            .unwrap()
+                            .replace(std::path::MAIN_SEPARATOR, "/");
+                        let source_digest = source.sha256.as_str();
+                        let package_key = format!("external/{}/{relative}", &source_digest[..16]);
+                        external_sources.insert(source.canonical_path.clone(), package_key.clone());
+                        files.insert(package_key, source.contents.as_bytes().to_vec());
+                    }
+                }
             }
         }
+        files.insert(
+            "learned/trial.md".into(),
+            b"Use the narrow tested approach.".to_vec(),
+        );
+        let captured_skill_text = applied
+            .source_files
+            .iter()
+            .find(|source| {
+                source.canonical_path
+                    == skill_root_a
+                        .join("SKILL.md")
+                        .canonicalize()
+                        .unwrap()
+                        .display()
+                        .to_string()
+            })
+            .unwrap()
+            .contents
+            .clone();
+        let captured_nested_text = applied
+            .source_files
+            .iter()
+            .find(|source| {
+                source.canonical_path
+                    == skill_root_a
+                        .join("references/checks.md")
+                        .canonicalize()
+                        .unwrap()
+                        .display()
+                        .to_string()
+            })
+            .unwrap()
+            .contents
+            .clone();
+        std::fs::write(skill_root_a.join("SKILL.md"), "MUTATED_AFTER_APPLY\n").unwrap();
+        let frozen_candidate = crate::profile_trial_request::profile_snapshot(
+            &applied,
+            &candidate_profile_id,
+            &base_profile_id,
+            &candidate,
+            Some(&files),
+            Some(&external_sources),
+        )
+        .unwrap();
+        let skill_a_key =
+            crate::learning_trials::trial_skill_root_key(candidate.skill_paths.first().unwrap())
+                .unwrap();
+        assert_eq!(
+            frozen_candidate.skill_trees[&skill_a_key].files["SKILL.md"],
+            captured_skill_text
+        );
+        assert_eq!(
+            frozen_candidate.skill_trees[&skill_a_key].files["references/checks.md"],
+            captured_nested_text
+        );
+        assert_eq!(frozen_candidate.skill_trees.len(), 2);
+        let mut escaping_relative_root = candidate.clone();
+        escaping_relative_root.skill_paths = vec!["../../external-skills/ops-a".into()];
+        let escaping_error = crate::profile_trial_request::profile_snapshot(
+            &applied,
+            &candidate_profile_id,
+            &base_profile_id,
+            &escaping_relative_root,
+            Some(&files),
+            Some(&external_sources),
+        )
+        .unwrap_err();
+        assert!(
+            escaping_error.contains("escapes its captured profile directory"),
+            "{escaping_error}"
+        );
+        let mut unsupported_file_root = candidate.clone();
+        unsupported_file_root.skill_paths =
+            vec![skill_root_a.join("SKILL.md").display().to_string()];
+        assert!(
+            crate::profile_trial_request::profile_snapshot(
+                &applied,
+                &candidate_profile_id,
+                &base_profile_id,
+                &unsupported_file_root,
+                Some(&files),
+                Some(&external_sources),
+            )
+            .unwrap_err()
+            .contains("not a directory")
+        );
+        let mut substituted_package = files.clone();
+        let skill_source = applied
+            .source_files
+            .iter()
+            .find(|source| source.canonical_path.ends_with("/ops-a/SKILL.md"))
+            .unwrap();
+        let skill_package_path = external_sources[&skill_source.canonical_path].clone();
+        substituted_package.insert(skill_package_path, b"SUBSTITUTED\n".to_vec());
+        assert!(
+            crate::profile_trial_request::profile_snapshot(
+                &applied,
+                &candidate_profile_id,
+                &base_profile_id,
+                &candidate,
+                Some(&substituted_package),
+                Some(&external_sources),
+            )
+            .unwrap_err()
+            .contains("substituted selected skill")
+        );
+        let mut incomplete_mapping = external_sources.clone();
+        incomplete_mapping.remove(&skill_source.canonical_path);
+        assert!(
+            crate::profile_trial_request::profile_snapshot(
+                &applied,
+                &candidate_profile_id,
+                &base_profile_id,
+                &candidate,
+                Some(&files),
+                Some(&incomplete_mapping),
+            )
+            .unwrap_err()
+            .contains("no exact mapping")
+        );
+        std::fs::write(skill_root_a.join("SKILL.md"), &captured_skill_text).unwrap();
         files.insert(
             "learned/trial.md".into(),
             b"Use the narrow tested approach.".to_vec(),
@@ -5353,7 +5504,7 @@ mod tests {
             evaluation_criterion: "The exact candidate profile is reviewed.".into(),
             description: "Fixture trial candidate".into(),
             learned_guidance: "Use the narrow tested approach.".into(),
-            external_sources: BTreeMap::new(),
+            external_sources: external_sources.clone(),
         };
         files.insert(
             crate::learning::PROFILE_CANDIDATE_METADATA_PATH.into(),
@@ -5662,6 +5813,33 @@ mod tests {
         let auth: crate::learning_trials::ProfileTrialAuthorization =
             serde_json::from_str(&auth_json).unwrap();
         assert_eq!(request_id, auth.human_request_id.as_str());
+        let mut empty_skill_base = base.clone();
+        empty_skill_base.skill_paths.clear();
+        let mut empty_skill_candidate = candidate.clone();
+        empty_skill_candidate.skill_paths.clear();
+        let mut empty_skill_auth = auth.clone();
+        empty_skill_auth.baseline = crate::profile_trial_request::profile_snapshot(
+            &applied,
+            &base_profile_id,
+            &base_profile_id,
+            &empty_skill_base,
+            None,
+            None,
+        )
+        .unwrap();
+        empty_skill_auth.candidate = crate::profile_trial_request::profile_snapshot(
+            &applied,
+            &candidate_profile_id,
+            &base_profile_id,
+            &empty_skill_candidate,
+            Some(&files),
+            Some(&external_sources),
+        )
+        .unwrap();
+        empty_skill_auth.base_profile_digest = empty_skill_auth.baseline.profile_digest.clone();
+        assert!(empty_skill_auth.baseline.skill_trees.is_empty());
+        assert!(empty_skill_auth.candidate.skill_trees.is_empty());
+        empty_skill_auth.validate().unwrap();
         for (profile, required_paths) in [
             (
                 &auth.baseline,
@@ -5691,7 +5869,59 @@ mod tests {
                 profile.instruction_files["aliases/instruction.md"],
                 b"Alias-resolved frozen instruction.\n"
             );
+            assert!(profile.instruction_files.values().all(|bytes| {
+                !String::from_utf8_lossy(bytes).contains("FROZEN_SKILL_BODY_MARKER")
+            }));
         }
+        assert_eq!(auth.baseline.skill_trees, auth.candidate.skill_trees);
+        assert_eq!(auth.candidate.skill_trees.len(), 2);
+        let rendered_role_contract = crate::profile_trial_runtime::render_trial_role_contract(
+            role,
+            &candidate,
+            &auth.candidate,
+        )
+        .unwrap();
+        assert!(!rendered_role_contract.contains("FROZEN_SKILL_BODY_MARKER"));
+        assert!(rendered_role_contract.contains("Alias-resolved frozen instruction."));
+        let first_input = &auth.inputs[0];
+        let derived_seed = crate::learning_trials::trial_workspace_seed(
+            &auth.candidate,
+            &first_input.fixture_seed,
+        )
+        .unwrap();
+        let workspace_parent = temp.path().join("trial-workspace-parent");
+        std::fs::create_dir_all(&workspace_parent).unwrap();
+        let workspace = workspace_parent.join("workspace");
+        crate::trial_step::materialize_fixture_workspace(
+            &derived_seed,
+            &derived_seed.digest().unwrap(),
+            &workspace,
+        )
+        .unwrap();
+        let provider_root = match candidate.adapter {
+            crate::domain::types::AgentAdapter::Codex => ".agents/skills",
+            crate::domain::types::AgentAdapter::ClaudeCode => ".claude/skills",
+        };
+        assert_eq!(
+            std::fs::read_to_string(
+                workspace
+                    .join(provider_root)
+                    .join(&skill_a_key)
+                    .join("SKILL.md")
+            )
+            .unwrap(),
+            captured_skill_text
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                workspace
+                    .join(provider_root)
+                    .join(&skill_a_key)
+                    .join("references/checks.md")
+            )
+            .unwrap(),
+            captured_nested_text
+        );
         assert_eq!(
             auth.candidate.instruction_files["learned/trial.md"],
             b"Use the narrow tested approach."

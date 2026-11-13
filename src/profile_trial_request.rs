@@ -10,8 +10,8 @@ use crate::config::{AppliedConfig, Profile};
 use crate::domain::ids::{Digest, HumanRequestId, ProfileId, ProjectId, Revision};
 use crate::domain::types::Role;
 use crate::learning_trials::{
-    FrozenTrialInput, InlineFixtureV1, ProfileTrialAuthorization, TrialEvaluator, TrialPairSpec,
-    TrialProfileSnapshot,
+    FrozenTrialInput, FrozenTrialSkillTree, InlineFixtureV1, ProfileTrialAuthorization,
+    TrialEvaluator, TrialPairSpec, TrialProfileSnapshot,
 };
 
 const POLICY: &[u8] = b"rex-profile-trial-request-policy-v1\0pairs=10;distinct_inputs=5;attempts_per_side=1;approval_ttl_seconds=86400;fixture=inline_fixture_v1;evaluator=structured_assertions_v1";
@@ -144,9 +144,6 @@ pub fn profile_snapshot(
     package_files: Option<&BTreeMap<String, Vec<u8>>>,
     external_sources: Option<&BTreeMap<String, String>>,
 ) -> Result<TrialProfileSnapshot, String> {
-    if !profile.skill_paths.is_empty() {
-        return Err("profile trial requests do not support profiles with skill_paths until frozen skill delivery is available".into());
-    }
     let logical_root = std::path::PathBuf::from(&applied.source_root)
         .join("profiles")
         .join(source_profile_id.as_str());
@@ -253,13 +250,169 @@ pub fn profile_snapshot(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&files).map_err(|e| e.to_string())?)
     ))?;
-    Ok(TrialProfileSnapshot {
+    let skill_trees = freeze_skill_trees(
+        applied,
+        profile,
+        &canonical_root,
+        &logical_root,
+        package_files,
+        external_sources,
+    )?;
+    let snapshot = TrialProfileSnapshot {
         profile_id: profile_id.clone(),
         profile_digest,
         instruction_digest,
         profile_config_json: canonical_profile(profile)?,
         instruction_files: files,
-    })
+        skill_trees,
+    };
+    crate::learning_trials::validate_trial_profile_snapshot(&snapshot)?;
+    Ok(snapshot)
+}
+
+fn freeze_skill_trees(
+    applied: &AppliedConfig,
+    profile: &Profile,
+    canonical_profile_root: &std::path::Path,
+    logical_profile_root: &std::path::Path,
+    package_files: Option<&BTreeMap<String, Vec<u8>>>,
+    external_sources: Option<&BTreeMap<String, String>>,
+) -> Result<BTreeMap<String, FrozenTrialSkillTree>, String> {
+    let mut trees = BTreeMap::new();
+    let mut canonical_roots = BTreeSet::new();
+    for configured in &profile.skill_paths {
+        let configured_path = std::path::Path::new(configured);
+        let lexical_root = if configured_path.is_absolute() {
+            configured_path.to_path_buf()
+        } else {
+            canonical_profile_root.join(configured_path)
+        };
+        let lexical_root = normalize_absolute_lexical(&lexical_root)?;
+        let root_source = applied.source_files.iter().find(|source| {
+            matches!(source.kind, crate::config::SourceKind::Directory)
+                && (normalize_absolute_lexical(std::path::Path::new(&source.path)).ok().as_ref()
+                    == Some(&lexical_root)
+                    || normalize_absolute_lexical(
+                        std::path::Path::new(&source.canonical_path),
+                    )
+                    .ok()
+                    .as_ref()
+                        == Some(&lexical_root))
+        }).ok_or_else(|| format!("selected skill root `{configured}` is absent from the captured source manifest or is not a directory"))?;
+        let canonical_root = std::path::PathBuf::from(&root_source.canonical_path);
+        if !configured_path.is_absolute() && !canonical_root.starts_with(canonical_profile_root) {
+            return Err(format!(
+                "relative selected skill root `{configured}` escapes its captured profile directory"
+            ));
+        }
+        if !canonical_roots.insert(canonical_root.clone()) {
+            return Err("selected skill roots alias the same captured directory".into());
+        }
+        let mut files = BTreeMap::new();
+        for source in &applied.source_files {
+            if !matches!(source.kind, crate::config::SourceKind::File) {
+                continue;
+            }
+            let canonical = std::path::Path::new(&source.canonical_path);
+            let Ok(relative) = canonical.strip_prefix(&canonical_root) else {
+                continue;
+            };
+            if relative.as_os_str().is_empty() {
+                return Err(format!(
+                    "selected skill root `{configured}` is not a directory"
+                ));
+            }
+            let relative = relative
+                .to_str()
+                .ok_or("captured skill path is not UTF-8")?
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            if !crate::learning_trials::valid_trial_relative_path(&relative) {
+                return Err("captured skill path is unsafe".into());
+            }
+            let captured = source.contents.as_bytes();
+            if captured.len() as u64 != source.bytes
+                || Digest::parse(format!("{:x}", Sha256::digest(captured)))? != source.sha256
+            {
+                return Err(format!(
+                    "captured skill `{relative}` does not match its source manifest"
+                ));
+            }
+            let bytes = if let Some(package) = package_files {
+                let package_key = if let Some(external) =
+                    external_sources.and_then(|mapping| mapping.get(&source.canonical_path))
+                {
+                    external.clone()
+                } else {
+                    canonical
+                        .strip_prefix(canonical_profile_root)
+                        .or_else(|_| std::path::Path::new(&source.path).strip_prefix(logical_profile_root))
+                        .ok()
+                        .and_then(|path| path.to_str())
+                        .ok_or_else(|| format!("candidate package has no exact mapping for selected skill `{relative}`"))?
+                        .replace(std::path::MAIN_SEPARATOR, "/")
+                };
+                if !crate::learning_trials::valid_trial_relative_path(&package_key) {
+                    return Err(format!(
+                        "candidate package mapping for selected skill `{relative}` is unsafe"
+                    ));
+                }
+                let bytes = package.get(&package_key).ok_or_else(|| {
+                    format!("candidate package is missing selected skill `{relative}`")
+                })?;
+                if bytes.len() as u64 != source.bytes
+                    || Digest::parse(format!("{:x}", Sha256::digest(bytes)))? != source.sha256
+                {
+                    return Err(format!(
+                        "candidate package substituted selected skill `{relative}`"
+                    ));
+                }
+                bytes.clone()
+            } else {
+                captured.to_vec()
+            };
+            let contents = String::from_utf8(bytes)
+                .map_err(|_| format!("selected skill `{relative}` is not UTF-8"))?;
+            if files.insert(relative.clone(), contents).is_some() {
+                return Err(format!(
+                    "selected skill contains duplicate path `{relative}`"
+                ));
+            }
+        }
+        if !files.contains_key("SKILL.md") {
+            return Err(format!(
+                "selected skill `{configured}` must be a directory containing SKILL.md"
+            ));
+        }
+        let root_key = crate::learning_trials::trial_skill_root_key(configured)?;
+        if trees
+            .insert(root_key, FrozenTrialSkillTree { files })
+            .is_some()
+        {
+            return Err("selected skill roots have duplicate identities".into());
+        }
+    }
+    Ok(trees)
+}
+
+fn normalize_absolute_lexical(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("captured source root is not absolute".into());
+    }
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err("selected skill root traverses above its filesystem root".into());
+                }
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Ok(normalized)
 }
 
 pub fn make_authorization(
