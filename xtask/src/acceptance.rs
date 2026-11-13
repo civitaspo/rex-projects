@@ -5217,26 +5217,26 @@ fn observe_native_worker_block_loss(
                 json!({"status":"inconclusive","reason":"current process-family receipt did not match the ready Worker run and epoch","run_id":run_id,"reservation_epoch":epoch,"fault_injected":false}),
             );
         }
-        let sleep = family
+        let process_snapshot = inspect_process_table()
+            .map_err(|error| format!("inspect native Worker process family: {error:?}"))?;
+        let mut sleep = None;
+        for identity in family
             .process_tree
             .iter()
-            .find(|identity| identity.command == "sleep");
-        if let Some(sleep) = sleep {
-            let pid = sleep.pid;
-            let start = sleep.start_identity.as_str();
-            let has_kernel_identity = inspect_process_table()
-                .map_err(|error| format!("inspect native Worker process family: {error:?}"))?
-                .iter()
-                .any(|process| {
-                    process.pid == pid
-                        && process.start_identity == start
-                        && process.quality == ProcessIdentityQuality::KernelBirthToken
-                });
+            .filter(|identity| identity.command == "sleep")
+        {
+            if !process_snapshot.iter().any(|process| {
+                process.pid == identity.pid
+                    && process.start_identity == identity.start_identity
+                    && process.quality == ProcessIdentityQuality::KernelBirthToken
+            }) {
+                continue;
+            }
             let command = invoke(
                 Path::new("/bin/ps"),
                 &[
                     OsString::from("-p"),
-                    OsString::from(pid.to_string()),
+                    OsString::from(identity.pid.to_string()),
                     OsString::from("-o"),
                     OsString::from("command="),
                 ],
@@ -5246,35 +5246,37 @@ fn observe_native_worker_block_loss(
             )?;
             let command = String::from_utf8_lossy(&command.stdout);
             let argv = command.split_whitespace().collect::<Vec<_>>();
-            let command_matches =
-                matches!(argv.as_slice(), ["/bin/sleep", "300"] | ["sleep", "300"]);
-            if has_kernel_identity && command_matches {
-                let cursor = recovery_state(&database, run_id, block_id)?;
-                if cursor.generation != baseline.generation
-                    || cursor.reservation_epoch != epoch
-                    || cursor.disposition != "live"
-                    || cursor.state != "running"
-                {
-                    return Ok(
-                        json!({"status":"inconclusive","reason":"native Worker recovery cursor changed before block loss","run_id":run_id,"reservation_epoch":epoch,"fault_injected":false}),
-                    );
-                }
-                if observe_cursor_advance(&mut last_order, cursor.observation_order)? {
-                    advances += 1;
-                }
-                if advances == 2 {
-                    let sleep = serde_json::to_value(sleep).map_err(|error| {
-                        format!("serialize validated native Worker process: {error}")
-                    })?;
-                    let process_tree = serde_json::to_value(&family.process_tree)
-                        .map_err(|error| {
-                            format!("serialize validated native Worker process tree: {error}")
-                        })?
-                        .as_array()
-                        .cloned()
-                        .ok_or("validated native Worker process tree is not an array")?;
-                    break (sleep, process_tree);
-                }
+            if matches!(argv.as_slice(), ["/bin/sleep", "300"] | ["sleep", "300"]) {
+                sleep = Some(identity);
+                break;
+            }
+        }
+        if let Some(sleep) = sleep {
+            let cursor = recovery_state(&database, run_id, block_id)?;
+            if cursor.generation != baseline.generation
+                || cursor.reservation_epoch != epoch
+                || cursor.disposition != "live"
+                || cursor.state != "running"
+            {
+                return Ok(
+                    json!({"status":"inconclusive","reason":"native Worker recovery cursor changed before block loss","run_id":run_id,"reservation_epoch":epoch,"fault_injected":false}),
+                );
+            }
+            if observe_cursor_advance(&mut last_order, cursor.observation_order)? {
+                advances += 1;
+            }
+            if advances == 2 {
+                let sleep = serde_json::to_value(sleep).map_err(|error| {
+                    format!("serialize validated native Worker process: {error}")
+                })?;
+                let process_tree = serde_json::to_value(&family.process_tree)
+                    .map_err(|error| {
+                        format!("serialize validated native Worker process tree: {error}")
+                    })?
+                    .as_array()
+                    .cloned()
+                    .ok_or("validated native Worker process tree is not an array")?;
+                break (sleep, process_tree);
             }
         }
         std::thread::sleep(POLL_INTERVAL);
@@ -5286,6 +5288,14 @@ fn observe_native_worker_block_loss(
             }
         }
     }
+    let post_fault_context = NativePostFaultContext {
+        run_id,
+        epoch,
+        block_id,
+        slot_pool: &slot_pool,
+        slot_index,
+        pre_close_process_identities: &pre_close_process_identities,
+    };
     match close_native_worker_block_before_deadline(
         ready_deadline,
         || {
@@ -5309,19 +5319,13 @@ fn observe_native_worker_block_loss(
             );
         }
         Err(error) => {
-            return Ok(
-                json!({"status":"inconclusive","reason":error,"run_id":run_id,"reservation_epoch":epoch,"fault_injected":null}),
-            );
+            let (_, mut report) =
+                native_post_fault_report(&database, &post_fault_context, None, &[error]);
+            report["status"] = json!("incomplete");
+            report["fault_injected"] = Value::Null;
+            return Ok(report);
         }
     }
-    let post_fault_context = NativePostFaultContext {
-        run_id,
-        epoch,
-        block_id,
-        slot_pool: &slot_pool,
-        slot_index,
-        pre_close_process_identities: &pre_close_process_identities,
-    };
     let event_deadline = (Instant::now() + NATIVE_WORKER_READY_LIMIT).min(terminal_deadline);
     loop {
         let presence = rex.agent_block_is_present(&window, run_id, block_id);
@@ -5882,20 +5886,25 @@ mod tests {
         };
 
         let temporary = tempfile::tempdir().unwrap();
-        if std::env::var_os("REX_PROJECTS_NATIVE_BLOCK_LOSS_TEST_CHILD").is_none() {
-            let isolated_state = temporary.path().join("xdg-state");
-            fs::create_dir(&isolated_state).unwrap();
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "acceptance::tests::native_block_loss_acceptance_runs_through_rex_transport_and_lifecycle_storage",
-                ])
-                .env("REX_PROJECTS_NATIVE_BLOCK_LOSS_TEST_CHILD", "1")
-                .env("REX_PROJECTS_NATIVE_BLOCK_LOSS_TEST_ROOT", temporary.path())
-                .env("XDG_STATE_HOME", isolated_state)
-                .status()
-                .unwrap();
-            assert!(status.success());
+        let test_mode = std::env::var("REX_PROJECTS_NATIVE_BLOCK_LOSS_TEST_MODE").ok();
+        if test_mode.is_none() {
+            for mode in ["normal", "uncertain-close"] {
+                let mode_root = temporary.path().join(mode);
+                fs::create_dir(&mode_root).unwrap();
+                let isolated_state = mode_root.join("xdg-state");
+                fs::create_dir(&isolated_state).unwrap();
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "acceptance::tests::native_block_loss_acceptance_runs_through_rex_transport_and_lifecycle_storage",
+                    ])
+                    .env("REX_PROJECTS_NATIVE_BLOCK_LOSS_TEST_MODE", mode)
+                    .env("REX_PROJECTS_NATIVE_BLOCK_LOSS_TEST_ROOT", &mode_root)
+                    .env("XDG_STATE_HOME", isolated_state)
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "{mode} native block loss fixture failed");
+            }
             return;
         }
         let fixture =
@@ -6005,11 +6014,13 @@ mod tests {
         fs::write(
             &rex_script,
             format!(
-                "#!/bin/sh\ncase \"$*\" in\n  *\"whoami --json\"*) printf '%s\\n' '{{\"endpoint\":\"{endpoint}\",\"instance_id\":\"{instance_id}\",\"host_id\":\"host-test\",\"rex_version\":\"test\"}}' ;;\n  *\"api list --json\"*) printf '%s\\n' '{{\"methods\":{{\"session.view\":{{}},\"session.new_window\":{{}},\"session.new_split\":{{}},\"session.focus_block\":{{}},\"session.zoom_block\":{{}},\"block.close\":{{}}}}}}' ;;\n  *\"api call session.view\"*) : > {started:?}; if [ -f {closed:?} ]; then cat {absent:?}; else cat {view:?}; fi ;;\n  *\"api call block.close\"*) : > {closed:?}; printf '{{}}\\n' ;;\n  *) exit 3 ;;\nesac\n",
+                "#!/bin/sh\ncase \"$*\" in\n  *\"whoami --json\"*) if [ -f {closed:?} ] && [ \"{uncertain_mode}\" = true ]; then printf '%s\\n' '{{\"endpoint\":\"{endpoint}\",\"instance_id\":\"wrong-instance\",\"host_id\":\"host-test\",\"rex_version\":\"test\"}}'; else printf '%s\\n' '{{\"endpoint\":\"{endpoint}\",\"instance_id\":\"{instance_id}\",\"host_id\":\"host-test\",\"rex_version\":\"test\"}}'; fi ;;\n  *\"api list --json\"*) printf '%s\\n' '{{\"methods\":{{\"session.view\":{{}},\"session.new_window\":{{}},\"session.new_split\":{{}},\"session.focus_block\":{{}},\"session.zoom_block\":{{}},\"block.close\":{{}}}}}}' ;;\n  *\"api call session.view\"*) : > {started:?}; if [ -f {closed:?} ]; then cat {absent:?}; else cat {view:?}; fi ;;\n  *\"api call block.close\"*) : > {closed:?}; printf 'close\\n' >> {close_calls:?}; printf '{{}}\\n' ;;\n  *) exit 3 ;;\nesac\n",
                 started = start_marker.display().to_string(),
                 closed = closed_marker.display().to_string(),
+                close_calls = fixture.join("close-calls").display().to_string(),
                 absent = rex_absent_view.display().to_string(),
                 view = rex_view.display().to_string(),
+                uncertain_mode = (test_mode.as_deref() == Some("uncertain-close")),
             ),
         )
         .unwrap();
@@ -6046,7 +6057,10 @@ mod tests {
             wrapper_start_identity: current_identity.start_identity.clone(),
             rex_launch_anchor: None,
         };
-        let process_tree = vec![sleep_identity.clone()];
+        let mut dead_sleep_identity = sleep_identity.clone();
+        dead_sleep_identity.pid = sleep.id().saturating_add(1);
+        dead_sleep_identity.start_identity = "dead-test-birth-token".into();
+        let process_tree = vec![dead_sleep_identity, sleep_identity.clone()];
         let family = RunFamilyRecord {
             schema_version: 2,
             binding: binding.clone(),
@@ -6171,6 +6185,28 @@ mod tests {
         }
         let _ = sleep.wait();
         let proof = result.unwrap();
+        if test_mode.as_deref() == Some("uncertain-close") {
+            assert!(closed_marker.exists(), "the stub applied block.close");
+            assert_eq!(
+                fs::read_to_string(fixture.join("close-calls"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            assert_eq!(proof["status"], "incomplete", "{proof}");
+            assert_eq!(proof["fault_injected"], Value::Null, "{proof}");
+            assert_eq!(proof["public_block_absent"], Value::Null, "{proof}");
+            for fact in [
+                "event_received",
+                "process_survived",
+                "exit_confirmed",
+                "slot_released",
+            ] {
+                assert!(proof["lifecycle_facts"].get(fact).is_some(), "{proof}");
+            }
+            return;
+        }
         assert_eq!(proof["status"], "passed", "{proof}");
         assert_eq!(proof["lifecycle_facts"]["event_received"], true);
         assert!(proof["lifecycle_facts"]["process_survived"].is_object());
