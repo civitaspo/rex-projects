@@ -85,6 +85,43 @@ enum Command {
         #[command(subcommand)]
         command: KnowledgeCommand,
     },
+    Learning {
+        #[command(subcommand)]
+        command: LearningCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum LearningCommand {
+    Trial {
+        #[command(subcommand)]
+        command: TrialCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TrialCommand {
+    /// Stage one immutable profile-trial matrix for human approval.
+    Request {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        candidate: String,
+        #[arg(long)]
+        candidate_digest: String,
+        #[arg(long)]
+        request_key: String,
+        #[arg(long)]
+        matrix_file: PathBuf,
+    },
+}
+
+struct TrialRequestInput {
+    project: String,
+    candidate: String,
+    candidate_digest: String,
+    request_key: String,
+    matrix_file: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -684,6 +721,13 @@ pub fn run() -> Result<i32, CliError> {
             cli.config.as_deref(),
             cli.state_root.as_deref(),
             command,
+            json,
+        ),
+        Command::Learning { command } => learning_command(
+            cli.config.as_deref(),
+            cli.state_root.as_deref(),
+            command,
+            cli.rex_server.as_deref(),
             json,
         ),
     };
@@ -2561,6 +2605,523 @@ fn provider_command(
     }
 }
 
+fn learning_command(
+    config_path: Option<&Path>,
+    explicit_state_root: Option<&Path>,
+    command: LearningCommand,
+    rex_server_override: Option<&str>,
+    json: bool,
+) -> Result<(), CliError> {
+    let environment = std::env::vars_os().collect::<std::collections::BTreeMap<_, _>>();
+    learning_command_with_environment(
+        config_path,
+        explicit_state_root,
+        command,
+        rex_server_override,
+        json,
+        &environment,
+    )
+}
+
+fn learning_command_with_environment(
+    config_path: Option<&Path>,
+    explicit_state_root: Option<&Path>,
+    command: LearningCommand,
+    rex_server_override: Option<&str>,
+    json: bool,
+    environment: &std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+) -> Result<(), CliError> {
+    require_human_context()?;
+    match command {
+        LearningCommand::Trial {
+            command:
+                TrialCommand::Request {
+                    project,
+                    candidate,
+                    candidate_digest,
+                    request_key,
+                    matrix_file,
+                },
+        } => stage_profile_trial_request(
+            config_path,
+            explicit_state_root,
+            TrialRequestInput {
+                project,
+                candidate,
+                candidate_digest,
+                request_key,
+                matrix_file,
+            },
+            rex_server_override,
+            json,
+            environment,
+        ),
+    }
+}
+
+fn stage_profile_trial_request(
+    config_path: Option<&Path>,
+    explicit_state_root: Option<&Path>,
+    request: TrialRequestInput,
+    rex_server_override: Option<&str>,
+    json: bool,
+    environment: &std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+) -> Result<(), CliError> {
+    use crate::launch::RexViewKind;
+    use crate::learning_trials::{profile_trial_human_request, profile_trial_review_bundle};
+    use std::ffi::OsStr;
+
+    let TrialRequestInput {
+        project,
+        candidate,
+        candidate_digest,
+        request_key,
+        matrix_file,
+    } = request;
+    let project_id = ProjectId::parse(project).map_err(CliError::usage)?;
+    if candidate.trim().is_empty()
+        || candidate.len() > 255
+        || candidate.chars().any(char::is_control)
+    {
+        return Err(CliError::usage("candidate ID is malformed"));
+    }
+    let requested_digest = Digest::parse(candidate_digest).map_err(CliError::usage)?;
+    let matrix_metadata = std::fs::symlink_metadata(&matrix_file)
+        .map_err(|error| CliError::usage(format!("{}: {error}", matrix_file.display())))?;
+    if matrix_metadata.file_type().is_symlink()
+        || !matrix_metadata.is_file()
+        || matrix_metadata.len() > crate::learning_trials::INLINE_FIXTURE_MATRIX_MAX_BYTES as u64
+    {
+        return Err(CliError::usage(
+            "trial matrix must be a regular non-symlink file no larger than 512 KiB",
+        ));
+    }
+    let matrix_bytes = std::fs::read(&matrix_file)
+        .map_err(|error| CliError::usage(format!("{}: {error}", matrix_file.display())))?;
+    let matrix = crate::profile_trial_request::TrialRequestMatrix::parse(&matrix_bytes)
+        .map_err(CliError::usage)?;
+    let frozen_inputs = matrix.freeze().map_err(CliError::usage)?;
+    let (authorization_id, human_request_id) =
+        crate::profile_trial_request::stable_ids(&project_id, &request_key)
+            .map_err(CliError::usage)?;
+    let (source_path, loaded) = load_config(config_path)?;
+    let source_identity = source_path
+        .canonicalize()
+        .map_err(|error| CliError::usage(format!("{}: {error}", source_path.display())))?
+        .display()
+        .to_string();
+    let state_root =
+        config::state_root(&loaded.config, explicit_state_root).map_err(CliError::usage)?;
+    let owner_status = ConfigStore::status(&state_root).map_err(CliError::unavailable)?;
+    let generation = owner_status.owner_generation.ok_or_else(|| {
+        CliError::unavailable(
+            "no foreground machine controller is running; start `rex-projects runtime run` first",
+        )
+    })?;
+    if !owner_status.owner_is_live() {
+        return Err(CliError::unavailable(
+            "controller ownership is stale or ambiguous",
+        ));
+    }
+    let search_path = environment
+        .get(OsStr::new("PATH"))
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let rex = crate::adapters::rex::RexIdentity::discover(
+        Path::new(&loaded.config.runtime.rex_binary),
+        &search_path,
+        environment,
+        rex_server_override,
+    )
+    .map_err(|error| CliError::unavailable(format!("Rex identity discovery failed: {error}")))?;
+    if owner_status.owner_rex_endpoint.as_deref() != Some(rex.endpoint.as_str())
+        || owner_status.owner_rex_server_identity.as_deref() != Some(rex.instance_id.as_str())
+        || owner_status.owner_rex_session_id.as_deref() != Some(rex.session_id.as_str())
+    {
+        return Err(CliError::unavailable(
+            "current Rex session does not match the foreground controller identity",
+        ));
+    }
+    let mut store = ConfigStore::open_control(&state_root).map_err(CliError::unavailable)?;
+    let current_revision = store
+        .current_revision(&source_identity)
+        .map_err(CliError::unavailable)?
+        .ok_or_else(|| CliError::conflict("configuration has not been applied"))?;
+    let snapshot = store
+        .load_snapshot(&source_identity)
+        .map_err(CliError::unavailable)?
+        .ok_or_else(|| CliError::conflict("applied configuration snapshot is missing"))?;
+    if snapshot.revision != current_revision || snapshot.config.digest != loaded.digest {
+        return Err(CliError::conflict(
+            "applied configuration changed; apply and retry",
+        ));
+    }
+    let project_config = snapshot
+        .config
+        .config
+        .projects
+        .get(&project_id)
+        .ok_or_else(|| CliError::not_found(format!("Project `{project_id}` is not applied")))?;
+    let package = store
+        .learning_candidate_package(&project_id, &candidate, &requested_digest)
+        .map_err(CliError::conflict)?
+        .ok_or_else(|| CliError::not_found("exact candidate revision was not found"))?;
+    if package.revision.digest != requested_digest
+        || package.revision.candidate_id != candidate
+        || package.revision.project_id != project_id
+    {
+        return Err(CliError::conflict(
+            "candidate package identity does not match the request",
+        ));
+    }
+    let role = package.revision.role;
+    let candidate_profile: crate::config::Profile = toml::from_str(
+        std::str::from_utf8(
+            package
+                .files
+                .get("config.toml")
+                .ok_or_else(|| CliError::conflict("candidate config.toml is missing"))?,
+        )
+        .map_err(|error| CliError::conflict(error.to_string()))?,
+    )
+    .map_err(|error| CliError::conflict(error.to_string()))?;
+    if !candidate_profile.skill_paths.is_empty() {
+        return Err(CliError::conflict(
+            "trial staging does not yet support candidate skill_paths",
+        ));
+    }
+    let metadata: crate::learning::ProfileCandidateMetadata = crate::protocol::parse_unique(
+        package
+            .files
+            .get(crate::learning::PROFILE_CANDIDATE_METADATA_PATH)
+            .ok_or_else(|| CliError::conflict("candidate metadata is missing"))?,
+    )
+    .map_err(CliError::conflict)?;
+    if metadata.project_id != project_id
+        || metadata.role != role
+        || metadata.config_revision != snapshot.revision
+        || metadata.config_digest != snapshot.config.digest
+    {
+        return Err(CliError::conflict(
+            "candidate metadata is stale for the applied Project",
+        ));
+    }
+    let base_profile = snapshot
+        .config
+        .profiles
+        .get(&metadata.base_profile_id)
+        .ok_or_else(|| CliError::conflict("candidate base profile is missing"))?;
+    if !crate::config::effective_project_roles(&project_id, &snapshot.config.config.projects)
+        .map_err(CliError::conflict)?
+        .get(&role)
+        .is_some_and(|id| id == &metadata.base_profile_id)
+    {
+        let selected_recipe_binding = project_config.operation_matches.iter().any(|matched| {
+            snapshot
+                .config
+                .config
+                .operation_recipes
+                .get(&matched.recipe)
+                .and_then(|recipe| recipe.roles.get(&role))
+                == Some(&metadata.base_profile_id)
+        });
+        if !selected_recipe_binding {
+            return Err(CliError::conflict(
+                "candidate base profile is not bound to this role by the Project or a selected recipe",
+            ));
+        }
+    }
+    let candidate_profile_id = package.profile_id.clone();
+    let candidate_profile_digest =
+        crate::store::agent_profile_digest(&candidate_profile).map_err(CliError::unexpected)?;
+    let qualification_request = crate::store::provider_qualification_runtime::ProviderQualificationRequest {
+        request_id: "profile-trial-staging".into(), project_id: project_id.clone(), role,
+        profile_id: candidate_profile_id.clone(), profile_digest: candidate_profile_digest.clone(),
+        config_revision: snapshot.revision.0, config_digest: snapshot.config.digest.clone(),
+        target: crate::store::provider_qualification_runtime::ProviderQualificationTarget::Candidate {
+            candidate_id: candidate.clone(), candidate_digest: requested_digest.clone(),
+        },
+    };
+    let candidate_profile = store
+        .resolve_profile_trial_candidate(&qualification_request, &snapshot.config)
+        .map_err(CliError::conflict)?;
+    let base_profile_id = metadata.base_profile_id.clone();
+    let baseline = crate::profile_trial_request::profile_snapshot(
+        &snapshot.config,
+        &base_profile_id,
+        &base_profile_id,
+        base_profile,
+        None,
+        None,
+    )
+    .map_err(CliError::conflict)?;
+    let candidate_snapshot = crate::profile_trial_request::profile_snapshot(
+        &snapshot.config,
+        &candidate_profile_id,
+        &base_profile_id,
+        &candidate_profile,
+        Some(&package.files),
+        Some(&metadata.external_sources),
+    )
+    .map_err(CliError::conflict)?;
+    let max_pairs = snapshot
+        .config
+        .config
+        .learning
+        .max_trial_pairs_per_revision
+        .min(crate::learning::MAX_TRIAL_PAIRS_PER_REVISION);
+    let min_inputs = snapshot
+        .config
+        .config
+        .learning
+        .min_distinct_trial_inputs
+        .max(crate::learning::MIN_DISTINCT_INPUTS);
+    let distinct_pairs = matrix
+        .pairs
+        .iter()
+        .map(|pair| pair.input_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if matrix.pairs.is_empty()
+        || matrix.pairs.len() > max_pairs
+        || matrix.pairs.len() > 10
+        || distinct_pairs.len() < min_inputs
+    {
+        return Err(CliError::conflict(
+            "trial matrix exceeds configured pair budget or misses the configured distinct-input minimum",
+        ));
+    }
+    if let Some(existing) = store
+        .profile_trial_authorization(&authorization_id)
+        .map_err(CliError::conflict)?
+    {
+        if existing.human_request_id != human_request_id
+            || existing.project_id != project_id
+            || existing.role != role
+            || existing.candidate_id != candidate
+            || existing.candidate_digest != requested_digest
+            || existing.config_revision != snapshot.revision
+            || existing.config_digest != snapshot.config.digest
+            || existing.inputs != frozen_inputs
+            || existing.pairs != matrix.pairs
+            || existing.scoped_exception != matrix.scoped_exception
+            || existing.baseline != baseline
+            || existing.candidate != candidate_snapshot
+        {
+            return Err(CliError::conflict(
+                "request key was reused with different trial content",
+            ));
+        }
+        let old_base_qualification = store
+            .provider_qualification(&existing.baseline_qualification_digest)
+            .map_err(CliError::conflict)?
+            .ok_or_else(|| CliError::conflict("saved baseline qualification receipt is missing"))?;
+        let old_candidate_qualification = store
+            .provider_qualification(&existing.candidate_qualification_digest)
+            .map_err(CliError::conflict)?
+            .ok_or_else(|| {
+                CliError::conflict("saved candidate qualification receipt is missing")
+            })?;
+        validate_trial_qualification(
+            &old_base_qualification,
+            &project_id,
+            &base_profile_id,
+            base_profile,
+            &baseline.profile_digest,
+            &rex.instance_id,
+        )?;
+        validate_trial_qualification(
+            &old_candidate_qualification,
+            &project_id,
+            &candidate_profile_id,
+            &candidate_profile,
+            &candidate_snapshot.profile_digest,
+            &rex.instance_id,
+        )?;
+        let lifecycle = store
+            .profile_trial_authorization_lifecycle(&authorization_id)
+            .map_err(CliError::conflict)?
+            .ok_or_else(|| CliError::conflict("saved profile trial authorization disappeared"))?;
+        return if json {
+            print_json(
+                &serde_json::json!({"accepted":true,"request_id":existing.human_request_id,"authorization_id":existing.authorization_id,"state":lifecycle,"authorization_digest":existing.digest().map_err(CliError::conflict)?}),
+            )
+        } else {
+            println!(
+                "Profile trial request {} is already staged ({lifecycle}).",
+                existing.human_request_id
+            );
+            Ok(())
+        };
+    }
+    let baseline_qualification = find_trial_qualification(
+        &store,
+        &project_id,
+        &base_profile_id,
+        base_profile,
+        &baseline.profile_digest,
+        &rex.instance_id,
+    )?;
+    let candidate_qualification = find_trial_qualification(
+        &store,
+        &project_id,
+        &candidate_profile_id,
+        &candidate_profile,
+        &candidate_snapshot.profile_digest,
+        &rex.instance_id,
+    )?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| CliError::unexpected(error.to_string()))?
+        .as_secs();
+    let authorization = crate::profile_trial_request::make_authorization(
+        crate::profile_trial_request::TrialAuthorizationSeed {
+            project_id: project_id.clone(),
+            role,
+            candidate_id: candidate.clone(),
+            candidate_digest: requested_digest.clone(),
+            base_profile_id,
+            config_revision: snapshot.revision,
+            config_digest: snapshot.config.digest.clone(),
+            baseline_qualification_digest: baseline_qualification
+                .canonical_digest()
+                .map_err(CliError::conflict)?,
+            candidate_qualification_digest: candidate_qualification
+                .canonical_digest()
+                .map_err(CliError::conflict)?,
+            request_key,
+            now_unix: now,
+        },
+        crate::profile_trial_request::FrozenTrialMatrix {
+            baseline,
+            candidate: candidate_snapshot,
+            inputs: frozen_inputs,
+            pairs: matrix.pairs.clone(),
+            scoped_exception: matrix.scoped_exception.clone(),
+        },
+    )
+    .map_err(CliError::conflict)?;
+    if authorization.authorization_id != authorization_id
+        || authorization.human_request_id != human_request_id
+    {
+        return Err(CliError::unexpected(
+            "host request identity derivation changed",
+        ));
+    }
+    {
+        let view = store
+            .rex_view_history(&project_id)
+            .map_err(CliError::conflict)?
+            .into_iter()
+            .find(|record| {
+                record.lifecycle == "active"
+                    && record.view.kind == RexViewKind::Supervisor
+                    && record.view.rex_server_identity == rex.instance_id
+                    && record.view.rex_session_id == rex.session_id
+            })
+            .map(|record| record.view)
+            .ok_or_else(|| {
+                CliError::unavailable(
+                    "Project has no active Supervisor Rex view in this controller session",
+                )
+            })?;
+        let bundle = profile_trial_review_bundle(&authorization).map_err(CliError::conflict)?;
+        let request = profile_trial_human_request(
+            human_request_id.clone(),
+            &authorization,
+            bundle,
+            "Review and approve this exact bounded profile trial matrix.".into(),
+            authorization.expires_at_unix,
+        )
+        .map_err(CliError::conflict)?;
+        let artifact_root = state_root.join("human-artifacts");
+        std::fs::create_dir_all(&artifact_root).map_err(|e| CliError::unexpected(e.to_string()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&artifact_root, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| CliError::unexpected(e.to_string()))?;
+        }
+        let artifact =
+            crate::human_runtime::write_runtime_review_artifact(&artifact_root, &request)
+                .map_err(|e| CliError::unexpected(e.to_string()))?;
+        store
+            .prepare_profile_trial_authorization(
+                generation,
+                &authorization,
+                &request,
+                &view.view_id,
+                &artifact,
+                now,
+            )
+            .map_err(CliError::conflict)?;
+        let persisted = store
+            .profile_trial_authorization(&authorization_id)
+            .map_err(CliError::conflict)?
+            .ok_or_else(|| {
+                CliError::unexpected("staged profile trial authorization disappeared")
+            })?;
+        if json {
+            print_json(
+                &serde_json::json!({"accepted":true,"request_id":human_request_id,"authorization_id":authorization_id,"state":"pending_human_approval","expires_at_unix":persisted.expires_at_unix,"authorization_digest":persisted.digest().map_err(CliError::conflict)?}),
+            )
+        } else {
+            println!(
+                "Staged profile trial request {} for human approval.",
+                human_request_id
+            );
+            Ok(())
+        }
+    }
+}
+
+fn find_trial_qualification(
+    store: &ConfigStore,
+    project_id: &ProjectId,
+    profile_id: &crate::domain::ids::ProfileId,
+    profile: &crate::config::Profile,
+    profile_digest: &Digest,
+    rex_instance: &str,
+) -> Result<crate::launch::ProviderQualification, CliError> {
+    let receipts = store
+        .verified_provider_qualifications(project_id, profile_id, profile_digest, 32)
+        .map_err(CliError::conflict)?;
+    receipts.into_iter().find(|receipt| validate_trial_qualification(receipt, project_id, profile_id, profile, profile_digest, rex_instance).is_ok())
+        .ok_or_else(|| CliError::conflict("no verified qualification matches the exact profile runtime and current Rex instance"))
+}
+
+fn validate_trial_qualification(
+    receipt: &crate::launch::ProviderQualification,
+    project_id: &ProjectId,
+    profile_id: &crate::domain::ids::ProfileId,
+    profile: &crate::config::Profile,
+    profile_digest: &Digest,
+    rex_instance: &str,
+) -> Result<(), CliError> {
+    let identity = crate::run_step::profile_runtime_identity(profile)
+        .map_err(|error| CliError::conflict(error.to_string()))?;
+    receipt
+        .validate_for_unattended_launch()
+        .map_err(CliError::conflict)?;
+    if receipt.project_id != *project_id
+        || receipt.profile_id != *profile_id
+        || receipt.profile_digest != *profile_digest
+        || receipt.proof.rex_instance_id != rex_instance
+        || receipt.adapter != identity.adapter
+        || receipt.executable_path != identity.executable_path.display().to_string()
+        || receipt.executable_digest != identity.executable_digest
+        || receipt.commit_mode != identity.commit_mode
+        || receipt.invocation_options_digest != identity.invocation_options_digest
+        || receipt.permission_mode != identity.effective_permission_mode
+    {
+        return Err(CliError::conflict(
+            "qualification receipt does not match the exact trial profile and current Rex instance",
+        ));
+    }
+    Ok(())
+}
+
 fn provider_status_fields(
     status: crate::store::provider_qualification_runtime::ProviderQualificationJobStatus,
     phase: crate::store::provider_qualification_runtime::ProviderQualificationLaunchPhase,
@@ -4364,6 +4925,25 @@ fn dispatch_provider_command_for_test(args: &[&str]) -> Result<(), CliError> {
     )
 }
 
+#[cfg(test)]
+fn dispatch_learning_command_with_environment_for_test(
+    args: &[&str],
+    environment: &std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+) -> Result<(), CliError> {
+    let cli = Cli::try_parse_from(args).map_err(|error| CliError::usage(error.to_string()))?;
+    let Command::Learning { command } = cli.command else {
+        return Err(CliError::usage("test command must select `learning`"));
+    };
+    learning_command_with_environment(
+        cli.config.as_deref(),
+        cli.state_root.as_deref(),
+        command,
+        cli.rex_server.as_deref(),
+        cli.json,
+        environment,
+    )
+}
+
 fn version(json: bool) -> Result<(), CliError> {
     if json {
         let report = VersionInfo {
@@ -4483,6 +5063,558 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn trial_request_cli_stages_exact_pending_review_with_fixture_rex_and_rejects_changed_key_content()
+     {
+        use crate::domain::ids::{Digest, ProjectId, Revision};
+        use crate::domain::types::Role;
+        use crate::launch::{RexView, RexViewKind};
+        use crate::learning::{CandidateRevision, CandidateStatus, ProfileCandidateMetadata};
+        use crate::store::{LearningCandidateRecord, OwnerMetadata, ProjectRecord};
+        use sha2::{Digest as _, Sha256};
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::ffi::{OsStr, OsString};
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fixture_root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture");
+        let config_root = temp.path().join("config");
+        std::fs::create_dir_all(config_root.join("profiles")).unwrap();
+        std::fs::copy(
+            fixture_root.join("config.toml"),
+            config_root.join("config.toml"),
+        )
+        .unwrap();
+        for profile in ["judgment_claude", "worker_codex"] {
+            let source = fixture_root.join("profiles").join(profile);
+            let target = config_root.join("profiles").join(profile);
+            std::fs::create_dir_all(&target).unwrap();
+            for entry in std::fs::read_dir(source).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_file() {
+                    std::fs::copy(entry.path(), target.join(entry.file_name())).unwrap();
+                }
+            }
+        }
+        let base_profile_config = config_root.join("profiles/judgment_claude/config.toml");
+        let original_profile_config = std::fs::read_to_string(&base_profile_config).unwrap();
+        let instruction_alias = config_root.join("profiles/judgment_claude/aliases/instruction.md");
+        std::fs::write(
+            &base_profile_config,
+            original_profile_config.replace(
+                "[options]",
+                &format!(
+                    "instruction_files = [{:?}]\n\n[options]",
+                    instruction_alias.display().to_string()
+                ),
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(config_root.join("profiles/judgment_claude/aliases")).unwrap();
+        std::fs::write(instruction_alias, "Alias-resolved frozen instruction.\n").unwrap();
+        let rex_cli = temp.path().join("fixture-rex");
+        std::fs::write(&rex_cli, "#!/bin/sh\nprintf '%s\\n' '{\"endpoint\":\"unix:///tmp/rex-trial-fixture.sock\",\"instance_id\":\"rex-trial-fixture\",\"host_id\":\"fixture-host\",\"rex_version\":\"fixture\",\"methods\":[]}'\n").unwrap();
+        std::fs::set_permissions(&rex_cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let config_path = config_root.join("config.toml");
+        let original = std::fs::read_to_string(&config_path).unwrap();
+        let config_text = original.replacen(
+            "schema_version = 1",
+            &format!(
+                "schema_version = 1\n\n[runtime]\nrex_binary = {:?}",
+                rex_cli.display().to_string()
+            ),
+            1,
+        );
+        std::fs::write(&config_path, config_text).unwrap();
+        for profile in ["judgment_claude", "worker_codex"] {
+            let profile_path = config_root
+                .join("profiles")
+                .join(profile)
+                .join("config.toml");
+            let source = std::fs::read_to_string(&profile_path).unwrap();
+            let changed = source
+                .replace("/absolute/path/to/claude", executable.to_str().unwrap())
+                .replace("/absolute/path/to/codex", executable.to_str().unwrap());
+            std::fs::write(profile_path, changed).unwrap();
+        }
+        let applied = config::load(&config_path).unwrap();
+        let state_root = temp.path().join("state");
+        let source_identity = config_path.canonicalize().unwrap().display().to_string();
+        let mut store = ConfigStore::open_test(&state_root).unwrap();
+        store
+            .apply_snapshot(&source_identity, &applied, ExpectedRevision::Bootstrap)
+            .unwrap();
+        for (project_id, project) in &applied.config.projects {
+            store
+                .insert_project(&ProjectRecord {
+                    id: project_id.clone(),
+                    config_source: source_identity.clone(),
+                    config_revision: Revision(1),
+                    config_digest: applied.digest.clone(),
+                    mode: match project.mode {
+                        crate::domain::types::ProjectMode::Goal => "goal",
+                        crate::domain::types::ProjectMode::Operations => "operations",
+                    }
+                    .into(),
+                    goal_revision: project.goal.as_ref().map_or(0, |goal| goal.revision),
+                    desired_lifecycle: "stopped".into(),
+                    state_revision: Revision(0),
+                })
+                .unwrap();
+        }
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "trial-request-fixture-owner".into(),
+                state_root: state_root.display().to_string(),
+                config_source: source_identity.clone(),
+                process_start_identity: super::process_start_identity().unwrap(),
+                executable_path: executable.display().to_string(),
+                executable_digest: "f".repeat(64),
+                rex_endpoint: Some("unix:///tmp/rex-trial-fixture.sock".into()),
+                rex_server_identity: Some("rex-trial-fixture".into()),
+                rex_session_id: Some("fixture-session".into()),
+                rex_block_id: Some("controller-block".into()),
+            })
+            .unwrap();
+        let project_id = ProjectId::parse("goal_project").unwrap();
+        let role = Role::Coordinator;
+        let base_profile_id =
+            crate::config::effective_project_roles(&project_id, &applied.config.projects).unwrap()
+                [&role]
+                .clone();
+        let base = applied.profiles[&base_profile_id].clone();
+        let base_digest = crate::store::agent_profile_digest(&base).unwrap();
+        let (candidate_id, candidate_profile_id) = crate::learning::candidate_slot_id(
+            &project_id,
+            role,
+            &base_profile_id,
+            &crate::topic::TopicKey::parse("trial-fixture").unwrap(),
+        );
+        let mut candidate = base.clone();
+        candidate.description = Some("Fixture trial candidate".into());
+        candidate.learned_guidance = Some(crate::config::LearnedGuidance {
+            file: "learned/trial.md".into(),
+            project_id: project_id.clone(),
+            role,
+            repository_ids: BTreeSet::new(),
+        });
+        let mut files = BTreeMap::new();
+        let root = config_root
+            .join("profiles")
+            .join(base_profile_id.as_str())
+            .canonicalize()
+            .unwrap();
+        for source in &applied.source_files {
+            if matches!(source.kind, crate::config::SourceKind::File) {
+                let path = std::path::Path::new(&source.canonical_path);
+                if path.starts_with(&root)
+                    && path
+                        .file_name()
+                        .is_some_and(|name| name != OsStr::new("config.toml"))
+                {
+                    let relative = path
+                        .strip_prefix(&root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    files.insert(relative, source.contents.as_bytes().to_vec());
+                }
+            }
+        }
+        files.insert(
+            "learned/trial.md".into(),
+            b"Use the narrow tested approach.".to_vec(),
+        );
+        files.insert(
+            "config.toml".into(),
+            toml::to_string(&candidate).unwrap().into_bytes(),
+        );
+        let metadata = ProfileCandidateMetadata {
+            schema_version: 1,
+            project_id: project_id.clone(),
+            candidate_id: candidate_id.clone(),
+            profile_id: candidate_profile_id.clone(),
+            role,
+            base_profile_id: base_profile_id.clone(),
+            base_profile_digest: base_digest,
+            base_profile_json: serde_json::to_string(&base).unwrap(),
+            base_config_toml: toml::to_string(&base).unwrap(),
+            base_guidance: None,
+            learned_guidance_path: "learned/trial.md".into(),
+            config_revision: Revision(1),
+            config_digest: applied.digest.clone(),
+            topic_key: crate::topic::TopicKey::parse("trial-fixture").unwrap(),
+            repository_ids: BTreeSet::new(),
+            source_finding_ids: vec![],
+            source_ticket_run_ids: BTreeSet::new(),
+            expected_prior_digest: None,
+            evaluation_criterion: "The exact candidate profile is reviewed.".into(),
+            description: "Fixture trial candidate".into(),
+            learned_guidance: "Use the narrow tested approach.".into(),
+            external_sources: BTreeMap::new(),
+        };
+        files.insert(
+            crate::learning::PROFILE_CANDIDATE_METADATA_PATH.into(),
+            serde_json::to_vec(&metadata).unwrap(),
+        );
+        let manifest = crate::learning::manifest_digest(&files).unwrap();
+        let rows = files
+            .iter()
+            .map(|(path, bytes)| {
+                (
+                    path.clone(),
+                    Digest::parse(format!("{:x}", Sha256::digest(bytes))).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let candidate_digest = crate::learning::candidate_revision_digest(&files).unwrap();
+        store
+            .register_learning_candidate(
+                generation,
+                &LearningCandidateRecord {
+                    revision: CandidateRevision {
+                        candidate_id: candidate_id.clone(),
+                        project_id: project_id.clone(),
+                        role,
+                        digest: candidate_digest.clone(),
+                        created_at: "2026-11-13T00:00:00Z".into(),
+                        expires_at: "2027-11-13T00:00:00Z".into(),
+                        status: CandidateStatus::Proposed,
+                    },
+                    profile_id: candidate_profile_id.clone(),
+                    package_manifest_digest: manifest,
+                    package_files_json: serde_json::to_string(&files).unwrap(),
+                    package_json: serde_json::to_string(&rows).unwrap(),
+                    expected_pairs: 10,
+                },
+            )
+            .unwrap();
+        let mut candidate_qualification = None;
+        for (profile_id, profile) in [
+            (&base_profile_id, &base),
+            (&candidate_profile_id, &candidate),
+        ] {
+            let identity = crate::run_step::profile_runtime_identity(profile).unwrap();
+            let markers = [
+                "REX_PROJECTS_AGENT",
+                "REX_PROJECTS_CONTEXT",
+                "REX_PROJECTS_PROJECT_ID",
+                "REX_PROJECTS_ROLE",
+                "REX_PROJECTS_RUN_ID",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+            let proof = crate::launch::QualificationProof {
+                schema_version: 1,
+                probe_id: "trial-request-fixture".into(),
+                fixture_digest: Digest::parse("a".repeat(64)).unwrap(),
+                rex_instance_id: "rex-trial-fixture".into(),
+                tool_shell_marker_digest: Digest::parse("b".repeat(64)).unwrap(),
+                tool_shell_markers_present: markers.clone(),
+                descendant_marker_digest: Digest::parse("c".repeat(64)).unwrap(),
+                descendant_markers_present: markers,
+                automatic_turn_result_digest: Digest::parse("d".repeat(64)).unwrap(),
+                automatic_turn_completed: true,
+                structured_result_valid: true,
+                observed_permission_mode: identity.effective_permission_mode.into(),
+                permission_prompt_count: 0,
+                cleanup_process_tree_digest: Digest::parse("e".repeat(64)).unwrap(),
+                process_tree_absent: true,
+                cleanup_confirmed: true,
+            };
+            let qualification: crate::launch::ProviderQualification = serde_json::from_value(serde_json::json!({
+                "schema_version":1,"project_id":project_id,"profile_id":profile_id,"profile_digest":crate::store::agent_profile_digest(profile).unwrap(),"adapter":identity.adapter,
+                "executable_path":identity.executable_path.display().to_string(),"executable_digest":identity.executable_digest,"provider_version":"fixture-1","permission_mode":identity.effective_permission_mode,
+                "invocation_options_digest":identity.invocation_options_digest,"commit_mode":identity.commit_mode,"proof":proof,"status":"verified"
+            })).unwrap();
+            if profile_id == &candidate_profile_id {
+                candidate_qualification = Some(qualification);
+            } else {
+                store
+                    .store_provider_qualification(generation, &qualification)
+                    .unwrap();
+            }
+        }
+        let supervisor_view = RexView {
+            view_id: RexView::derive_id(&project_id, RexViewKind::Supervisor, None, None, 1)
+                .unwrap(),
+            project_id: project_id.clone(),
+            kind: RexViewKind::Supervisor,
+            ticket_namespace: None,
+            ticket_id: None,
+            view_epoch: 1,
+            rex_server_identity: "rex-trial-fixture".into(),
+            rex_session_id: "fixture-session".into(),
+            rex_window_id: "supervisor-window".into(),
+        };
+        store
+            .register_rex_view(generation, &supervisor_view)
+            .unwrap();
+        drop(store);
+        let matrix_path = temp.path().join("trial-matrix.json");
+        let matrix = serde_json::json!({
+            "inputs": (0..5).map(|index| serde_json::json!({"input_id":format!("case-{index}"),"input":{"case":index},"fixture":{"schema_version":1,"files":{}},"assertions":[]})).collect::<Vec<_>>(),
+            "pairs": (0..10).map(|index| serde_json::json!({"pair_index":index,"input_id":format!("case-{}",index/2)})).collect::<Vec<_>>(),
+        });
+        let env = BTreeMap::from([
+            (
+                OsString::from("REX_SESSION"),
+                OsString::from("fixture-session"),
+            ),
+            (OsString::from("REX_BLOCK"), OsString::from("human-block")),
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+        ]);
+        let args = [
+            "rex-projects",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--state-root",
+            state_root.to_str().unwrap(),
+            "learning",
+            "trial",
+            "request",
+            "--project",
+            "goal_project",
+            "--candidate",
+            candidate_id.as_str(),
+            "--candidate-digest",
+            candidate_digest.as_str(),
+            "--request-key",
+            "fixture-request-key",
+            "--matrix-file",
+            matrix_path.to_str().unwrap(),
+        ];
+        std::fs::write(&matrix_path, serde_json::to_vec(&matrix).unwrap()).unwrap();
+        let mut other_session = env.clone();
+        other_session.insert(
+            OsString::from("REX_SESSION"),
+            OsString::from("other-fixture-session"),
+        );
+        assert!(
+            super::dispatch_learning_command_with_environment_for_test(&args, &other_session)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match the foreground controller identity")
+        );
+        assert!(
+            super::dispatch_learning_command_with_environment_for_test(&args, &env)
+                .unwrap_err()
+                .to_string()
+                .contains("no verified qualification matches")
+        );
+        let original_config = std::fs::read(&config_path).unwrap();
+        let mut changed_config = original_config.clone();
+        changed_config.extend_from_slice(b"\n# Not the applied source snapshot.\n");
+        std::fs::write(&config_path, changed_config).unwrap();
+        let changed_source = crate::config::load(&config_path).unwrap();
+        assert_ne!(changed_source.digest, applied.digest);
+        assert!(
+            super::dispatch_learning_command_with_environment_for_test(&args, &env)
+                .unwrap_err()
+                .to_string()
+                .contains("applied configuration changed")
+        );
+        std::fs::write(&config_path, original_config).unwrap();
+        let db = rusqlite::Connection::open(state_root.join("state.sqlite3")).unwrap();
+        for table in ["profile_trial_authorizations", "human_requests"] {
+            let count: i64 = db
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "rejected request wrote to {table}");
+        }
+        drop(db);
+        let mut store = ConfigStore::open_test(&state_root).unwrap();
+        store
+            .store_provider_qualification(generation, &candidate_qualification.unwrap())
+            .unwrap();
+        drop(store);
+        let mut skewed = matrix.clone();
+        for pair_index in 0..10 {
+            let input_id = if pair_index < 6 {
+                "case-0".to_owned()
+            } else {
+                format!("case-{}", pair_index - 5)
+            };
+            skewed["pairs"][pair_index]["input_id"] = serde_json::json!(input_id);
+        }
+        std::fs::write(&matrix_path, serde_json::to_vec(&skewed).unwrap()).unwrap();
+        let error =
+            super::dispatch_learning_command_with_environment_for_test(&args, &env).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("nonstandard trial pair coverage requires")
+        );
+        let db = rusqlite::Connection::open(state_root.join("state.sqlite3")).unwrap();
+        let auth_count: i64 = db
+            .query_row(
+                "SELECT count(*) FROM profile_trial_authorizations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let request_count: i64 = db
+            .query_row("SELECT count(*) FROM human_requests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((auth_count, request_count), (0, 0));
+        drop(db);
+        std::fs::write(&matrix_path, serde_json::to_vec(&matrix).unwrap()).unwrap();
+        super::dispatch_learning_command_with_environment_for_test(&args, &env).unwrap();
+        let db = rusqlite::Connection::open(state_root.join("state.sqlite3")).unwrap();
+        let (lifecycle, request_id, auth_json): (String, String, String) = db.query_row(
+            "SELECT lifecycle,human_request_id,authorization_json FROM profile_trial_authorizations WHERE project_id='goal_project'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(lifecycle, "pending");
+        let auth: crate::learning_trials::ProfileTrialAuthorization =
+            serde_json::from_str(&auth_json).unwrap();
+        assert_eq!(request_id, auth.human_request_id.as_str());
+        for (profile, required_paths) in [
+            (
+                &auth.baseline,
+                ["instructions.md", "aliases/instruction.md"].as_slice(),
+            ),
+            (
+                &auth.candidate,
+                [
+                    "instructions.md",
+                    "aliases/instruction.md",
+                    "learned/trial.md",
+                ]
+                .as_slice(),
+            ),
+        ] {
+            for path in required_paths {
+                assert!(
+                    profile.instruction_files.contains_key(*path),
+                    "frozen snapshot omitted {path}"
+                );
+            }
+            assert_eq!(
+                profile.instruction_files["instructions.md"],
+                files["instructions.md"]
+            );
+            assert_eq!(
+                profile.instruction_files["aliases/instruction.md"],
+                b"Alias-resolved frozen instruction.\n"
+            );
+        }
+        assert_eq!(
+            auth.candidate.instruction_files["learned/trial.md"],
+            b"Use the narrow tested approach."
+        );
+        assert!(
+            auth.human_response_receipt_digest
+                .as_str()
+                .bytes()
+                .all(|byte| byte == b'0')
+        );
+        let human_count: i64 = db
+            .query_row(
+                "SELECT count(*) FROM human_requests WHERE request_id=?1",
+                [&request_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(human_count, 1);
+        for table in [
+            "profile_trial_launches",
+            "profile_trial_run_receipts",
+            "effects",
+        ] {
+            let count: i64 = db
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "unexpected rows in {table}");
+        }
+        let slot_count: i64 = db.query_row("SELECT count(*) FROM execution_slots WHERE owner_kind='profile_trial' AND disposition<>'released'", [], |row| row.get(0)).unwrap();
+        assert_eq!(slot_count, 0);
+        drop(db);
+        // Reopen through the production store before replay; the ID remains bound to the original matrix.
+        let reopened = ConfigStore::open_test(&state_root).unwrap();
+        assert!(
+            reopened
+                .profile_trial_authorization(&auth.authorization_id)
+                .unwrap()
+                .is_some()
+        );
+        drop(reopened);
+        let request_before: (String, String, String, String, i64, i64) =
+            rusqlite::Connection::open(state_root.join("state.sqlite3"))
+                .unwrap()
+                .query_row(
+                    "SELECT request_json,artifact_path,bundle_digest,material_digest,created_at_unix,expires_at_unix FROM human_requests WHERE request_id=?1",
+                    [&request_id],
+                    |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+                )
+                .unwrap();
+        super::dispatch_learning_command_with_environment_for_test(&args, &env).unwrap();
+        let db = rusqlite::Connection::open(state_root.join("state.sqlite3")).unwrap();
+        let replay_auth_json: String = db
+            .query_row(
+                "SELECT authorization_json FROM profile_trial_authorizations WHERE project_id='goal_project'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            replay_auth_json, auth_json,
+            "exact retry changed frozen authorization"
+        );
+        let request_after: (String, String, String, String, i64, i64) = db
+            .query_row(
+                "SELECT request_json,artifact_path,bundle_digest,material_digest,created_at_unix,expires_at_unix FROM human_requests WHERE request_id=?1",
+                [&request_id],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            request_after, request_before,
+            "exact retry changed human review binding"
+        );
+        let retry_auth_count: i64 = db
+            .query_row(
+                "SELECT count(*) FROM profile_trial_authorizations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let retry_request_count: i64 = db
+            .query_row("SELECT count(*) FROM human_requests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((retry_auth_count, retry_request_count), (1, 1));
+        drop(db);
+        let mut changed = matrix;
+        changed["inputs"][0]["input"]["case"] = serde_json::json!(999);
+        std::fs::write(&matrix_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        let error =
+            super::dispatch_learning_command_with_environment_for_test(&args, &env).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("request key was reused with different trial content")
+        );
+        let db = rusqlite::Connection::open(state_root.join("state.sqlite3")).unwrap();
+        let auth_count: i64 = db
+            .query_row(
+                "SELECT count(*) FROM profile_trial_authorizations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let human_count: i64 = db
+            .query_row("SELECT count(*) FROM human_requests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(auth_count, 1);
+        assert_eq!(human_count, 1);
     }
 
     #[test]

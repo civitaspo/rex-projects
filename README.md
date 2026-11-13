@@ -35,6 +35,9 @@ human-controlled recovery commands and their one-use limit.
 See [Reconcile an interrupted provider qualification](docs/provider-recovery.md)
 for exact-request recovery and retained execution-slot ownership.
 
+See [Request a frozen profile trial](docs/profile-trial-request.md) for the
+human-only matrix submission command and an example input file.
+
 Generic comment-triggered `Request` merge execution is currently unsupported and
 is blocked before human approval or any merge-procedure mutation, even when a
 human approves the proposed procedure. `Direct` merge continues to use the
