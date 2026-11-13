@@ -349,6 +349,7 @@ fn supervisor_learning_snapshot_in_transaction(
             || receipt.manifest.operation_id != intent.operation_id
             || receipt.manifest.project_id != *project
             || receipt.manifest.topic_key.as_str() != topic_key
+            || receipt.manifest.format != "okf-0.2"
             || receipt.manifest.content_sha256 != intent.content_digest
             || receipt.manifest.relative_path != crate::topic::publication_relative_path(&intent)?
             || receipt.manifest.byte_count != intent.content.len()
@@ -2646,6 +2647,7 @@ impl ConfigStore {
         if receipt.manifest.operation_id != operation_id.as_str()
             || receipt.manifest.project_id != intent.project_id
             || receipt.manifest.topic_key != intent.key
+            || receipt.manifest.format != "okf-0.2"
             || receipt.manifest.relative_path != crate::topic::publication_relative_path(&intent)?
             || receipt.manifest.content_sha256 != intent.content_digest
             || receipt.manifest.byte_count != intent.content.len()
@@ -6972,6 +6974,37 @@ mod tests {
                 params![project.as_str(), root.to_string_lossy().as_ref()],
             )
             .unwrap();
+
+        let mut wrong_format = durable_receipt.clone();
+        wrong_format.manifest.format = "unsupported-format".into();
+        wrong_format.manifest_digest = Digest::parse(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&wrong_format.manifest).unwrap())
+        ))
+        .unwrap();
+        let wrong_format_json = crate::store::canonical_json(&wrong_format).unwrap();
+        store.connection.execute(
+            "UPDATE supervisor_topic_publications SET receipt_json=?2,receipt_digest=?3 WHERE operation_id=?1",
+            params![operation.as_str(), wrong_format_json, crate::store::content_digest(&wrong_format_json)],
+        ).unwrap();
+        assert!(
+            store
+                .maintain_project_supervisor_learning(
+                    generation,
+                    &project,
+                    "2026-11-08T00:00:00Z",
+                    12,
+                    Some(&root),
+                )
+                .is_err(),
+            "a matching receipt digest must not authorize an unsupported Topic format"
+        );
+        assert!(store.supervisor_topic_receipt(&operation).is_err());
+        let valid_receipt_json = crate::store::canonical_json(&durable_receipt).unwrap();
+        store.connection.execute(
+            "UPDATE supervisor_topic_publications SET receipt_json=?2,receipt_digest=?3 WHERE operation_id=?1",
+            params![operation.as_str(), valid_receipt_json, crate::store::content_digest(&valid_receipt_json)],
+        ).unwrap();
 
         drop(store);
         let reopened = ConfigStore::open_test(_temp.path()).unwrap();
