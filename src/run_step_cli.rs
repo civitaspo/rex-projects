@@ -2206,6 +2206,529 @@ while (! -e $ARGV[0]) { select undef, undef, undef, 0.05; }
 
     #[cfg(unix)]
     #[test]
+    fn runtime_services_reconnect_recovers_a_real_run_step_after_missed_block_close() {
+        use crate::adapters::rex::{RexCliTransport, RexIdentity};
+        use crate::engine::factory_runtime::FactoryRuntimeObservationServices;
+        use crate::runtime_services::{RuntimeExecutable, RuntimeServices};
+        use crate::store::agent_runtime::tests::{
+            prepared_anchored_block_loss_fixture, test_agent_launch_states,
+            test_execution_slot_disposition,
+        };
+
+        let root = tempdir().unwrap();
+        let mut fixture = prepared_anchored_block_loss_fixture(root.path());
+        let state_root = root.path().join("state");
+        let rex = root.path().join("rex connected recovery fixture");
+        let first_reader_pid = root.path().join("first reader pid");
+        let replacement_reader_pid = root.path().join("replacement reader pid");
+        let subscription_count = root.path().join("subscription count");
+        let allow_first_eof = root.path().join("allow first eof");
+        let closed = root.path().join("block closed");
+        let process_observation_file = root.path().join("process observation.json");
+        let shell_path =
+            |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+        let first_reader_pid_pending = first_reader_pid.with_extension("pid.pending");
+        let replacement_reader_pid_pending = replacement_reader_pid.with_extension("pid.pending");
+        let endpoint = "unix:///tmp/rex-connected-recovery-fixture.sock";
+        let instance = "rex-instance";
+        let session = fixture.authority.rex_session_id.clone();
+        let block = fixture.authority.rex_block_id.clone();
+        let window = fixture.authority.rex_window_id.clone();
+        let run_id = fixture.authority.agent_run_id.to_string();
+        let label = crate::adapters::rex::owned_agent_block_label(&run_id).unwrap();
+        let script = format!(
+            r##"#!/bin/sh
+case "$*" in
+  *"whoami --json"*) printf '%s\n' '{{"endpoint":"{endpoint}","instance_id":"{instance}","host_id":"fixture","rex_version":"1"}}' ;;
+  *"api list --json"*) printf '%s\n' '{{"methods":{{"session.view":{{}},"session.new_window":{{}},"session.new_split":{{}},"session.focus_block":{{}},"session.zoom_block":{{}},"block.close":{{}}}}}}' ;;
+  *"events -s {session} --json"*) n=0; [ ! -f {subscription_count} ] || n=$(cat {subscription_count}); n=$((n + 1)); printf '%s\n' "$n" > {subscription_count}; if [ "$n" -eq 1 ]; then printf '%s\n' "$$" > {first_reader_pid_pending}; mv {first_reader_pid_pending} {first_reader_pid}; while [ ! -f {allow_first_eof} ]; do /bin/sleep 0.01; done; exit 0; fi; printf '%s\n' "$$" > {replacement_reader_pid_pending}; mv {replacement_reader_pid_pending} {replacement_reader_pid}; exec /bin/sleep 30 ;;
+  *"api call session.view"*) if [ -f {closed} ]; then printf '%s\n' '{{"session_id":"{session}","windows":[{{"window_id":"{window}","layers":[]}}]}}'; else printf '%s\n' '{{"session_id":"{session}","windows":[{{"window_id":"{window}","layers":[{{"blocks":[{{"block_id":"{block}","label":"{label}","flavor":"com.superlogical.terminal.shell"}}]}}]}}]}}'; fi ;;
+  *"api call com.superlogical.terminal.process"*) cat {process_observation_file} ;;
+  *"api call block.close"*) touch {closed}; printf '%s\n' '{{}}' ;;
+  *) exit 64 ;;
+esac
+"##,
+            endpoint = endpoint,
+            instance = instance,
+            session = session,
+            window = window,
+            block = block,
+            label = label,
+            subscription_count = shell_path(&subscription_count),
+            first_reader_pid = shell_path(&first_reader_pid),
+            first_reader_pid_pending = shell_path(&first_reader_pid_pending),
+            allow_first_eof = shell_path(&allow_first_eof),
+            replacement_reader_pid = shell_path(&replacement_reader_pid),
+            replacement_reader_pid_pending = shell_path(&replacement_reader_pid_pending),
+            closed = shell_path(&closed),
+            process_observation_file = shell_path(&process_observation_file),
+        );
+        fs::write(&rex, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&rex, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let anchor_marker = root.path().join("supervisor identity");
+        let applied_config_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml");
+        let mut applied = crate::config::load(&applied_config_path).unwrap();
+        applied.config.runtime.rex_binary = rex.display().to_string();
+        applied.config.runtime.environment.source = crate::config::EnvironmentSource::Inherit;
+        applied
+            .config
+            .repositories
+            .get_mut(&crate::domain::ids::RepositoryId::parse("example").unwrap())
+            .unwrap()
+            .clone_url = "https://github.com/example/example.git".into();
+        let ticket_adapter = root.path().join("ticket adapter fixture");
+        let description = r#"{"ticket_namespace":"fixture:workspace","identity":{},"supported_schema_versions":[1],"native_value_convention":"fixture-native-values","status_values":{"triage":"triage","backlog":"backlog","ready":"ready","in_progress":"in_progress","in_review":"in_review","done":"done","canceled":"canceled"},"capabilities":{"pagination":false,"filters":[],"revision_support":false,"conditional_revision_mutation":false,"atomic_scope_mutation":false,"remote_idempotency":[],"reconciliation":{},"visibility_grace_seconds":0.0,"supported_optional_methods":[]}}"#;
+        let ticket_adapter_script = format!(
+            "#!/bin/sh\nrequest=$(cat)\nrequest_id=$(printf '%s' \"$request\" | sed -E -n 's/.*\\\"request_id\\\":\\\"([^\\\"]*)\\\".*/\\1/p')\ncase \"$request\" in\n  *adapter.describe*) result='{description}' ;;\n  *) exit 64 ;;\nesac\nprintf '{{\"schema_version\":1,\"request_id\":\"%s\",\"result\":%s}}\\n' \"$request_id\" \"$result\"\n",
+            description = description.replace('\'', "'\\''"),
+        );
+        fs::write(&ticket_adapter, ticket_adapter_script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&ticket_adapter, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        applied.config.adapters.tickets.command = vec![ticket_adapter.display().to_string()];
+        let package_path = fixture.authority.descriptor_path.clone();
+        let package: crate::run_step_package::RunStepPackage =
+            crate::protocol::parse_unique(&fs::read(&package_path).unwrap()).unwrap();
+        let spool = RunStepSpool::open(&fixture.authority.control_dir).unwrap();
+        applied.profiles.insert(
+            fixture.authority.profile_id.clone(),
+            package.profile.clone(),
+        );
+        let config_file = applied_config_path;
+        let mut shim_command = Command::new(std::env::current_exe().unwrap());
+        shim_command
+            .args([
+                "--exact",
+                "run_step_cli::tests::anchored_shim_child",
+                "--nocapture",
+            ])
+            .env(ANCHORED_SHIM_ENV, "1")
+            .env(ANCHORED_SHIM_MARKER_ENV, &anchor_marker)
+            .env(BLOCK_LOSS_ROOT_ENV, root.path())
+            .env(CONNECTED_EOF_PACKAGE_ENV, &package_path)
+            .env(
+                CONNECTED_EOF_AUTHORITY_ENV,
+                fixture.authority_digest.as_str(),
+            )
+            .env(BLOCK_LOSS_GRACE_ENV, "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            shim_command.process_group(0);
+        }
+        let mut shim = BlockLossChildGuard::new(shim_command.spawn().unwrap(), spool.clone());
+        assert_eq!(
+            shim.child_identity
+                .as_ref()
+                .map(|identity| identity.process_group_id),
+            Some(shim.child.id()),
+            "guarded run-step child must own a private process group for cleanup"
+        );
+        let start_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !anchor_marker.exists() {
+            assert!(
+                std::time::Instant::now() < start_deadline,
+                "run-step supervisor did not start"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let process_observation = serde_json::json!({
+            "last_exit": null,
+            "child": {"pid": shim.child.id(), "user_id": 501, "name": "rex-projects", "path": std::env::current_exe().unwrap()},
+            "foreground": {"pid": shim.child.id(), "user_id": 501, "name": "rex-projects", "path": std::env::current_exe().unwrap()},
+            "ancestors": []
+        });
+        fs::write(&process_observation_file, process_observation.to_string()).unwrap();
+        let environment = crate::environment::capture(&applied.config.runtime.environment).unwrap();
+        let runtime_binary = std::env::current_exe().unwrap();
+        let mut services = RuntimeServices::new(
+            &applied,
+            &environment,
+            &config_file,
+            &state_root,
+            fixture.generation,
+            &RexIdentity {
+                endpoint: endpoint.into(),
+                instance_id: instance.into(),
+                session_id: session.clone(),
+                block_id: Some("fixture-controller-block".into()),
+            },
+            RuntimeExecutable {
+                path: &runtime_binary,
+                digest: &fixture.authority.runtime_binary_digest,
+            },
+        )
+        .unwrap();
+        let start = loop {
+            if let Ok(start) = spool.read_start_request() {
+                break start;
+            }
+            assert!(std::time::Instant::now() < start_deadline + Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let observed = observe_wrapper_process(
+            start.request.wrapper_pid,
+            &start.request.wrapper_start_identity,
+            start.request.rex_launch_anchor.as_ref(),
+            &start.request.runtime_binary_digest,
+            &start.request.rex_session_id,
+            &start.request.rex_block_id,
+        )
+        .unwrap();
+        let receipt = fixture
+            .store
+            .authorize_agent_start(fixture.generation, &start.request, &observed)
+            .unwrap();
+        spool.publish_start_receipt(&start, receipt).unwrap();
+
+        let rex_transport = RexCliTransport::connect(
+            &rex,
+            &std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .collect::<Vec<_>>(),
+            endpoint.into(),
+            instance.into(),
+            session.clone(),
+            environment.child_environment(
+                crate::environment::ChildContext::HostOperation,
+                &std::collections::BTreeMap::new(),
+            ),
+        )
+        .unwrap();
+        let first_reader_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !first_reader_pid.exists() {
+            assert!(std::time::Instant::now() < first_reader_deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let reader_identity = crate::process::process_identity_for_pid(
+            fs::read_to_string(&first_reader_pid)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+
+        let observing_family = wait_for_observing_family(&spool);
+        assert_eq!(
+            observing_family.provider_executable_path, fixture.qualification.executable_path,
+            "provider readiness must come from the exact qualified executable"
+        );
+        assert_eq!(
+            observing_family.provider_executable_digest,
+            fixture.qualification.executable_digest
+        );
+        assert_eq!(
+            crate::process::process_identity_for_pid(observing_family.provider_root.pid)
+                .unwrap()
+                .filter(|identity| {
+                    identity.start_identity == observing_family.provider_root.start_identity
+                        && identity.quality
+                            == crate::process::ProcessIdentityQuality::KernelBirthToken
+                })
+                .map(|identity| identity.pid),
+            Some(observing_family.provider_root.pid),
+            "the observed provider root must still be live before recovery"
+        );
+
+        let ticket_window = crate::adapters::rex::TicketWindow {
+            server_instance_id: instance.into(),
+            session_id: session.clone(),
+            window_id: window.clone(),
+            label: String::new(),
+            initial_block_id: Some(block.clone()),
+            disposition: crate::adapters::rex::CreateDisposition::Existing,
+        };
+        let rex_observation = rex_transport
+            .observe_process(&ticket_window, &run_id, &block)
+            .unwrap();
+        let launch_anchor = start
+            .request
+            .rex_launch_anchor
+            .as_ref()
+            .expect("anchored fixture must persist its Rex launch anchor");
+        assert_eq!(
+            rex_observation.child.as_ref().map(|process| process.pid),
+            Some(launch_anchor.pid),
+            "fixture Rex child must be the exact saved launch anchor"
+        );
+        let first = FactoryRuntimeObservationServices::recover_agents(
+            &mut services,
+            &mut fixture.store,
+            fixture.generation,
+            super::unix_now_seconds().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            first.observations.iter().any(|observation| {
+                observation.agent_run_id == fixture.authority.agent_run_id
+                    && observation.disposition
+                        == crate::agent_recovery::AgentRecoveryDisposition::ProviderStarted
+            }),
+            "connected startup observation was {first:?}"
+        );
+        assert_eq!(
+            test_execution_slot_disposition(&fixture.store, &fixture.slot_owner_id),
+            "live"
+        );
+        let recovery_run = fixture
+            .store
+            .recoverable_agent_runs(fixture.generation, 8)
+            .unwrap()
+            .into_iter()
+            .find(|run| run.agent_run_id == fixture.authority.agent_run_id)
+            .expect("the accepted run must be available before block loss");
+        assert_eq!(
+            crate::process::process_identity_for_pid(reader_identity.pid)
+                .unwrap()
+                .unwrap()
+                .start_identity,
+            reader_identity.start_identity
+        );
+
+        fs::write(&allow_first_eof, b"eof").unwrap();
+        let eof_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while crate::process::process_identity_for_pid(reader_identity.pid)
+            .unwrap()
+            .is_some()
+        {
+            assert!(
+                std::time::Instant::now() < eof_deadline,
+                "reader EOF was not reaped"
+            );
+            let _ = FactoryRuntimeObservationServices::recover_agents(
+                &mut services,
+                &mut fixture.store,
+                fixture.generation,
+                super::unix_now_seconds().unwrap(),
+            )
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            test_execution_slot_disposition(&fixture.store, &fixture.slot_owner_id),
+            "live",
+            "an event-reader EOF cannot release the running Agent reservation"
+        );
+        rex_transport
+            .close_agent_block(&ticket_window, &run_id, &block)
+            .unwrap();
+        assert!(closed.exists());
+        let first_post_close = FactoryRuntimeObservationServices::recover_agents(
+            &mut services,
+            &mut fixture.store,
+            fixture.generation,
+            super::unix_now_seconds().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first_post_close.examined, 1);
+        assert_eq!(
+            test_execution_slot_disposition(&fixture.store, &fixture.slot_owner_id),
+            "live",
+            "the matching slot remains owned while the exact run-step family is live"
+        );
+        let family_while_owned = spool.read_run_family_record().unwrap().unwrap();
+        let mut exact_family = family_while_owned.process_tree.clone();
+        exact_family.push(family_while_owned.wrapper_process.clone());
+        let current_processes = crate::process::inspect_process_table().unwrap();
+        assert!(
+            !crate::process::matching_processes(&exact_family, &current_processes).is_empty(),
+            "the exact persisted run-step family is still live while its slot remains owned"
+        );
+        assert_eq!(
+            test_execution_slot_disposition(&fixture.store, "unrelated-run"),
+            "unknown"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .test_connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM execution_slots WHERE owner_id='unrelated-run' AND disposition='unknown'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "the seeded unrelated reservation remains present and unchanged"
+        );
+
+        let recovery_deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut reconnected = false;
+        let mut matching_terminal_proof = false;
+        let mut verified_cancelled_writer_may_be_terminated = false;
+        while std::time::Instant::now() < recovery_deadline {
+            let report = FactoryRuntimeObservationServices::recover_agents(
+                &mut services,
+                &mut fixture.store,
+                fixture.generation,
+                super::unix_now_seconds().unwrap(),
+            )
+            .unwrap();
+            if fs::read_to_string(&subscription_count).is_ok_and(|text| text.trim() == "2")
+                && let Ok(pid) = fs::read_to_string(&replacement_reader_pid)
+                && let Ok(pid) = pid.trim().parse::<u32>()
+                && let Some(identity) = crate::process::process_identity_for_pid(pid).unwrap()
+                && identity.quality == ProcessIdentityQuality::KernelBirthToken
+            {
+                reconnected = true;
+            }
+            let slot = test_execution_slot_disposition(&fixture.store, &fixture.slot_owner_id);
+            if slot == "released" {
+                let family = spool.read_run_family_record().unwrap().unwrap();
+                assert_eq!(family.coverage, RunFamilyCoverage::Complete);
+                wait_for_family_absence(&family);
+                let cleanup = spool
+                    .read_block_loss_cleanup_snapshot()
+                    .unwrap()
+                    .expect("recovery must persist its exact absence proof");
+                assert_eq!(cleanup.agent_run_id, fixture.authority.agent_run_id);
+                assert_eq!(cleanup.reservation_epoch, fixture.reservation.project_epoch);
+                assert!(
+                    crate::process::matching_processes(
+                        &cleanup.process_tree,
+                        &crate::process::inspect_process_table().unwrap()
+                    )
+                    .is_empty()
+                );
+                let child_status = shim.wait_bounded(Duration::from_secs(5)).unwrap();
+                let mut child_stderr = String::new();
+                if let Some(mut pipe) = shim.child.stderr.take() {
+                    use std::io::Read;
+                    pipe.read_to_string(&mut child_stderr).unwrap();
+                }
+                match spool.read_turn_result(&start) {
+                    Ok(result) => {
+                        assert!(matches!(
+                            result.receipt.outcome,
+                            crate::run_step::TurnOutcome::Cancelled
+                        ));
+                        result.validate_for(&start).unwrap();
+                        assert_eq!(result.receipt.processes.len(), family.process_tree.len());
+                        assert!(
+                            family.process_tree.iter().all(|identity| {
+                                result.receipt.processes.iter().any(|observed| {
+                                    observed.pid == identity.pid
+                                        && observed.parent_pid == identity.parent_pid
+                                        && observed.process_group_id == identity.process_group_id
+                                        && observed.start_identity == identity.start_identity
+                                        && observed.identity_quality == "kernel_birth_token"
+                                })
+                            }),
+                            "cancelled receipt must bind the complete family"
+                        );
+                        verified_cancelled_writer_may_be_terminated = true;
+                        if !cleanup.cleanup_covered {
+                            assert_eq!(recovery_run.agent_state, "running");
+                            assert_eq!(recovery_run.launch_state, "running");
+                        }
+                    }
+                    Err(error)
+                        if error == "run-step spool file is not present"
+                            && cleanup.cleanup_covered =>
+                    {
+                        use std::os::unix::process::ExitStatusExt;
+                        assert!(
+                            matches!(child_status.signal(), Some(libc::SIGTERM | libc::SIGKILL)),
+                            "missing result requires covered absence proof and expected writer cancellation; status={child_status}, stderr={child_stderr}"
+                        );
+                        verified_cancelled_writer_may_be_terminated = true;
+                    }
+                    Err(error) => panic!("read terminal run-step result: {error}"),
+                }
+                assert_eq!(
+                    test_agent_launch_states(&fixture.store, &fixture.slot_owner_id),
+                    ("cancelled".into(), fixture.generation, "cancelled".into())
+                );
+                let facts = fixture
+                    .store
+                    .test_connection()
+                    .prepare(
+                        "SELECT fact_type,proof_digest FROM agent_block_lifecycle_facts WHERE agent_run_id=?1 AND reservation_epoch=?2 AND fact_type IN ('exit_confirmed','slot_released') ORDER BY fact_type",
+                    )
+                    .unwrap()
+                    .query_map(
+                        rusqlite::params![
+                            fixture.authority.agent_run_id.as_str(),
+                            fixture.reservation.project_epoch
+                        ],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                    )
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(facts.len(), 2);
+                assert_eq!(facts[0].0, "exit_confirmed");
+                assert_eq!(facts[1].0, "slot_released");
+                let proof_digest = facts[0]
+                    .1
+                    .as_deref()
+                    .ok_or("exit-confirmed proof digest was absent")
+                    .unwrap();
+                crate::domain::ids::Digest::parse(proof_digest.to_owned()).unwrap();
+                assert_eq!(facts[0].1, facts[1].1);
+                matching_terminal_proof = true;
+                if reconnected {
+                    break;
+                }
+            } else {
+                assert_eq!(slot, "live", "unknown slot dispositions fail closed");
+            }
+            assert!(report.examined <= 1);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(reconnected, "the production event reader must reconnect");
+        assert!(
+            matching_terminal_proof,
+            "a matching exact-family exit proof must accompany release"
+        );
+        assert_eq!(
+            test_execution_slot_disposition(&fixture.store, &fixture.slot_owner_id),
+            "released"
+        );
+        assert_eq!(
+            test_execution_slot_disposition(&fixture.store, "unrelated-run"),
+            "unknown"
+        );
+        let events = fixture.store.test_connection().query_row(
+            "SELECT COUNT(*) FROM agent_block_lifecycle_facts WHERE agent_run_id=?1 AND reservation_epoch=?2 AND fact_type='event_received'",
+            rusqlite::params![fixture.authority.agent_run_id.as_str(), fixture.reservation.project_epoch],
+            |row| row.get::<_, i64>(0),
+        ).unwrap();
+        assert_eq!(
+            events, 0,
+            "the close was not delivered to either event subscription"
+        );
+
+        drop(services);
+        let final_status = shim.wait_bounded(Duration::from_secs(5)).unwrap();
+        if verified_cancelled_writer_may_be_terminated {
+            use std::os::unix::process::ExitStatusExt;
+            assert!(
+                final_status.success()
+                    || matches!(final_status.signal(), Some(libc::SIGTERM | libc::SIGKILL)),
+                "verified cancelled result permits normal or signal termination only: {final_status}"
+            );
+        } else {
+            assert!(
+                final_status.success(),
+                "run-step child failed: {final_status}"
+            );
+        }
+        shim.finished = true;
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn shim_death_reparents_supervisor_without_invalidating_durable_family() {
         let root = tempdir().unwrap();
         let control_dir = root.path().join("control");
@@ -2307,7 +2830,9 @@ while (! -e $ARGV[0]) { select undef, undef, undef, 0.05; }
             .process_group(0)
             .spawn()
             .unwrap();
-        fs::write(marker, provider.id().to_string()).unwrap();
+        let pending_marker = marker.with_extension("pid.pending");
+        fs::write(&pending_marker, provider.id().to_string()).unwrap();
+        fs::rename(pending_marker, marker).unwrap();
         loop {
             if let Some(status) = provider.try_wait().unwrap() {
                 panic!("provider exited before the parent cleanup: {status}");
