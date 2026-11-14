@@ -32,7 +32,7 @@ Agents run unattended, so give the provider the permission mode you want, for ex
 args = ["--permission-mode", "auto"]
 ```
 
-Claude Code asks whether to trust each new folder, and that prompt would stop a Coordinator. Trust the worktrees directory once: run `claude` in `${XDG_STATE_HOME:-~/.local/state}/rex-projects/worktrees` and accept. New worktrees under it are then trusted. Codex needs the same directory in its trusted projects.
+Claude Code asks whether to trust a new folder, and that prompt stops a Coordinator until you answer it. In our runs, a Ticket worktree was trusted once its Project repository had been trusted, so open `claude` once in each Project repository if you have not already. A Coordinator that reports no status for a minute, as when it waits on this prompt, appears under "Needs you" in the dashboard. Codex has its own list of trusted projects.
 
 ## Rex plugin
 
