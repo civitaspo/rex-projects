@@ -349,10 +349,18 @@ pub(crate) struct CompleteRexSessionInventory {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CompleteObservedWindow {
     window_id: String,
+    label: String,
     block_labels: Vec<String>,
 }
 
 impl CompleteRexSessionInventory {
+    pub(crate) fn ticket_window_is_absent(&self, window_id: &str, label: &str) -> bool {
+        !self
+            .windows
+            .iter()
+            .any(|window| window.window_id == window_id || window.label == label)
+    }
+
     pub(crate) fn matches_view(&self, server: &str, session: &str, window: &str) -> bool {
         self.server_instance_id == server
             && self.session_id == session
@@ -1739,9 +1747,9 @@ fn parse_complete_session_inventory(
                 block_labels.push(block_label.to_owned());
             }
         }
-        let _ = label;
         complete_windows.push(CompleteObservedWindow {
             window_id: window_id.to_owned(),
+            label: label.to_owned(),
             block_labels,
         });
     }
