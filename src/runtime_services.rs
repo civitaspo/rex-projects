@@ -3879,11 +3879,7 @@ impl FactoryRuntimeServices for RuntimeServices {
             return Ok(false);
         };
         let qualification_digest = qualification.canonical_digest()?;
-        let wake_inputs = store.pending_role_wake_inputs(
-            &candidate.project_id,
-            &candidate.role_session_id,
-            256,
-        )?;
+        let wake_inputs = store.pending_supervisor_wake_inputs(&candidate.project_id, 256)?;
         if wake_inputs.is_empty() {
             return Ok(false);
         }

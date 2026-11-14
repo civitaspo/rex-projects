@@ -870,6 +870,26 @@ impl ConfigStore {
         tx.commit().map_err(|error| error.to_string())
     }
 
+    /// Keep a learning decision from consuming operational wakes assigned to the same turn.
+    pub(crate) fn pending_supervisor_wake_inputs(
+        &self,
+        project_id: &ProjectId,
+        limit: usize,
+    ) -> Result<Vec<PendingRoleWakeInput>, String> {
+        let mut inputs = self.pending_role_wake_inputs(
+            project_id,
+            &format!("project:{project_id}:supervisor"),
+            limit,
+        )?;
+        if inputs
+            .iter()
+            .any(|wake| wake.source_type != "learning_batch")
+        {
+            inputs.retain(|wake| wake.source_type != "learning_batch");
+        }
+        Ok(inputs)
+    }
+
     /// Read an ordered candidate snapshot for a scheduler. This is advisory only: the launch
     /// preparation transaction must recheck and claim these exact IDs before creating a run.
     pub fn pending_role_wake_inputs(
@@ -1476,6 +1496,10 @@ fn load_exact_wake_inputs(
     }
     Ok(inputs)
 }
+
+#[cfg(test)]
+#[path = "agent_runtime/supervisor_wake_tests.rs"]
+mod supervisor_wake_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
