@@ -32,7 +32,7 @@ Agents run unattended, so give the provider the permission mode you want, for ex
 args = ["--permission-mode", "auto"]
 ```
 
-Claude Code asks whether to trust a new folder, and that prompt stops a Coordinator until you answer it. In our runs, a Ticket worktree was trusted once its Project repository had been trusted, so open `claude` once in each Project repository if you have not already. A Coordinator that reports no status for a minute, as when it waits on this prompt, appears under "Needs you" in the dashboard. Codex has its own list of trusted projects.
+Claude Code asks whether to trust a new folder, and that prompt stops a Coordinator until you answer it. In our runs, a Ticket worktree was trusted once its Project repository had been trusted, so open `claude` once in each Project repository if you have not already. A Coordinator that reports no status for a minute, as when it waits on this prompt, appears under "Needs you" in the dashboard. Codex asks the same question and says that trusting a worktree applies to its repository root.
 
 ## Rex plugin
 
@@ -46,7 +46,7 @@ require("rex_projects").setup({
 })
 ```
 
-Adjust the path to your clone. The plugin adds two actions: `rex_projects_dashboard` opens the dashboard as a floating layer, and `rex_projects_serve` shows the control session `rxp`, creating it with `rex-projects serve` when it is missing. Keys are bound only when given.
+Adjust the path to your clone. Jumping from the dashboard to a Ticket in another session asks the Rex app to switch sessions, which needs Remote Control turned on in Rex Settings under Rex Server. Without it, the dashboard still zooms the Coordinator's pane in its session and says that the app did not switch. The plugin adds two actions: `rex_projects_dashboard` opens the dashboard as a floating layer, and `rex_projects_serve` shows the control session `rxp`, creating it with `rex-projects serve` when it is missing. Keys are bound only when given.
 
 ## External trackers
 

@@ -269,8 +269,18 @@ fn jump(row: &TicketRow) -> Result<()> {
         .as_ref()
         .with_context(|| format!("{} has no Coordinator block", row.ticket_id))?;
     let current = std::env::var("REX_SESSION").ok();
-    for args in jump_commands(target, current.as_deref()) {
-        run_rex(&args)?;
+    let mut commands = jump_commands(target, current.as_deref()).into_iter();
+    if let Some(zoom) = commands.next() {
+        run_rex(&zoom)?;
+    }
+    for select in commands {
+        run_rex(&select).with_context(|| {
+            format!(
+                "zoomed {} in its session, but the app did not switch to it; \
+                 turn on Remote Control in Rex Settings under Rex Server",
+                row.ticket_id
+            )
+        })?;
     }
     Ok(())
 }
