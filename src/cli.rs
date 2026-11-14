@@ -172,6 +172,7 @@ enum HumanCommand {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum HumanChoiceArg {
     Approve,
+    Answer,
     RequestChanges,
     RevisePlan,
     Defer,
@@ -4777,6 +4778,7 @@ fn human_command(
             let expected_subject_digest = Digest::parse(subject_digest).map_err(CliError::usage)?;
             let choice = match choice {
                 HumanChoiceArg::Approve => crate::human_runtime::HumanDecisionChoice::Approve,
+                HumanChoiceArg::Answer => crate::human_runtime::HumanDecisionChoice::Answer,
                 HumanChoiceArg::RequestChanges => {
                     crate::human_runtime::HumanDecisionChoice::RequestChanges
                 }

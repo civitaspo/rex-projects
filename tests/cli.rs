@@ -2151,3 +2151,287 @@ fn project_start_queues_only_to_the_active_foreground_owner() {
         "foreground controller exited with {status}; stderr: {stderr}"
     );
 }
+
+#[test]
+fn human_respond_answer_queues_validated_coordinator_clarification_and_wakes_it() {
+    use rex_projects::domain::ids::{
+        Digest, HumanRequestId, ProjectId, Revision, TicketId, TicketNamespace, TicketRunId,
+    };
+    use rex_projects::human::{ReviewBundle, review_bundle_digest};
+    use rex_projects::human_runtime::{
+        HumanDecisionChoice, HumanPurpose, HumanRuntimeRequest, HumanSubjectBinding,
+        HumanSubjectKind,
+    };
+    use rex_projects::launch::{RexView, RexViewKind};
+    use rex_projects::store::{ConfigStore, OwnerMetadata};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let temp = tempfile::tempdir().unwrap();
+    let (config, state, home) = fixture(&temp);
+    let applied = command(&config, &state, &home)
+        .args(["config", "apply", "--bootstrap"])
+        .output()
+        .unwrap();
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+
+    let mut store = ConfigStore::open_control(&state).unwrap();
+    let project_id = ProjectId::parse("goal_project").unwrap();
+    let project = store.project(&project_id).unwrap().unwrap();
+    let generation = store
+        .start_owner(&OwnerMetadata {
+            owner_nonce: "human-answer-cli-test-owner".into(),
+            state_root: state.display().to_string(),
+            config_source: project.config_source.clone(),
+            process_start_identity: "human-answer-cli-test-process".into(),
+            executable_path: std::env::current_exe().unwrap().display().to_string(),
+            executable_digest: "a".repeat(64),
+            rex_endpoint: None,
+            rex_server_identity: None,
+            rex_session_id: None,
+            rex_block_id: None,
+        })
+        .unwrap();
+    let namespace = TicketNamespace::parse("fixture-clarification").unwrap();
+    let ticket_id = TicketId::parse("ISSUE-ANSWER").unwrap();
+    let ticket_run_id = TicketRunId::parse("run-clarification-answer").unwrap();
+    store
+        .create_ticket_run(
+            generation,
+            &project_id,
+            &namespace,
+            &ticket_id,
+            &ticket_run_id,
+            1,
+            "coordinator_waiting",
+            "In Progress",
+        )
+        .unwrap();
+
+    let view_id = RexView::derive_id(
+        &project_id,
+        RexViewKind::Ticket,
+        Some(namespace.as_str()),
+        Some(ticket_id.as_str()),
+        1,
+    )
+    .unwrap();
+    store
+        .register_rex_view(
+            generation,
+            &RexView {
+                view_id: view_id.clone(),
+                project_id: project_id.clone(),
+                kind: RexViewKind::Ticket,
+                ticket_namespace: Some(namespace.as_str().into()),
+                ticket_id: Some(ticket_id.as_str().into()),
+                view_epoch: 1,
+                rex_server_identity: "fixture-server".into(),
+                rex_session_id: "fixture-session".into(),
+                rex_window_id: "fixture-ticket-window".into(),
+            },
+        )
+        .unwrap();
+
+    let bundle = ReviewBundle {
+        title: "Coordinator clarification".into(),
+        summary: "The Coordinator needs one implementation detail.".into(),
+        risk: None,
+        repositories: vec![],
+        evidence: vec![],
+        unknowns: vec![],
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let request = HumanRuntimeRequest {
+        request_id: HumanRequestId::parse("clarify-answer-cli").unwrap(),
+        purpose: HumanPurpose::CoordinatorClarification,
+        subject: HumanSubjectBinding {
+            project_id: project_id.clone(),
+            kind: HumanSubjectKind::TicketRun,
+            subject_id: ticket_run_id.as_str().into(),
+            ticket_run_id: Some(ticket_run_id.clone()),
+            revision: Revision(0),
+            material_digest: Digest::parse("a".repeat(64)).unwrap(),
+            configuration_digest: project.config_digest.clone(),
+            policy_digest: Digest::parse("b".repeat(64)).unwrap(),
+            bundle_digest: review_bundle_digest(&bundle).unwrap(),
+        },
+        question: "Which deployment region should this change target?".into(),
+        choices: vec![
+            HumanDecisionChoice::Answer,
+            HumanDecisionChoice::Defer,
+            HumanDecisionChoice::Cancel,
+        ],
+        expires_at_unix: now + 3_600,
+        review_bundle: bundle,
+    };
+    let artifact = temp.path().join("coordinator-clarification.html");
+    std::fs::write(&artifact, "<!doctype html><title>Clarification</title>").unwrap();
+    assert!(
+        store
+            .register_human_request(generation, &request, &view_id, &artifact, now)
+            .unwrap()
+    );
+
+    let subject_digest = request.subject.digest().unwrap();
+    let invoke_response = |choice: &str, digest: &str, explanation: &str, response_id: &str| {
+        command(&config, &state, &home)
+            .args([
+                "--json",
+                "human",
+                "respond",
+                request.request_id.as_str(),
+                "--subject-digest",
+                digest,
+                "--choice",
+                choice,
+                "--explanation",
+                explanation,
+                "--response-id",
+                response_id,
+            ])
+            .output()
+            .unwrap()
+    };
+    let assert_conflict = |output: &std::process::Output, message: &str| {
+        assert_eq!(output.status.code(), Some(4));
+        let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(body["error"]["code"], "conflict");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|actual| actual.contains(message)),
+            "expected conflict message containing {message:?}, got {}",
+            body["error"]["message"]
+        );
+    };
+
+    let stale_digest = invoke_response("answer", &"c".repeat(64), "Use west-2.", "stale-answer");
+    assert_conflict(&stale_digest, "human request subject has changed");
+    let blank_answer = invoke_response("answer", subject_digest.as_str(), "  ", "blank-answer");
+    assert_conflict(
+        &blank_answer,
+        "Coordinator clarification answer must include nonempty answer text",
+    );
+    let disallowed_choice = invoke_response(
+        "approve",
+        subject_digest.as_str(),
+        "Approve.",
+        "wrong-choice",
+    );
+    assert_conflict(
+        &disallowed_choice,
+        "choice is not offered for this human request",
+    );
+    for marker in ["REX_PROJECTS_AGENT", "REX_PROJECTS_CONTEXT"] {
+        let marked = command(&config, &state, &home)
+            .env(marker, "1")
+            .args([
+                "human",
+                "respond",
+                request.request_id.as_str(),
+                "--subject-digest",
+                subject_digest.as_str(),
+                "--choice",
+                "answer",
+                "--explanation",
+                "Use west-2.",
+                "--response-id",
+                "agent-answer",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(marked.status.code(), Some(77), "{marker}");
+        assert!(String::from_utf8_lossy(&marked.stderr).contains("human host context"));
+    }
+
+    let mut plan_request = request.clone();
+    plan_request.request_id = HumanRequestId::parse("plan-decision-no-answer").unwrap();
+    plan_request.purpose = HumanPurpose::PlanDecision;
+    plan_request.subject.kind = HumanSubjectKind::Plan;
+    plan_request.subject.subject_id = "plan-1".into();
+    plan_request.choices = vec![HumanDecisionChoice::Approve, HumanDecisionChoice::Defer];
+    assert!(
+        store
+            .register_human_request(generation, &plan_request, &view_id, &artifact, now)
+            .unwrap()
+    );
+    let plan_subject_digest = plan_request.subject.digest().unwrap();
+    let answer_for_plan = command(&config, &state, &home)
+        .args([
+            "--json",
+            "human",
+            "respond",
+            plan_request.request_id.as_str(),
+            "--subject-digest",
+            plan_subject_digest.as_str(),
+            "--choice",
+            "answer",
+            "--explanation",
+            "A freeform answer is not offered here.",
+            "--response-id",
+            "answer-for-plan",
+        ])
+        .output()
+        .unwrap();
+    assert_conflict(
+        &answer_for_plan,
+        "choice is not offered for this human request",
+    );
+
+    let answer = "Use region west-2; it matches the existing deployment target.";
+    let queued = invoke_response("answer", subject_digest.as_str(), answer, "answer-1");
+    assert!(
+        queued.status.success(),
+        "stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&queued.stdout),
+        String::from_utf8_lossy(&queued.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&queued.stdout).unwrap();
+    assert_eq!(receipt["state"], "queued_for_validation");
+    assert_eq!(receipt["request_id"], request.request_id.as_str());
+    assert_eq!(receipt["response_id"], "answer-1");
+
+    let queued_intents = store.pending_human_decisions(generation, 10).unwrap();
+    assert_eq!(queued_intents.len(), 1);
+    assert_eq!(queued_intents[0].intent.response_id, "answer-1");
+    assert_eq!(
+        queued_intents[0].intent.expected_subject_digest,
+        subject_digest
+    );
+    assert_eq!(
+        queued_intents[0].intent.explanation.as_deref(),
+        Some(answer)
+    );
+    assert_eq!(
+        store
+            .process_human_decision(
+                generation,
+                "answer-1",
+                &request.subject,
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            )
+            .unwrap(),
+        rex_projects::store::human::HumanDecisionResult::Applied
+    );
+
+    let coordinator_session = format!("ticket_run:{}:coordinator", ticket_run_id.as_str());
+    let wake_inputs = store
+        .pending_role_wake_inputs(&project_id, &coordinator_session, 10)
+        .unwrap();
+    assert_eq!(wake_inputs.len(), 1);
+    assert_eq!(wake_inputs[0].source_type, "human_decision");
+    assert_eq!(wake_inputs[0].source_id, "answer-1");
+    assert_eq!(wake_inputs[0].payload_json["choice"], "answer");
+    assert_eq!(wake_inputs[0].payload_json["explanation"], answer);
+    store.stop_owner(generation).unwrap();
+}
