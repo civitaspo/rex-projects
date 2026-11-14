@@ -3,7 +3,7 @@
 //! This module contains no provider, Rex, or SQLite calls. Callers persist each
 //! returned decision before performing its effects.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use sha2::Digest as _;
 
@@ -740,6 +740,36 @@ fn validate_merge_reassessment_plan_scope(
     Ok(())
 }
 
+fn prepared_worktree_node_request(
+    node: &crate::engine::orchestration::ValidatedWorkNode,
+    repositories: &BTreeMap<crate::domain::ids::RepositoryId, crate::config::RepositoryConfig>,
+    configured_commit_mode: crate::domain::types::CommitMode,
+) -> Result<crate::delivery_runtime::PreparedWorktreeNodeRequest, String> {
+    let crate::engine::orchestration::WorkBaseSource::ControllerObservedCommit { commit } =
+        &node.base
+    else {
+        return Err(format!(
+            "work node {} depends on a predecessor head that is not available before implementation",
+            node.id
+        ));
+    };
+    if !repositories.contains_key(&node.repository) {
+        return Err("validated work node repository is no longer configured".into());
+    }
+    let commit_mode = match configured_commit_mode {
+        // Auto qualification proves the provider's automatic turn policy, not
+        // this repository's native Git commit capabilities.
+        crate::domain::types::CommitMode::Auto => crate::domain::types::CommitMode::Host,
+        explicit => explicit,
+    };
+    Ok(crate::delivery_runtime::PreparedWorktreeNodeRequest {
+        work_node_id: node.id.clone(),
+        repository_id: node.repository.clone(),
+        expected_base_sha: commit.clone(),
+        commit_mode,
+    })
+}
+
 fn apply_agent_result(
     store: &mut ConfigStore,
     owner_generation: u64,
@@ -748,7 +778,7 @@ fn apply_agent_result(
     services: &mut impl FactoryRuntimeServices,
     result: &crate::store::agent_results::IngestedAgentResult,
 ) -> Result<bool, String> {
-    use crate::engine::orchestration::{RoleOutputKind, RoleResultPayload, WorkBaseSource};
+    use crate::engine::orchestration::{RoleOutputKind, RoleResultPayload};
 
     let binding = &result.validated.binding;
     if binding.role == Role::Supervisor
@@ -1185,21 +1215,13 @@ fn apply_agent_result(
     {
         // A dependent node must be prepared from its predecessor's validated
         // accepted head; preparing it from trunk would violate the declared Git base.
-        let WorkBaseSource::ControllerObservedCommit { commit } = &node.base else {
-            return Err(format!(
-                "work node {} depends on a predecessor head that is not available before implementation",
-                node.id
-            ));
-        };
-        if !config.repositories.contains_key(&node.repository) {
-            return Err("validated work node repository is no longer configured".into());
-        }
-        work_nodes.push(crate::delivery_runtime::PreparedWorktreeNodeRequest {
-            work_node_id: node.id.clone(),
-            repository_id: node.repository.clone(),
-            expected_base_sha: commit.clone(),
-            commit_mode: services.profile_commit_mode(&binding.project_id, Role::Worker)?,
-        });
+        let configured_commit_mode =
+            services.profile_commit_mode(&binding.project_id, Role::Worker)?;
+        work_nodes.push(prepared_worktree_node_request(
+            node,
+            &config.repositories,
+            configured_commit_mode,
+        )?);
     }
     if work_nodes.is_empty() {
         return Err("Coordinator plan contains no implementation Worker nodes".into());
@@ -4508,6 +4530,55 @@ pub(crate) mod tests {
     use crate::domain::types::{Role, TicketStatus};
     use crate::engine::reducer::Phase;
     use sha2::Digest as ShaDigest;
+
+    #[test]
+    fn plan_ready_prepare_payload_resolves_auto_before_persistence() {
+        use crate::delivery_runtime::PrepareWorktreesEffectPayload;
+        use crate::domain::ids::{Digest, RepositoryId, TicketId, TicketNamespace, TicketRunId};
+        use crate::domain::types::CommitMode;
+        use crate::engine::orchestration::{ValidatedWorkNode, WorkBaseSource, WorkNodeId};
+
+        let config: Config =
+            toml::from_str(include_str!("../../examples/fixture/config.toml")).unwrap();
+        let node = ValidatedWorkNode {
+            id: WorkNodeId::parse("worker-1").unwrap(),
+            repository: RepositoryId::parse("example").unwrap(),
+            base: WorkBaseSource::ControllerObservedCommit {
+                commit: "b".repeat(40),
+            },
+            task: "implement the accepted plan".into(),
+            depends_on: Vec::new(),
+            required_evidence: vec!["implementation".into()],
+            role: Role::Worker,
+        };
+        for (configured, expected) in [
+            (CommitMode::Auto, "host"),
+            (CommitMode::Native, "native"),
+            (CommitMode::Host, "host"),
+        ] {
+            let work_node =
+                super::prepared_worktree_node_request(&node, &config.repositories, configured)
+                    .unwrap();
+            let payload = PrepareWorktreesEffectPayload {
+                schema_version: 1,
+                source_revision: 3,
+                configuration_digest: Digest::parse("a".repeat(64)).unwrap(),
+                ticket_namespace: TicketNamespace::parse("fixture").unwrap(),
+                ticket_id: TicketId::parse("T-1").unwrap(),
+                ticket_run_id: TicketRunId::parse("run-1").unwrap(),
+                work_nodes: vec![work_node],
+            };
+
+            let (request_json, _) =
+                crate::delivery_runtime::canonical_delivery_payload(&payload).unwrap();
+            let recorded: serde_json::Value = serde_json::from_str(&request_json).unwrap();
+            assert_eq!(recorded["work_nodes"][0]["commit_mode"], expected);
+            assert_eq!(
+                recorded["work_nodes"][0]["expected_base_sha"],
+                "b".repeat(40)
+            );
+        }
+    }
 
     struct WorkerPublicationFixtureServices {
         configuration_digest: Digest,
