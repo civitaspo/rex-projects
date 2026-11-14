@@ -146,6 +146,14 @@ pub enum Event {
         ticket_id: String,
         reason: String,
     },
+    /// A tracker reports that an external ref of an active Ticket was closed
+    /// outside rex-projects. It informs the UI and the Coordinator only.
+    ExternalChanged {
+        ticket_id: String,
+        tracker: String,
+        reference: String,
+        status: String,
+    },
     AgentCreated {
         agent_id: String,
         ticket_id: String,
@@ -188,6 +196,7 @@ impl Event {
             Self::TicketCompleted { .. } => "ticket_completed",
             Self::TicketCancelled { .. } => "ticket_cancelled",
             Self::TicketFailed { .. } => "ticket_failed",
+            Self::ExternalChanged { .. } => "external_changed",
             Self::AgentCreated { .. } => "agent_created",
             Self::AgentLaunched { .. } => "agent_launched",
             Self::AgentSessionBound { .. } => "agent_session_bound",
@@ -207,6 +216,7 @@ impl Event {
             | Self::TicketCompleted { ticket_id, .. }
             | Self::TicketCancelled { ticket_id, .. }
             | Self::TicketFailed { ticket_id, .. }
+            | Self::ExternalChanged { ticket_id, .. }
             | Self::AgentCreated { ticket_id, .. } => Some(ticket_id),
             _ => None,
         }
