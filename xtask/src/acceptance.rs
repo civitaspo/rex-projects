@@ -909,6 +909,14 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
     let stopped = stop_proof["status"] == "passed";
     trace.push(json!({"step":"controller_stop","status":if stopped {"passed"} else {"unconfirmed"},"evidence":stop_proof}));
     if !stopped {
+        let cleanup = cleanup_exited_controller_ui(
+            &request,
+            &window,
+            &block,
+            &controller_identity,
+            &mut trace,
+        );
+        trace.push(cleanup);
         return unsupported(
             request.fixture_root,
             &trace,
@@ -4754,6 +4762,144 @@ fn rex_capture(request: &Request<'_>, block: &str) -> Result<ProcessOutput, Stri
     )
 }
 
+fn cleanup_exited_controller_ui(
+    request: &Request<'_>,
+    window: &str,
+    block: &str,
+    controller: &ProcessIdentity,
+    trace: &mut Vec<Value>,
+) -> Value {
+    let mut close_attempted = false;
+    let outcome = (|| -> Result<(), String> {
+        verify_exited_controller_ui(request, window, block, controller)?;
+        let capture = rex_capture(request, block)?;
+        require_success("archive exited controller output", &capture)?;
+        trace.push(json!({
+            "step":"exited_controller_output",
+            "status":"captured",
+            "block_id":block,
+            "stdout_truncated":capture.stdout_truncated,
+            "evidence":String::from_utf8_lossy(&capture.stdout),
+        }));
+        verify_exited_controller_ui(request, window, block, controller)?;
+        close_attempted = true;
+        let close = rex_call(
+            request,
+            &["block", "close", "--session", request.rex_session, block],
+        )?;
+        require_success("close exited controller UI block", &close)?;
+        let identity = rex_call(request, &["whoami", "--json"])?;
+        require_success(
+            "recheck Rex instance after controller UI cleanup",
+            &identity,
+        )?;
+        let identity: Value =
+            serde_json::from_slice(&identity.stdout).map_err(|error| error.to_string())?;
+        if identity["instance_id"].as_str() != Some(request.expected_instance) {
+            return Err("Rex instance changed after controller UI cleanup".into());
+        }
+        let blocks = rex_call(
+            request,
+            &["block", "ls", "--session", request.rex_session, "--json"],
+        )?;
+        require_success("verify exited controller UI absence", &blocks)?;
+        let blocks: Value =
+            serde_json::from_slice(&blocks.stdout).map_err(|error| error.to_string())?;
+        let blocks = blocks["blocks"]
+            .as_array()
+            .ok_or("Rex block listing omitted blocks")?;
+        if blocks
+            .iter()
+            .any(|item| item["block_id"].as_str() == Some(block))
+        {
+            return Err("exited controller UI block remains after close".into());
+        }
+        Ok(())
+    })();
+    json!({
+        "step":"exited_controller_ui_cleanup",
+        "status":if outcome.is_ok() {"closed"} else if close_attempted {"unconfirmed"} else {"preserved"},
+        "window_id":window,
+        "block_id":block,
+        "close_attempted":close_attempted,
+        "reason":outcome.err(),
+    })
+}
+
+fn verify_exited_controller_ui(
+    request: &Request<'_>,
+    window: &str,
+    block: &str,
+    controller: &ProcessIdentity,
+) -> Result<(), String> {
+    if controller.quality != ProcessIdentityQuality::KernelBirthToken {
+        return Err("controller UI cleanup requires the original kernel birth identity".into());
+    }
+    match process_identity_for_pid(controller.pid).map_err(|error| error.to_string())? {
+        None => {}
+        Some(current)
+            if current.quality == ProcessIdentityQuality::KernelBirthToken
+                && current.start_identity != controller.start_identity => {}
+        Some(_) => return Err("original controller process absence is unconfirmed".into()),
+    }
+    let identity = rex_call(request, &["whoami", "--json"])?;
+    require_success(
+        "verify Rex instance before controller UI cleanup",
+        &identity,
+    )?;
+    let identity: Value =
+        serde_json::from_slice(&identity.stdout).map_err(|error| error.to_string())?;
+    if identity["instance_id"].as_str() != Some(request.expected_instance) {
+        return Err("Rex instance changed before controller UI cleanup".into());
+    }
+    let blocks = rex_call(
+        request,
+        &["block", "ls", "--session", request.rex_session, "--json"],
+    )?;
+    require_success("verify owned controller UI membership", &blocks)?;
+    let blocks: Value =
+        serde_json::from_slice(&blocks.stdout).map_err(|error| error.to_string())?;
+    let blocks = blocks["blocks"]
+        .as_array()
+        .ok_or("Rex block listing omitted blocks")?;
+    let matching = blocks
+        .iter()
+        .filter(|item| item["block_id"].as_str() == Some(block))
+        .collect::<Vec<_>>();
+    if matching.len() != 1
+        || matching[0]["window_id"].as_str() != Some(window)
+        || matching[0]["flavor"].as_str() != Some("com.superlogical.terminal.shell")
+    {
+        return Err("owned controller UI block membership changed".into());
+    }
+    let process = rex_call(
+        request,
+        &[
+            "block",
+            "call",
+            "--session",
+            request.rex_session,
+            "--block",
+            block,
+            "process",
+        ],
+    )?;
+    require_success("observe exited controller UI process", &process)?;
+    let process: RexProcessObservation =
+        serde_json::from_slice(&process.stdout).map_err(|error| error.to_string())?;
+    if process.last_exit.is_none()
+        || process.child.is_some()
+        || process.foreground.is_some()
+        || process
+            .ancestors
+            .as_ref()
+            .is_some_and(|ancestors| !ancestors.is_empty())
+    {
+        return Err("Rex has not confirmed the controller terminal exited".into());
+    }
+    Ok(())
+}
+
 fn wait_block_exit(request: &Request<'_>, block: &str) -> bool {
     rex_call(
         request,
@@ -7725,6 +7871,175 @@ esac
             start_identity: start_identity.into(),
             command: "fixture".into(),
             quality: ProcessIdentityQuality::KernelBirthToken,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_stop_cleans_only_the_proven_exited_controller_ui_through_rex_cli() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let exited_controller = process_identity_for_pid(child.id()).unwrap().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(
+            exited_controller.quality,
+            ProcessIdentityQuality::KernelBirthToken
+        );
+        let live_controller = process_identity_for_pid(std::process::id())
+            .unwrap()
+            .unwrap();
+
+        for (case, expected) in [
+            ("exited", "closed"),
+            ("live", "preserved"),
+            ("weak-identity", "preserved"),
+            ("wrong-instance", "preserved"),
+            ("wrong-window", "preserved"),
+            ("missing-block", "preserved"),
+            ("duplicate-block", "preserved"),
+            ("wrong-flavor", "preserved"),
+            ("missing-exit", "preserved"),
+            ("child", "preserved"),
+            ("foreground", "preserved"),
+            ("ancestors", "preserved"),
+            ("capture-fails", "preserved"),
+            ("instance-changes-after-capture", "preserved"),
+            ("process-changes-after-capture", "preserved"),
+            ("instance-changes-after-close", "unconfirmed"),
+            ("block-remains-after-close", "unconfirmed"),
+        ] {
+            let fixture = tempfile::tempdir().unwrap();
+            let root = fixture.path();
+            let rex = root.join("rex");
+            fs::write(root.join("case"), case).unwrap();
+            let block = json!({"block_id":"block-owned","window_id":"window-owned","flavor":"com.superlogical.terminal.shell"});
+            let mut blocks = vec![block.clone()];
+            match case {
+                "wrong-window" => blocks[0]["window_id"] = json!("window-other"),
+                "missing-block" => blocks.clear(),
+                "duplicate-block" => blocks.push(block),
+                "wrong-flavor" => blocks[0]["flavor"] = json!("other"),
+                _ => {}
+            }
+            fs::write(
+                root.join("blocks.json"),
+                json!({"blocks":blocks}).to_string(),
+            )
+            .unwrap();
+            let mut process = json!({"last_exit":{"exit_code":5}});
+            let process_info =
+                json!({"pid":live_controller.pid,"user_id":0,"name":"live-test-process"});
+            match case {
+                "missing-exit" => process = json!({}),
+                "child" | "foreground" => process[case] = process_info.clone(),
+                "ancestors" => process[case] = json!([process_info]),
+                _ => {}
+            }
+            fs::write(root.join("process.json"), process.to_string()).unwrap();
+            fs::write(
+                &rex,
+                r#"#!/bin/sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+scenario=$(cat "$root/case")
+[ "$1" = '--autostart=false' ] && [ "$2" = '--server' ] && [ "$3" = 'unix:///owned/rex.sock' ] || exit 70
+shift 3
+printf '%s\n' "$*" >> "$root/calls"
+case "$*" in
+  'whoami --json')
+    instance=instance-owned
+    if [ "$scenario" = wrong-instance ] ||
+       { [ "$scenario" = instance-changes-after-capture ] && [ -f "$root/captured" ]; } ||
+       { [ "$scenario" = instance-changes-after-close ] && [ -f "$root/closed" ]; }; then
+      instance=instance-other
+    fi
+    printf '{"instance_id":"%s"}\n' "$instance" ;;
+  'block ls --session session-owned --json')
+    if [ -f "$root/closed" ] && [ "$scenario" != block-remains-after-close ]; then
+      printf '{"blocks":[]}\n'
+    else
+      cat "$root/blocks.json"
+    fi ;;
+  'block call --session session-owned --block block-owned process')
+    if [ "$scenario" = process-changes-after-capture ] && [ -f "$root/captured" ]; then
+      printf '{"last_exit":{"exit_code":5},"child":{"pid":1,"user_id":0,"name":"unexpected"}}\n'
+    else
+      cat "$root/process.json"
+    fi ;;
+  'capture --session session-owned --block block-owned --trim --unwrap')
+    [ "$scenario" != capture-fails ] || exit 71
+    : > "$root/captured"
+    printf 'retained controller output\n' ;;
+  'block close --session session-owned block-owned')
+    [ -f "$root/captured" ] || exit 72
+    : > "$root/closed"
+    printf '{}\n' ;;
+  *) exit 73 ;;
+esac
+"#,
+            ).unwrap();
+            fs::set_permissions(&rex, fs::Permissions::from_mode(0o755)).unwrap();
+            let request = Request {
+                cli: Path::new("/usr/bin/false"),
+                rex: &rex,
+                rex_server: "unix:///owned/rex.sock",
+                rex_session: "session-owned",
+                expected_instance: "instance-owned",
+                fixture_root: root,
+            };
+            let mut controller = if case == "live" {
+                live_controller.clone()
+            } else {
+                exited_controller.clone()
+            };
+            if case == "weak-identity" {
+                controller.quality = ProcessIdentityQuality::SecondPrecision;
+            }
+            let mut trace = vec![
+                json!({"step":"controller_stop","status":"unconfirmed","evidence":{"occupied_slots":1}}),
+            ];
+            let cleanup = cleanup_exited_controller_ui(
+                &request,
+                "window-owned",
+                "block-owned",
+                &controller,
+                &mut trace,
+            );
+            assert_eq!(cleanup["status"], expected, "{case}: {cleanup}");
+            let close_attempted = expected != "preserved";
+            assert_eq!(cleanup["close_attempted"], close_attempted, "{case}");
+            assert_eq!(root.join("closed").exists(), close_attempted, "{case}");
+            let calls = fs::read_to_string(root.join("calls")).unwrap_or_default();
+            assert_eq!(
+                calls.lines().filter(|line| line.contains("close")).count(),
+                usize::from(close_attempted),
+                "{case}: {calls}"
+            );
+            assert_eq!(trace[0]["status"], "unconfirmed");
+            assert_eq!(trace[0]["evidence"]["occupied_slots"], 1);
+            if close_attempted {
+                assert_eq!(trace[1]["evidence"], "retained controller output\n");
+                assert_eq!(trace[1]["stdout_truncated"], false);
+                assert!(
+                    calls.contains(
+                        "block close --session session-owned block-owned\nwhoami --json\n"
+                    )
+                );
+            }
+            if case == "exited" {
+                assert!(calls.ends_with("block ls --session session-owned --json\n"));
+                trace.push(cleanup);
+                unsupported(root, &trace, "controller stop remains incomplete", true).unwrap();
+                let report: Value =
+                    serde_json::from_slice(&fs::read(root.join("acceptance-trace.json")).unwrap())
+                        .unwrap();
+                assert_eq!(report["status"], "UNSUPPORTED");
+                assert_eq!(report["trace"][0]["status"], "unconfirmed");
+                assert_eq!(report["trace"][2]["status"], "closed");
+            }
         }
     }
 
