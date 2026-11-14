@@ -245,6 +245,11 @@ impl Store {
         Ok(events)
     }
 
+    /// The underlying connection, for modules that keep their own tables.
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
     /// Drops the projections and rebuilds them by replaying every event.
     pub fn rebuild(&mut self) -> Result<()> {
         let tx = self
@@ -515,6 +520,9 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event) -> Result<()> {
                 "UPDATE tickets SET summary = ?2, outcome = ?3, question = NULL WHERE id = ?1",
                 params![ticket_id, reason, serde_json::to_value(outcome)?.as_str()],
             )?;
+        }
+        Event::ExternalChanged { ticket_id, .. } => {
+            ticket_state(tx, ticket_id)?;
         }
         Event::AgentCreated {
             agent_id,
