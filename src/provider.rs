@@ -88,6 +88,9 @@ impl Harness<'_> {
                         toml_string(&self.exe.display().to_string())
                     ),
                     r#"mcp_servers.rex_projects.args=["mcp"]"#.to_owned(),
+                    // Without this, an interactive Codex asks before every
+                    // rex-projects tool call, and `-a never` refuses them.
+                    r#"mcp_servers.rex_projects.default_tools_approval_mode="approve""#.to_owned(),
                     format!("mcp_servers.rex_projects.env={{{}}}", env.join(", ")),
                 ] {
                     argv.extend(["-c".into(), config]);
@@ -449,7 +452,7 @@ mod tests {
             .filter(|w| w[0] == "-c")
             .map(|w| w[1].as_str())
             .collect();
-        assert_eq!(configs.len(), 4);
+        assert_eq!(configs.len(), 5);
         // Every override must parse as TOML, as Codex parses it.
         let parsed: toml::Table = toml::from_str(&configs.join("\n")).unwrap();
         assert_eq!(
@@ -459,6 +462,10 @@ mod tests {
         let server = &parsed["mcp_servers"]["rex_projects"];
         assert_eq!(server["command"].as_str(), Some("/bin/rex-projects"));
         assert_eq!(server["args"][0].as_str(), Some("mcp"));
+        assert_eq!(
+            server["default_tools_approval_mode"].as_str(),
+            Some("approve")
+        );
         assert_eq!(server["env"]["REXP_AGENT_LAUNCH"].as_str(), Some("2"));
 
         let resume = argv(ProviderKind::Codex, Start::Resume { session_id: "s9" });

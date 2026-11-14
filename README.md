@@ -30,7 +30,13 @@ Agents run unattended, so give the provider the permission mode you want, for ex
 ```toml
 [providers.claude]
 args = ["--permission-mode", "auto"]
+
+[providers.codex]
+# A Ticket worktree commits into its repository's .git, outside the sandbox's workspace.
+args = ["-a", "never", "-s", "workspace-write", "-c", "sandbox_workspace_write.writable_roots=[\"/path/to/repo/.git\"]"]
 ```
+
+rex-projects lets Codex call its own MCP tools without asking, so `-a never` does not block a Coordinator's reports.
 
 Claude Code asks whether to trust a new folder, and that prompt stops a Coordinator until you answer it. In our runs, a Ticket worktree was trusted once its Project repository had been trusted, so open `claude` once in each Project repository if you have not already. A Coordinator that reports no status for a minute, as when it waits on this prompt, appears under "Needs you" in the dashboard. Codex asks the same question and says that trusting a worktree applies to its repository root.
 
