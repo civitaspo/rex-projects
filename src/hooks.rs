@@ -303,7 +303,10 @@ impl HookRunner {
                     }
                     receipts.push(receipt);
                 }
-                HostJobProgress::ProcessCompleted(output) => {
+                HostJobProgress::ProcessCompleted {
+                    receipt: output,
+                    intent: _completed_intent,
+                } => {
                     let after_head = self.git_text(&repo, ["rev-parse", "--verify", "HEAD"])?;
                     let after = self.source_fingerprint(&repo)?;
                     let source_changed = before != after;
@@ -1099,6 +1102,171 @@ mod tests {
         conflicting_receipt.succeeded = false;
         assert!(write_receipt(&receipt_path, &conflicting_receipt).is_err());
         assert_eq!(fs::read(&receipt_path).unwrap(), original_bytes);
+    }
+
+    #[test]
+    fn managed_hook_replays_raw_completion_after_fresh_environment_capture() {
+        use crate::host_jobs::HostJobPool;
+        use crate::store::host_jobs::{HostJobState, in_memory_test_store};
+        use crate::worktrees::{ManagedWorktree, WorktreeManager};
+        use std::thread;
+        use std::time::Instant;
+
+        let (temp, repo, config_digest) = fixture();
+        let expected_head = {
+            let output = process::run(ProcessRequest {
+                executable: PathBuf::from("/usr/bin/git"),
+                args: ["rev-parse", "HEAD"]
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect(),
+                stdin: Vec::new(),
+                cwd: Some(repo.clone()),
+                clear_environment: true,
+                environment: BTreeMap::new(),
+                timeout: Duration::from_secs(10),
+                shutdown_grace: Duration::from_secs(2),
+                stdout_limit: 1024,
+                stderr_tail_limit: 1024,
+            })
+            .unwrap();
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let manager = WorktreeManager::new(
+            temp.path(),
+            GitOptions {
+                executable: PathBuf::from("/usr/bin/git"),
+                environment: BTreeMap::new(),
+                timeout: Duration::from_secs(10),
+            },
+        )
+        .unwrap();
+        let marker = temp.path().join("hook-invocations");
+        let hook = HookConfig {
+            id: "restart-check".into(),
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf 'invoked\\n' >> \"$MARKER\"; exit 0".into(),
+            ],
+            timeout_seconds: 10,
+        };
+        let mut inherited =
+            BTreeMap::from([(OsString::from("PATH"), OsString::from("/bin:/usr/bin"))]);
+        inherited.insert(OsString::from("MARKER"), marker.as_os_str().to_owned());
+        let capture_config = crate::config::EnvironmentConfig {
+            source: crate::config::EnvironmentSource::Inherit,
+            ..Default::default()
+        };
+        let first_capture = crate::environment::capture(&capture_config).unwrap();
+        let second_capture = crate::environment::capture(&capture_config).unwrap();
+        let first_snapshot = first_capture.metadata().id.clone();
+        let second_snapshot = second_capture.metadata().id.clone();
+        assert_ne!(first_snapshot, second_snapshot);
+        let project = ProjectId::parse("fixture-project").unwrap();
+        let repository = RepositoryId::parse("fixture-repo").unwrap();
+        let ticket_run = TicketRunId::parse("restart-run").unwrap();
+        let context = || HookRunContext {
+            repository_id: &repository,
+            worktree: &repo,
+            expected_head: &expected_head,
+            project_id: &project,
+            ticket_run_id: &ticket_run,
+            configuration_digest: &config_digest,
+            state_root: temp.path(),
+        };
+        let acquire_lease = || {
+            manager
+                .acquire_writer_lease(ManagedWorktree {
+                    repository_id: repository.clone(),
+                    path: repo.canonicalize().unwrap(),
+                    branch: "rex-projects/0123456789abcdef0123456789abcdef".into(),
+                    base_sha: expected_head.clone(),
+                })
+                .map_err(|error| error.to_string())
+        };
+        let binding = |snapshot_id| HostJobEnvironmentBinding {
+            snapshot_id,
+            policy_digest: test_environment_binding().policy_digest,
+        };
+        let git = GitOptions {
+            executable: PathBuf::from("/usr/bin/git"),
+            environment: BTreeMap::new(),
+            timeout: Duration::from_secs(10),
+        };
+        let first_runner = HookRunner::new(git.clone(), inherited.clone(), binding(first_snapshot));
+        let effect_operation_id = "effect:restart-hook";
+        let mut store = in_memory_test_store();
+        let mut pool = HostJobPool::new(1, 1).unwrap();
+        assert!(
+            first_runner
+                .run_required_managed(
+                    std::slice::from_ref(&hook),
+                    context(),
+                    ManagedHookExecution {
+                        store: &mut store,
+                        pool: &mut pool,
+                        owner_generation: 1,
+                        effect_operation_id,
+                        max_attempts: 1,
+                        now_unix: 1,
+                    },
+                    acquire_lease,
+                )
+                .unwrap()
+                .is_none()
+        );
+        let before = first_runner.source_fingerprint(&repo).unwrap();
+        let job_id = digest_bytes(
+            format!(
+                "rex-hook-v1:{effect_operation_id}:{}:{}:{}:{}",
+                hook.id, expected_head, config_digest, before
+            )
+            .as_bytes(),
+        )
+        .to_string();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            pool.drain_finished_processes(&mut store, 1, 2).unwrap();
+            if store
+                .host_job(&job_id)
+                .unwrap()
+                .and_then(|record| record.process_receipt)
+                .is_some()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "hook process did not finish");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let original_intent = store.host_job(&job_id).unwrap().unwrap().intent;
+        drop(pool);
+
+        let second_runner = HookRunner::new(git, inherited, binding(second_snapshot));
+        let mut pool = HostJobPool::new(1, 1).unwrap();
+        let receipts = second_runner
+            .run_required_managed(
+                std::slice::from_ref(&hook),
+                context(),
+                ManagedHookExecution {
+                    store: &mut store,
+                    pool: &mut pool,
+                    owner_generation: 1,
+                    effect_operation_id,
+                    max_attempts: 1,
+                    now_unix: 3,
+                },
+                acquire_lease,
+            )
+            .unwrap()
+            .expect("durable process result should complete the hook");
+        assert!(receipts[0].succeeded);
+        assert_eq!(fs::read_to_string(marker).unwrap().lines().count(), 1);
+        let final_record = store.host_job(&job_id).unwrap().unwrap();
+        assert_eq!(final_record.intent, original_intent);
+        assert!(matches!(final_record.state, HostJobState::Succeeded));
+        assert!(final_record.process_receipt.is_none());
+        assert!(final_record.receipt_json.is_some());
     }
 
     #[test]

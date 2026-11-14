@@ -342,6 +342,9 @@ pub(crate) fn validate_v12_schema(connection: &Connection) -> Result<(), String>
     if version >= 18 {
         crate::store::agent_launch_phase::apply_v18_layout(&canonical)?;
     }
+    if version >= 24 {
+        crate::store::host_jobs::apply_v24_host_process_receipts_layout(&canonical)?;
+    }
     for table in V12_TABLES {
         let actual = read_table_layout(connection, table)?;
         let expected = read_table_layout(&canonical, table)?;
@@ -1751,7 +1754,7 @@ mod tests {
             .execute_batch(
                 "PRAGMA foreign_keys=OFF;
                  BEGIN IMMEDIATE;
-                 DROP TABLE machine_shutdowns;
+                 ALTER TABLE host_effect_jobs DROP COLUMN process_receipt_json; DELETE FROM schema_migrations WHERE version=24; DROP TABLE machine_shutdowns;
                  DELETE FROM schema_migrations WHERE version=23;
                  DROP TABLE learning_decisions;
                  DROP TABLE learning_findings;

@@ -206,7 +206,7 @@ mod tests {
         let legacy = rusqlite::Connection::open(&database).unwrap();
         legacy
             .execute_batch(
-                "DROP TABLE machine_shutdowns;
+                "ALTER TABLE host_effect_jobs DROP COLUMN process_receipt_json; DELETE FROM schema_migrations WHERE version=24; DROP TABLE machine_shutdowns;
                  DELETE FROM schema_migrations WHERE version=23;
                  DROP TABLE provider_qualification_candidate_targets;
                  DELETE FROM schema_migrations WHERE version=22;
@@ -271,7 +271,7 @@ mod tests {
                     .starts_with("state.sqlite3.pre-v2-")
             })
             .collect::<Vec<_>>();
-        assert_eq!(backups.len(), old_backup_count + 2);
+        assert_eq!(backups.len(), old_backup_count + 3);
         assert!(
             backups
                 .iter()

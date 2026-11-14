@@ -105,8 +105,69 @@ pub struct HostJobRecord {
     pub state: HostJobState,
     pub process_identity: Option<ProcessIdentity>,
     pub receipt_json: Option<String>,
+    pub process_receipt: Option<HostProcessReceipt>,
     pub attempt_count: u32,
     pub updated_at_unix: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostProcessReceipt {
+    pub status_code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr_tail: Vec<u8>,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    pub timed_out: bool,
+    pub cleanup_confirmed: bool,
+}
+
+pub(crate) fn migrate_v24_host_process_receipts(
+    connection: &rusqlite::Connection,
+) -> Result<(), String> {
+    let tx = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let version: i64 = tx
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if version != 23 {
+        return Err(format!(
+            "host process receipt migration requires schema 23, found {version}"
+        ));
+    }
+    tx.execute_batch(
+        "ALTER TABLE host_effect_jobs ADD COLUMN process_receipt_json TEXT;
+         INSERT INTO schema_migrations(version,applied_at_unix) VALUES (24,unixepoch());
+         PRAGMA user_version = 24;",
+    )
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())
+}
+
+pub(crate) fn validate_v24_host_process_receipts(
+    connection: &rusqlite::Connection,
+) -> Result<(), String> {
+    let valid: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=24)
+             AND EXISTS(SELECT 1 FROM pragma_table_info('host_effect_jobs') WHERE name='process_receipt_json')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !valid {
+        return Err("host process receipt schema 24 is incomplete".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn apply_v24_host_process_receipts_layout(
+    connection: &rusqlite::Connection,
+) -> Result<(), String> {
+    connection
+        .execute_batch("ALTER TABLE host_effect_jobs ADD COLUMN process_receipt_json TEXT;")
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn migrate_v12_host_jobs_tables(tx: &Transaction<'_>) -> Result<(), String> {
@@ -146,7 +207,7 @@ impl ConfigStore {
         validate_active_generation(&tx, owner_generation)?;
         let existing = tx
             .query_row(
-                "SELECT job_id, intent_json, state, process_identity_json, unknown_reason, receipt_json, attempt_count, updated_at_unix
+                "SELECT job_id, intent_json, state, process_identity_json, unknown_reason, receipt_json, process_receipt_json, attempt_count, updated_at_unix
                  FROM host_effect_jobs WHERE effect_operation_id = ?1",
                 [&intent.effect_operation_id],
                 row_to_host_job,
@@ -170,7 +231,7 @@ impl ConfigStore {
             )
             .map_err(|error| error.to_string())?;
         let record = tx.query_row(
-                "SELECT job_id, intent_json, state, process_identity_json, unknown_reason, receipt_json, attempt_count, updated_at_unix
+                "SELECT job_id, intent_json, state, process_identity_json, unknown_reason, receipt_json, process_receipt_json, attempt_count, updated_at_unix
                  FROM host_effect_jobs WHERE job_id = ?1",
                 [&intent.job_id],
                 row_to_host_job,
@@ -183,7 +244,7 @@ impl ConfigStore {
     pub fn host_job(&self, job_id: &str) -> Result<Option<HostJobRecord>, String> {
         self.connection
             .query_row(
-                "SELECT job_id, intent_json, state, process_identity_json, unknown_reason, receipt_json, attempt_count, updated_at_unix
+                "SELECT job_id, intent_json, state, process_identity_json, unknown_reason, receipt_json, process_receipt_json, attempt_count, updated_at_unix
                  FROM host_effect_jobs WHERE job_id = ?1",
                 [job_id],
                 row_to_host_job,
@@ -204,7 +265,7 @@ impl ConfigStore {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT job_id, intent_json, state, process_identity_json, unknown_reason, receipt_json, attempt_count, updated_at_unix
+            "SELECT job_id, intent_json, state, process_identity_json, unknown_reason, receipt_json, process_receipt_json, attempt_count, updated_at_unix
              FROM host_effect_jobs WHERE state IN ({placeholders}) ORDER BY updated_at_unix, job_id"
         );
         let mut statement = self
@@ -290,7 +351,7 @@ impl ConfigStore {
             return Ok(true);
         }
         let existing = tx.query_row(
-            "SELECT job_id, intent_json, state, process_identity_json, unknown_reason, receipt_json, attempt_count, updated_at_unix
+            "SELECT job_id, intent_json, state, process_identity_json, unknown_reason, receipt_json, process_receipt_json, attempt_count, updated_at_unix
              FROM host_effect_jobs WHERE job_id = ?1",
             [job_id], row_to_host_job,
         ).optional().map_err(|error| error.to_string())?;
@@ -337,7 +398,7 @@ impl ConfigStore {
             .map_err(|error| error.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
         let record = tx.query_row(
-            "SELECT job_id, intent_json, state, process_identity_json, unknown_reason, receipt_json, attempt_count, updated_at_unix
+            "SELECT job_id, intent_json, state, process_identity_json, unknown_reason, receipt_json, process_receipt_json, attempt_count, updated_at_unix
              FROM host_effect_jobs WHERE job_id = ?1",
             [job_id], row_to_host_job,
         ).optional().map_err(|error| error.to_string())?;
@@ -346,12 +407,86 @@ impl ConfigStore {
             return Ok(false);
         }
         let changed = tx.execute(
-                "UPDATE host_effect_jobs SET state = 'pending', process_identity_json = NULL, unknown_reason = NULL, receipt_json = NULL, updated_at_unix = ?2
+                "UPDATE host_effect_jobs SET state = 'pending', process_identity_json = NULL, unknown_reason = NULL, receipt_json = NULL, process_receipt_json = NULL, updated_at_unix = ?2
                  WHERE job_id = ?1 AND state = 'unknown'
                    AND json_extract(intent_json, '$.retry_when_absent') = 1
                    AND attempt_count < json_extract(intent_json, '$.max_attempts')",
                 params![job_id, now_unix],
             ).map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(changed == 1)
+    }
+
+    pub fn record_host_process_result(
+        &mut self,
+        owner_generation: u64,
+        expected_intent: &HostJobIntent,
+        expected_identity: &ProcessIdentity,
+        receipt: &HostProcessReceipt,
+        now_unix: i64,
+    ) -> Result<bool, String> {
+        if !receipt.cleanup_confirmed {
+            return Err(
+                "host process result cannot be recorded before cleanup is confirmed".into(),
+            );
+        }
+        if expected_identity.pid == 0
+            || expected_identity.process_group_id != expected_identity.pid
+            || expected_identity.start_identity.trim().is_empty()
+            || expected_identity.quality != ProcessIdentityQuality::KernelBirthToken
+        {
+            return Err("host process result requires its exact kernel process identity".into());
+        }
+        let receipt_json = serde_json::to_string(receipt).map_err(|error| error.to_string())?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        validate_active_generation(&tx, owner_generation)?;
+        let record = tx
+            .query_row(
+                "SELECT job_id, intent_json, state, process_identity_json, unknown_reason, receipt_json, process_receipt_json, attempt_count, updated_at_unix
+                 FROM host_effect_jobs WHERE job_id = ?1",
+                [&expected_intent.job_id],
+                row_to_host_job,
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some(record) = record else {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(false);
+        };
+        if record.intent != *expected_intent
+            || record.process_identity.as_ref() != Some(expected_identity)
+            || !matches!(
+                record.state,
+                HostJobState::Running | HostJobState::Unknown { .. }
+            )
+            || record.receipt_json.is_some()
+        {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(false);
+        }
+        if let Some(existing) = record.process_receipt.as_ref() {
+            if existing != receipt {
+                return Err("conflicting host process results retain the existing owner".into());
+            }
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(true);
+        }
+        let changed = tx
+            .execute(
+                "UPDATE host_effect_jobs SET process_receipt_json = ?2, updated_at_unix = ?3
+                 WHERE job_id = ?1 AND process_identity_json = ?4 AND state IN ('running','unknown')
+                   AND process_receipt_json IS NULL AND receipt_json IS NULL",
+                params![
+                    expected_intent.job_id,
+                    receipt_json,
+                    now_unix,
+                    serde_json::to_string(expected_identity).map_err(|error| error.to_string())?
+                ],
+            )
+            .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(changed == 1)
     }
@@ -370,7 +505,7 @@ impl ConfigStore {
             .map_err(|error| error.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
         let record = tx.query_row(
-            "SELECT job_id, intent_json, state, process_identity_json, unknown_reason, receipt_json, attempt_count, updated_at_unix
+            "SELECT job_id, intent_json, state, process_identity_json, unknown_reason, receipt_json, process_receipt_json, attempt_count, updated_at_unix
              FROM host_effect_jobs WHERE job_id = ?1",
             [job_id], row_to_host_job,
         ).optional().map_err(|error| error.to_string())?;
@@ -416,7 +551,7 @@ impl ConfigStore {
             .map_err(|error| error.to_string())?;
         validate_active_generation(&tx, owner_generation)?;
         let changed = tx.execute(
-                "UPDATE host_effect_jobs SET state = ?2, receipt_json = ?3, unknown_reason = NULL, updated_at_unix = ?4
+                "UPDATE host_effect_jobs SET state = ?2, receipt_json = ?3, process_receipt_json = NULL, unknown_reason = NULL, updated_at_unix = ?4
                  WHERE job_id = ?1 AND state IN ('running','starting')",
                 params![job_id, state, receipt_json, now_unix],
             ).map_err(|error| error.to_string())?;
@@ -471,8 +606,9 @@ fn row_to_host_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<HostJobRecord> {
     let process_identity_json: Option<String> = row.get(3)?;
     let unknown_reason: Option<String> = row.get(4)?;
     let receipt_json: Option<String> = row.get(5)?;
-    let attempt_count: u32 = row.get(6)?;
-    let updated_at_unix: i64 = row.get(7)?;
+    let process_receipt_json: Option<String> = row.get(6)?;
+    let attempt_count: u32 = row.get(7)?;
+    let updated_at_unix: i64 = row.get(8)?;
     let intent: HostJobIntent =
         serde_json::from_str(&intent_json).map_err(|_| rusqlite::Error::InvalidQuery)?;
     if intent.job_id != job_id {
@@ -494,11 +630,15 @@ fn row_to_host_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<HostJobRecord> {
     let process_identity = process_identity_json
         .map(|json| serde_json::from_str(&json).map_err(|_| rusqlite::Error::InvalidQuery))
         .transpose()?;
+    let process_receipt = process_receipt_json
+        .map(|json| serde_json::from_str(&json).map_err(|_| rusqlite::Error::InvalidQuery))
+        .transpose()?;
     Ok(HostJobRecord {
         intent,
         state,
         process_identity,
         receipt_json,
+        process_receipt,
         attempt_count,
         updated_at_unix,
     })
@@ -529,7 +669,34 @@ pub(crate) fn in_memory_test_store() -> super::ConfigStore {
          INSERT INTO controller_owners(singleton,generation,stopped_at_unix) VALUES (1,1,NULL);",
     )
     .unwrap();
+    tx.execute_batch("ALTER TABLE host_effect_jobs ADD COLUMN process_receipt_json TEXT;")
+        .unwrap();
     tx.commit().unwrap();
+    super::ConfigStore {
+        connection,
+        _machine_lock: super::MachineLock { _file: None },
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn file_test_store(path: &std::path::Path) -> super::ConfigStore {
+    let fresh = !path.exists();
+    let mut connection = rusqlite::Connection::open(path).unwrap();
+    if fresh {
+        let tx = connection.transaction().unwrap();
+        migrate_v12_host_jobs_tables(&tx).unwrap();
+        tx.execute_batch(
+            "ALTER TABLE host_effect_jobs ADD COLUMN process_receipt_json TEXT;
+             CREATE TABLE controller_owners (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                generation INTEGER NOT NULL,
+                stopped_at_unix INTEGER
+             );
+             INSERT INTO controller_owners(singleton,generation,stopped_at_unix) VALUES (1,1,NULL);",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
     super::ConfigStore {
         connection,
         _machine_lock: super::MachineLock { _file: None },
@@ -559,6 +726,35 @@ mod tests {
             max_attempts: 2,
             retry_when_absent: true,
         }
+    }
+
+    #[test]
+    fn schema_24_adds_a_nullable_raw_process_receipt_column() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at_unix INTEGER NOT NULL);
+                 INSERT INTO schema_migrations(version,applied_at_unix) VALUES (23,1);
+                 CREATE TABLE host_effect_jobs(job_id TEXT PRIMARY KEY, receipt_json TEXT);
+                 INSERT INTO host_effect_jobs(job_id,receipt_json) VALUES ('prior',NULL);
+                 PRAGMA user_version=23;",
+            )
+            .unwrap();
+
+        migrate_v24_host_process_receipts(&connection).unwrap();
+        validate_v24_host_process_receipts(&connection).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 24);
+        let value: Option<String> = connection
+            .query_row(
+                "SELECT process_receipt_json FROM host_effect_jobs WHERE job_id='prior'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, None);
     }
 
     fn identity() -> ProcessIdentity {
@@ -641,6 +837,75 @@ mod tests {
             store
                 .mark_host_job_running(1, &job.job_id, &identity(), 13)
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn process_result_requires_exact_authority_and_cleanup_and_is_idempotent() {
+        let mut store = in_memory_test_store();
+        let mut job = intent();
+        job.kind = HostJobKind::OperationAdapter;
+        job.operation_method = Some(OperationMethod::Invoke);
+        job.max_attempts = 1;
+        job.retry_when_absent = false;
+        job.job_id = "invoke-result".into();
+        job.effect_operation_id = "operation-1:invoke:1".into();
+        job.lane_id = "operation-1".into();
+        store.enqueue_host_job(1, &job, 10).unwrap();
+        store.start_host_job(1, &job.job_id, 11).unwrap();
+        let identity = identity();
+        store
+            .mark_host_job_running(1, &job.job_id, &identity, 12)
+            .unwrap();
+        let receipt = HostProcessReceipt {
+            status_code: Some(0),
+            stdout: b"first result".to_vec(),
+            stderr_tail: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            timed_out: false,
+            cleanup_confirmed: true,
+        };
+
+        let mut wrong_intent = job.clone();
+        wrong_intent.request_digest = "different request".into();
+        assert!(
+            !store
+                .record_host_process_result(1, &wrong_intent, &identity, &receipt, 13)
+                .unwrap()
+        );
+        let mut wrong_identity = identity.clone();
+        wrong_identity.pid += 1;
+        wrong_identity.process_group_id = wrong_identity.pid;
+        assert!(
+            !store
+                .record_host_process_result(1, &job, &wrong_identity, &receipt, 13)
+                .unwrap()
+        );
+        let mut unclean = receipt.clone();
+        unclean.cleanup_confirmed = false;
+        assert!(
+            store
+                .record_host_process_result(1, &job, &identity, &unclean, 13)
+                .is_err()
+        );
+
+        assert!(
+            store
+                .record_host_process_result(1, &job, &identity, &receipt, 13)
+                .unwrap()
+        );
+        assert!(
+            store
+                .record_host_process_result(1, &job, &identity, &receipt, 14)
+                .unwrap()
+        );
+        let mut conflicting = receipt;
+        conflicting.stdout = b"different result".to_vec();
+        assert!(
+            store
+                .record_host_process_result(1, &job, &identity, &conflicting, 15)
+                .is_err()
         );
     }
 

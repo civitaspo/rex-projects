@@ -5,6 +5,8 @@
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest as _, Sha256};
 
+use crate::process::ProcessIdentityQuality;
+
 use super::{ConfigStore, validate_active_generation};
 
 pub const DEFAULT_MACHINE_SHUTDOWN_GRACE_SECONDS: i64 = 30;
@@ -186,8 +188,8 @@ impl ConfigStore {
         tx.commit().map_err(|error| error.to_string())
     }
 
-    /// Count every still-owned execution slot and every independently tracked host/qualification
-    /// process. No query limit is used: any remaining owner means bounded-incomplete.
+    /// Count live process owners, not effects with a safely staged process result. Those effects
+    /// remain durable and unsettled for ordinary controller replay after shutdown.
     pub fn machine_shutdown_unresolved_owners(&self) -> Result<u64, String> {
         let slots: u64 = self
             .connection
@@ -197,9 +199,40 @@ impl ConfigStore {
                 |row| row.get(0),
             )
             .map_err(|error| error.to_string())?;
-        let host: u64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM host_effect_jobs WHERE state IN ('starting','running','unknown')", [], |row| row.get(0),
-        ).map_err(|error| error.to_string())?;
+        let total_host: u64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM host_effect_jobs WHERE state IN ('starting','running','unknown')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let host_records = self.host_jobs_in_states(&[
+            crate::store::host_jobs::HostJobState::Starting,
+            crate::store::host_jobs::HostJobState::Running,
+            crate::store::host_jobs::HostJobState::Unknown {
+                reason: String::new(),
+            },
+        ]);
+        let drained_host_processes = host_records
+            .map(|records| {
+                records
+                    .iter()
+                    .filter(|record| {
+                        record.process_receipt.as_ref().is_some_and(|receipt| {
+                            receipt.cleanup_confirmed
+                                && record.process_identity.as_ref().is_some_and(|identity| {
+                                    identity.quality == ProcessIdentityQuality::KernelBirthToken
+                                        && identity.pid > 0
+                                        && identity.process_group_id == identity.pid
+                                        && !identity.start_identity.trim().is_empty()
+                                })
+                        })
+                    })
+                    .count() as u64
+            })
+            .unwrap_or(0);
+        let host = total_host.saturating_sub(drained_host_processes);
         let qualifications: u64 = self.connection.query_row(
             "SELECT COUNT(*) FROM provider_qualification_jobs WHERE status IN ('running','unknown')", [], |row| row.get(0),
         ).map_err(|error| error.to_string())?;
@@ -600,5 +633,91 @@ mod tests {
                 ("unstarted-agent".into(), "launch_pending".into()),
             ]
         );
+    }
+
+    #[test]
+    fn shutdown_counts_only_strictly_deserialized_cleanup_confirmed_process_receipts() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = ConfigStore::open_test(root.path()).unwrap();
+        let generation = store
+            .start_owner(&owner(root.path(), "controller"))
+            .unwrap();
+        let intent = crate::store::host_jobs::HostJobIntent {
+            job_id: "job-complete".into(),
+            effect_operation_id: "effect-complete".into(),
+            project_id: "project-a".into(),
+            subject_id: "ticket-a".into(),
+            lane_id: "operation-a".into(),
+            kind: crate::store::host_jobs::HostJobKind::OperationAdapter,
+            operation_method: Some(crate::store::host_jobs::OperationMethod::Invoke),
+            request_digest: "request-a".into(),
+            configuration_digest: "config-a".into(),
+            environment_snapshot_id: crate::domain::ids::Digest::parse("e".repeat(64)).unwrap(),
+            environment_policy_digest: crate::domain::ids::Digest::parse("f".repeat(64)).unwrap(),
+            head: "head-a".into(),
+            source_digest: "source-a".into(),
+            max_attempts: 1,
+            retry_when_absent: false,
+        };
+        store.enqueue_host_job(generation, &intent, 10).unwrap();
+        assert!(
+            store
+                .start_host_job(generation, &intent.job_id, 11)
+                .unwrap()
+        );
+        let identity = crate::process::ProcessIdentity {
+            pid: 42,
+            parent_pid: 1,
+            process_group_id: 42,
+            start_identity: "birth-token".into(),
+            command: "fixture".into(),
+            quality: crate::process::ProcessIdentityQuality::KernelBirthToken,
+        };
+        assert!(
+            store
+                .mark_host_job_running(generation, &intent.job_id, &identity, 12)
+                .unwrap()
+        );
+        let receipt = crate::store::host_jobs::HostProcessReceipt {
+            status_code: Some(0),
+            stdout: b"result".to_vec(),
+            stderr_tail: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            timed_out: false,
+            cleanup_confirmed: true,
+        };
+        assert!(
+            store
+                .record_host_process_result(generation, &intent, &identity, &receipt, 13)
+                .unwrap()
+        );
+        assert_eq!(store.machine_shutdown_unresolved_owners().unwrap(), 0);
+
+        store
+            .connection
+            .execute(
+                r#"UPDATE host_effect_jobs SET process_receipt_json='{"cleanup_confirmed":true}' WHERE job_id=?1"#,
+                [&intent.job_id],
+            )
+            .unwrap();
+        assert_eq!(store.machine_shutdown_unresolved_owners().unwrap(), 1);
+
+        let valid_receipt = serde_json::to_string(&receipt).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE host_effect_jobs SET process_receipt_json=?1 WHERE job_id=?2",
+                rusqlite::params![valid_receipt, intent.job_id],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                r#"UPDATE host_effect_jobs SET process_identity_json='{"pid":42,"parent_pid":1,"process_group_id":42,"start_identity":"birth-token","command":"fixture"}' WHERE job_id=?1"#,
+                [&intent.job_id],
+            )
+            .unwrap();
+        assert_eq!(store.machine_shutdown_unresolved_owners().unwrap(), 1);
     }
 }

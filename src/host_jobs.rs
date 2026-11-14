@@ -1,14 +1,15 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
-use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::domain::ids::Digest as ContentDigest;
 use crate::process::{self, ProcessError, ProcessIdentity, ProcessRequest};
 use crate::store::ConfigStore;
+pub use crate::store::host_jobs::HostProcessReceipt;
 use crate::store::host_jobs::{
     HostJobIntent, HostJobKind, HostJobRecord, HostJobState, HostJobSystemReceipt,
 };
@@ -43,8 +44,44 @@ pub fn stable_host_job_id(operation_id: &str, method: &str, round: u32) -> Strin
     format!("{:x}", digest.finalize())
 }
 
-/// Hash every immutable child-process input that can change its execution.
-/// The digest can be persisted without storing the command's stdin or secrets.
+fn can_replay_completed_process(
+    record: &HostJobRecord,
+    current_intent: &HostJobIntent,
+    current_request: &ProcessRequest,
+) -> bool {
+    // Replay consumes the original invocation's output; it never runs in the new environment.
+    let stored = &record.intent;
+    if current_intent.environment_policy_digest != stored.environment_policy_digest {
+        return false;
+    }
+
+    let current_binding = HostJobEnvironmentBinding {
+        snapshot_id: current_intent.environment_snapshot_id.clone(),
+        policy_digest: current_intent.environment_policy_digest.clone(),
+    };
+    if current_intent.request_digest != process_request_digest(current_request, &current_binding) {
+        return false;
+    }
+
+    let stored_binding = HostJobEnvironmentBinding {
+        snapshot_id: stored.environment_snapshot_id.clone(),
+        policy_digest: stored.environment_policy_digest.clone(),
+    };
+    if stored.request_digest != process_request_digest(current_request, &stored_binding) {
+        return false;
+    }
+
+    let mut normalized = current_intent.clone();
+    normalized.request_digest.clone_from(&stored.request_digest);
+    normalized
+        .environment_snapshot_id
+        .clone_from(&stored.environment_snapshot_id);
+    normalized == *stored
+}
+
+/// Hash process inputs without storing command stdin or environment values.
+/// Environment identity is represented by its snapshot and policy IDs; variable names are hashed.
+/// Values are not recovered or used to authorize execution from this digest.
 pub fn process_request_digest(
     request: &ProcessRequest,
     environment: &HostJobEnvironmentBinding,
@@ -102,18 +139,6 @@ fn os_bytes(value: &OsStr) -> Vec<u8> {
     value.to_string_lossy().as_bytes().to_vec()
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HostProcessReceipt {
-    pub status_code: Option<i32>,
-    pub stdout: Vec<u8>,
-    pub stderr_tail: Vec<u8>,
-    pub stdout_truncated: bool,
-    pub stderr_truncated: bool,
-    pub timed_out: bool,
-    pub cleanup_confirmed: bool,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostJobProgress {
     Pending,
@@ -122,7 +147,13 @@ pub enum HostJobProgress {
     /// A previously launched process identity was checked and confirmed absent;
     /// the immutable intent forbids another host-side attempt.
     ProcessAbsentNoRetry,
-    ProcessCompleted(HostProcessReceipt),
+    ProcessCompleted {
+        receipt: HostProcessReceipt,
+        /// The immutable launch binding retained by the durable host-job row.
+        /// This remains authoritative when a controller restart captures a
+        /// fresh environment snapshot before replaying the raw result.
+        intent: Box<HostJobIntent>,
+    },
     ProcessFailed(String),
     Succeeded(String),
     Failed(String),
@@ -132,7 +163,7 @@ struct ActiveJob {
     lane_id: String,
     worker: Option<JoinHandle<()>>,
     recovered: bool,
-    _worktree_lease: Option<WorktreeLease>,
+    _worktree_lease: Option<Arc<WorktreeLease>>,
 }
 
 #[derive(Clone)]
@@ -143,6 +174,8 @@ enum WorkerEvent {
     },
     Finished {
         job_id: String,
+        intent: Box<HostJobIntent>,
+        identity: Option<ProcessIdentity>,
         result: Result<HostProcessReceipt, String>,
     },
     Unknown {
@@ -160,6 +193,7 @@ pub struct HostJobPool {
     receiver: Receiver<WorkerEvent>,
     active: HashMap<String, ActiveJob>,
     completed: HashMap<String, Result<HostProcessReceipt, String>>,
+    pending_events: VecDeque<WorkerEvent>,
 }
 
 impl HostJobPool {
@@ -175,6 +209,7 @@ impl HostJobPool {
             receiver,
             active: HashMap::new(),
             completed: HashMap::new(),
+            pending_events: VecDeque::new(),
         })
     }
 
@@ -187,14 +222,66 @@ impl HostJobPool {
         worktree_lease: Option<WorktreeLease>,
         now_unix: i64,
     ) -> Result<HostJobProgress, String> {
+        let worktree_lease = worktree_lease.map(Arc::new);
         self.drain_events(store, owner_generation, now_unix)?;
-        let mut record = store.enqueue_host_job(owner_generation, intent, now_unix)?;
+        let existing = store.host_job(&intent.job_id)?;
+        let replayed = if let Some(record) = existing.as_ref() {
+            if let Some(receipt) = record.process_receipt.as_ref() {
+                if receipt.cleanup_confirmed
+                    && record
+                        .process_identity
+                        .as_ref()
+                        .is_some_and(is_exact_identity)
+                    && record.receipt_json.is_none()
+                    && matches!(
+                        record.state,
+                        HostJobState::Running | HostJobState::Unknown { .. }
+                    )
+                {
+                    if !can_replay_completed_process(record, intent, &process_request) {
+                        return Err(
+                            "completed host process does not match the current immutable request"
+                                .into(),
+                        );
+                    }
+                    Some((record.clone(), receipt.clone()))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mut record = match replayed.as_ref() {
+            Some((record, _)) => record.clone(),
+            None => store.enqueue_host_job(owner_generation, intent, now_unix)?,
+        };
         if matches!(record.state, HostJobState::Succeeded | HostJobState::Failed) {
             return terminal_progress(&record);
         }
+        if let Some((record, receipt)) = replayed {
+            return Ok(HostJobProgress::ProcessCompleted {
+                receipt,
+                intent: Box::new(record.intent),
+            });
+        }
+        if record.process_receipt.is_some() {
+            store.mark_host_job_unknown(
+                owner_generation,
+                &intent.job_id,
+                "stored host process result is not bound to a verified completed process",
+                now_unix,
+            )?;
+            return Ok(HostJobProgress::Unknown);
+        }
         if let Some(result) = self.completed.get(&intent.job_id) {
             return Ok(match result {
-                Ok(receipt) => HostJobProgress::ProcessCompleted(receipt.clone()),
+                Ok(receipt) => HostJobProgress::ProcessCompleted {
+                    receipt: receipt.clone(),
+                    intent: Box::new(record.intent.clone()),
+                },
                 Err(error) => HostJobProgress::ProcessFailed(error.clone()),
             });
         }
@@ -370,7 +457,7 @@ impl HostJobPool {
         owner_generation: u64,
         intent: &HostJobIntent,
         record: &HostJobRecord,
-        worktree_lease: Option<WorktreeLease>,
+        worktree_lease: Option<Arc<WorktreeLease>>,
         now_unix: i64,
     ) -> Result<HostJobProgress, String> {
         if intent.kind == HostJobKind::OperationAdapter {
@@ -444,6 +531,17 @@ impl HostJobPool {
         self.drain_events(store, owner_generation, now_unix)
     }
 
+    /// Collect only reports from already-launched host jobs. This never starts
+    /// queued work or interprets the result as completion of its logical effect.
+    pub fn drain_finished_processes(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+    ) -> Result<(), String> {
+        self.drain_events(store, owner_generation, now_unix)
+    }
+
     fn slot_available(&self, store: &ConfigStore, intent: &HostJobIntent) -> Result<bool, String> {
         if self
             .active
@@ -474,21 +572,26 @@ impl HostJobPool {
         &mut self,
         intent: &HostJobIntent,
         request: ProcessRequest,
-        worktree_lease: Option<WorktreeLease>,
+        worktree_lease: Option<Arc<WorktreeLease>>,
     ) -> Result<(), String> {
         if self.active.contains_key(&intent.job_id) {
             return Err("host job already has a worker".into());
         }
         let job_id = intent.job_id.clone();
         let started_job_id = job_id.clone();
+        let worker_intent = intent.clone();
         let sender = self.sender.clone();
+        let worker_lease = worktree_lease.clone();
         let worker = thread::Builder::new()
             .name(format!("rex-host-job-{}", short_id(&job_id)))
             .spawn(move || {
+                let _worktree_lease = worker_lease;
                 let started_sender = sender.clone();
-                let result = process::run_with_started_identity(request, move |identity| {
+                let mut process_identity = None;
+                let result = process::run_with_started_identity(request, |identity| {
+                    process_identity = Some(identity.clone());
                     let _ = started_sender.send(WorkerEvent::Started {
-                        job_id: started_job_id,
+                        job_id: started_job_id.clone(),
                         identity,
                     });
                 });
@@ -505,6 +608,8 @@ impl HostJobPool {
                         };
                         let _ = sender.send(WorkerEvent::Finished {
                             job_id,
+                            intent: Box::new(worker_intent),
+                            identity: process_identity,
                             result: Ok(receipt),
                         });
                     }
@@ -517,6 +622,8 @@ impl HostJobPool {
                     Err(error) => {
                         let _ = sender.send(WorkerEvent::Finished {
                             job_id,
+                            intent: Box::new(worker_intent),
+                            identity: process_identity,
                             result: Err(error.to_string()),
                         });
                     }
@@ -541,29 +648,100 @@ impl HostJobPool {
         owner_generation: u64,
         now_unix: i64,
     ) -> Result<(), String> {
-        while let Ok(event) = self.receiver.try_recv() {
+        while let Some(event) = self
+            .pending_events
+            .pop_front()
+            .or_else(|| self.receiver.try_recv().ok())
+        {
+            let retry_event = event.clone();
             match event {
                 WorkerEvent::Started { job_id, identity } => {
-                    if !store.mark_host_job_running(
+                    match store.mark_host_job_running(
                         owner_generation,
                         &job_id,
                         &identity,
                         now_unix,
-                    )? {
-                        return Err(
-                            "host job start report does not match its durable Starting state"
-                                .into(),
-                        );
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            self.pending_events.push_front(retry_event);
+                            return Err(
+                                "host job start report does not match its durable Starting state"
+                                    .into(),
+                            );
+                        }
+                        Err(error) => {
+                            self.pending_events.push_front(retry_event);
+                            return Err(error);
+                        }
                     }
                 }
-                WorkerEvent::Finished { job_id, result } => {
+                WorkerEvent::Finished {
+                    job_id,
+                    intent,
+                    identity,
+                    result,
+                } => {
+                    if let Ok(receipt) = &result
+                        && receipt.cleanup_confirmed
+                    {
+                        let Some(identity) = identity.as_ref() else {
+                            self.pending_events.push_front(retry_event);
+                            return Err("finished host job has no started process identity".into());
+                        };
+                        match store.record_host_process_result(
+                            owner_generation,
+                            &intent,
+                            identity,
+                            receipt,
+                            now_unix,
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                self.pending_events.push_front(retry_event);
+                                return Err(
+                                    "finished process result does not match durable host job authority".into(),
+                                );
+                            }
+                            Err(error) => {
+                                self.pending_events.push_front(retry_event);
+                                return Err(error);
+                            }
+                        }
+                    }
+                    if matches!(&result, Ok(receipt) if !receipt.cleanup_confirmed) {
+                        match store.mark_host_job_unknown(
+                            owner_generation,
+                            &job_id,
+                            "host process completion did not confirm cleanup",
+                            now_unix,
+                        ) {
+                            Ok(_) => {}
+                            Err(error) => {
+                                self.pending_events.push_front(retry_event);
+                                return Err(error);
+                            }
+                        }
+                        self.completed.remove(&job_id);
+                        if let Some(active) = self.active.get_mut(&job_id) {
+                            if let Some(worker) = active.worker.take() {
+                                if worker.is_finished() {
+                                    let _ = worker.join();
+                                } else {
+                                    drop(worker);
+                                }
+                            }
+                            active.recovered = true;
+                        }
+                        continue;
+                    }
                     self.completed.insert(job_id, result);
                 }
                 WorkerEvent::Unknown { job_id, reason } => {
                     if let Err(error) =
                         store.mark_host_job_unknown(owner_generation, &job_id, &reason, now_unix)
                     {
-                        let _ = self.sender.send(WorkerEvent::Unknown { job_id, reason });
+                        self.pending_events.push_front(retry_event);
                         return Err(error);
                     }
                     if let Some(active) = self.active.get_mut(&job_id) {
@@ -626,7 +804,9 @@ impl HostJobPool {
 impl Drop for HostJobPool {
     fn drop(&mut self) {
         for active in self.active.values_mut() {
-            if let Some(worker) = active.worker.take() {
+            if let Some(worker) = active.worker.take()
+                && worker.is_finished()
+            {
                 let _ = worker.join();
             }
         }
@@ -664,6 +844,13 @@ fn reconcile_record(record: &HostJobRecord) -> Result<Recovery, String> {
             Recovery::Alive
         },
     )
+}
+
+fn is_exact_identity(identity: &ProcessIdentity) -> bool {
+    identity.quality == process::ProcessIdentityQuality::KernelBirthToken
+        && identity.pid != 0
+        && identity.process_group_id == identity.pid
+        && !identity.start_identity.trim().is_empty()
 }
 
 fn terminal_progress(record: &HostJobRecord) -> Result<HostJobProgress, String> {
@@ -708,7 +895,7 @@ fn short_id(id: &str) -> String {
 mod tests {
     use super::*;
     use crate::process::ProcessIdentityQuality;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
     fn request(executable: PathBuf, args: &[&str]) -> ProcessRequest {
@@ -729,7 +916,26 @@ mod tests {
     #[test]
     #[ignore = "spawned by managed_host_job_reports_identity_before_exit"]
     fn managed_host_job_process_fixture() {
-        thread::sleep(Duration::from_millis(250));
+        use std::io::Write as _;
+        if let Some(marker) = std::env::var_os("REX_HOST_JOB_INVOCATION_MARKER") {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(marker)
+                .unwrap();
+            writeln!(file, "invoked").unwrap();
+        }
+        print!("fixed host process result");
+        std::io::stdout().flush().unwrap();
+        if let Some(release_file) = std::env::var_os("REX_HOST_JOB_RELEASE_FILE") {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !Path::new(&release_file).exists() {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(5));
+            }
+        } else {
+            thread::sleep(Duration::from_millis(250));
+        }
     }
 
     #[test]
@@ -1041,9 +1247,19 @@ mod pool_tests {
             .join("worktrees/repo-a/00000000000000000000000000000002")
             .to_string_lossy()
             .into_owned();
-        let first = intent("job-1", "project-1", &first_worktree);
-        let second = intent("job-2", "project-2", &second_worktree);
-        let same_worktree_waiter = intent("job-3", "project-3", &first_worktree);
+        let mut first = intent("job-1", "project-1", &first_worktree);
+        let mut second = intent("job-2", "project-2", &second_worktree);
+        let mut same_worktree_waiter = intent("job-3", "project-3", &first_worktree);
+        let request = request();
+        for job in [&mut first, &mut second, &mut same_worktree_waiter] {
+            job.request_digest = process_request_digest(
+                &request,
+                &HostJobEnvironmentBinding {
+                    snapshot_id: job.environment_snapshot_id.clone(),
+                    policy_digest: job.environment_policy_digest.clone(),
+                },
+            );
+        }
         let mut store = crate::store::host_jobs::in_memory_test_store();
         let mut pool = HostJobPool::new(2, 2).unwrap();
         let began = Instant::now();
@@ -1052,7 +1268,7 @@ mod pool_tests {
                 &mut store,
                 1,
                 &first,
-                request(),
+                request.clone(),
                 Some(lease_for(&manager, &state_root, &repository_id, 1)),
                 1
             )
@@ -1064,7 +1280,7 @@ mod pool_tests {
                 &mut store,
                 1,
                 &second,
-                request(),
+                request.clone(),
                 Some(lease_for(&manager, &state_root, &repository_id, 2)),
                 1
             )
@@ -1072,8 +1288,15 @@ mod pool_tests {
             HostJobProgress::Running
         );
         assert_eq!(
-            pool.submit_or_poll(&mut store, 1, &same_worktree_waiter, request(), None, 1)
-                .unwrap(),
+            pool.submit_or_poll(
+                &mut store,
+                1,
+                &same_worktree_waiter,
+                request.clone(),
+                None,
+                1,
+            )
+            .unwrap(),
             HostJobProgress::Pending
         );
         assert_eq!(
@@ -1093,10 +1316,10 @@ mod pool_tests {
                     continue;
                 }
                 match pool
-                    .submit_or_poll(&mut store, 1, job, request(), None, 2)
+                    .submit_or_poll(&mut store, 1, job, request.clone(), None, 2)
                     .unwrap()
                 {
-                    HostJobProgress::ProcessCompleted(receipt) => {
+                    HostJobProgress::ProcessCompleted { receipt, .. } => {
                         assert_eq!(receipt.status_code, Some(0));
                         let receipt_json = serde_json::to_string(&receipt).unwrap();
                         pool.finish(&mut store, 1, &job.job_id, true, &receipt_json, 2)
@@ -1194,6 +1417,254 @@ mod pool_tests {
             pool.submit_or_poll(&mut store, 1, &second_operation, request(), None, 1)
                 .unwrap(),
             HostJobProgress::Pending
+        );
+    }
+
+    #[test]
+    fn completed_process_result_survives_pool_restart_without_second_invocation() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("invocations");
+        let database = temp.path().join("state.sqlite3");
+        let marker_count = |path: &Path| {
+            std::fs::read_to_string(path)
+                .map(|contents| contents.lines().count())
+                .unwrap_or_default()
+        };
+        let mut job = intent("operation-replay", "project-1", "operation-1");
+        job.kind = HostJobKind::OperationAdapter;
+        job.operation_method = Some(crate::store::host_jobs::OperationMethod::Invoke);
+        job.max_attempts = 1;
+        job.retry_when_absent = false;
+        let mut process_request = request();
+        process_request.environment.insert(
+            OsString::from("REX_HOST_JOB_INVOCATION_MARKER"),
+            marker.as_os_str().to_owned(),
+        );
+        let original_binding = HostJobEnvironmentBinding {
+            snapshot_id: job.environment_snapshot_id.clone(),
+            policy_digest: job.environment_policy_digest.clone(),
+        };
+        job.request_digest = process_request_digest(&process_request, &original_binding);
+        let mut store = crate::store::host_jobs::file_test_store(&database);
+        let mut queued = job.clone();
+        queued.job_id = "operation-queued".into();
+        queued.effect_operation_id = "effect:operation-queued".into();
+        store.enqueue_host_job(1, &queued, 1).unwrap();
+        {
+            let mut pool = HostJobPool::new(1, 1).unwrap();
+            assert_eq!(
+                pool.submit_or_poll(&mut store, 1, &job, process_request.clone(), None, 1)
+                    .unwrap(),
+                HostJobProgress::Running
+            );
+            let began = Instant::now();
+            loop {
+                pool.drain_finished_processes(&mut store, 1, 2).unwrap();
+                if store
+                    .host_job(&job.job_id)
+                    .unwrap()
+                    .unwrap()
+                    .process_receipt
+                    .is_some()
+                {
+                    break;
+                }
+                assert!(began.elapsed() < Duration::from_secs(3));
+                thread::sleep(Duration::from_millis(5));
+            }
+            let record = store.host_job(&job.job_id).unwrap().unwrap();
+            let raw_receipt = record.process_receipt.unwrap();
+            assert!(raw_receipt.cleanup_confirmed);
+            assert!(
+                String::from_utf8_lossy(&raw_receipt.stdout).contains("fixed host process result")
+            );
+            assert!(record.receipt_json.is_none());
+            assert_eq!(record.state, HostJobState::Running);
+            assert_eq!(
+                store
+                    .host_job(&queued.job_id)
+                    .unwrap()
+                    .unwrap()
+                    .attempt_count,
+                0
+            );
+            assert_eq!(
+                store.host_job(&queued.job_id).unwrap().unwrap().state,
+                HostJobState::Pending
+            );
+            assert_eq!(marker_count(&marker), 1);
+        }
+        drop(store);
+
+        let mut store = crate::store::host_jobs::file_test_store(&database);
+        let mut restarted_pool = HostJobPool::new(1, 1).unwrap();
+        let mut restarted_job = job.clone();
+        restarted_job.environment_snapshot_id = ContentDigest::parse("d".repeat(64)).unwrap();
+        restarted_job.request_digest = process_request_digest(
+            &process_request,
+            &HostJobEnvironmentBinding {
+                snapshot_id: restarted_job.environment_snapshot_id.clone(),
+                policy_digest: restarted_job.environment_policy_digest.clone(),
+            },
+        );
+        assert!(store.enqueue_host_job(1, &restarted_job, 3).is_err());
+        let progress = restarted_pool
+            .submit_or_poll(
+                &mut store,
+                1,
+                &restarted_job,
+                process_request.clone(),
+                None,
+                3,
+            )
+            .unwrap();
+        let HostJobProgress::ProcessCompleted {
+            receipt: replayed,
+            intent: replayed_intent,
+        } = progress
+        else {
+            panic!("durable raw process result was not replayed: {progress:?}");
+        };
+        assert_eq!(*replayed_intent, job);
+        assert!(String::from_utf8_lossy(&replayed.stdout).contains("fixed host process result"));
+        assert_eq!(
+            store.host_job(&job.job_id).unwrap().unwrap().attempt_count,
+            1
+        );
+        assert_eq!(marker_count(&marker), 1);
+
+        let mut changed_request = process_request;
+        changed_request.stdin.push(b'x');
+        let mut changed_intent = restarted_job;
+        changed_intent.request_digest = process_request_digest(
+            &changed_request,
+            &HostJobEnvironmentBinding {
+                snapshot_id: changed_intent.environment_snapshot_id.clone(),
+                policy_digest: changed_intent.environment_policy_digest.clone(),
+            },
+        );
+        assert!(
+            restarted_pool
+                .submit_or_poll(&mut store, 1, &changed_intent, changed_request, None, 4)
+                .is_err()
+        );
+        assert_eq!(marker_count(&marker), 1);
+    }
+
+    #[test]
+    fn dropping_pool_is_bounded_and_running_worker_keeps_worktree_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("worktree-state");
+        let manager = WorktreeManager::new(
+            &state_root,
+            GitOptions {
+                executable: git_executable(),
+                environment: Default::default(),
+                timeout: Duration::from_secs(2),
+            },
+        )
+        .unwrap();
+        let state_root = state_root.canonicalize().unwrap();
+        let repository_id = RepositoryId::parse("repo-a").unwrap();
+        let lease = lease_for(&manager, &state_root, &repository_id, 1);
+        let lease_target = lease.worktree().clone();
+        let mut store = crate::store::host_jobs::in_memory_test_store();
+        let mut pool = HostJobPool::new(1, 1).unwrap();
+        let job = intent(
+            "drop-keeps-lease",
+            "project-1",
+            &lease_target.path.display().to_string(),
+        );
+        let release_file = temp.path().join("release-worker");
+        let mut process_request = request();
+        process_request.environment.insert(
+            OsString::from("REX_HOST_JOB_RELEASE_FILE"),
+            release_file.as_os_str().to_owned(),
+        );
+        assert_eq!(
+            pool.submit_or_poll(&mut store, 1, &job, process_request, Some(lease), 1)
+                .unwrap(),
+            HostJobProgress::Running
+        );
+
+        let drop_started = Instant::now();
+        drop(pool);
+        assert!(drop_started.elapsed() < Duration::from_millis(200));
+        assert!(manager.acquire_writer_lease(lease_target.clone()).is_err());
+        std::fs::write(&release_file, "release").unwrap();
+
+        let began = Instant::now();
+        loop {
+            if manager.acquire_writer_lease(lease_target.clone()).is_ok() {
+                break;
+            }
+            assert!(began.elapsed() < Duration::from_secs(3));
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(
+            store.host_job(&job.job_id).unwrap().unwrap().state,
+            HostJobState::Starting | HostJobState::Running
+        ));
+    }
+
+    #[test]
+    fn cleanup_unconfirmed_process_result_is_not_exposed_to_effect_consumers() {
+        let mut store = crate::store::host_jobs::in_memory_test_store();
+        let mut job = intent("unclean-process", "project-1", "operation-1");
+        job.kind = HostJobKind::OperationAdapter;
+        job.operation_method = Some(crate::store::host_jobs::OperationMethod::Invoke);
+        job.max_attempts = 1;
+        job.retry_when_absent = false;
+        job.lane_id = "operation-1".into();
+        job.effect_operation_id = "operation-1:invoke:1".into();
+        store.enqueue_host_job(1, &job, 10).unwrap();
+        store.start_host_job(1, &job.job_id, 11).unwrap();
+        let identity = ProcessIdentity {
+            pid: u32::MAX,
+            parent_pid: 1,
+            process_group_id: u32::MAX,
+            start_identity: "nonexistent-kernel-birth-token".into(),
+            command: "fixture".into(),
+            quality: process::ProcessIdentityQuality::KernelBirthToken,
+        };
+        let mut pool = HostJobPool::new(1, 1).unwrap();
+        pool.sender
+            .send(WorkerEvent::Started {
+                job_id: job.job_id.clone(),
+                identity: identity.clone(),
+            })
+            .unwrap();
+        pool.sender
+            .send(WorkerEvent::Finished {
+                job_id: job.job_id.clone(),
+                intent: Box::new(job.clone()),
+                identity: Some(identity),
+                result: Ok(HostProcessReceipt {
+                    status_code: Some(0),
+                    stdout: b"untrusted result".to_vec(),
+                    stderr_tail: Vec::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                    timed_out: false,
+                    cleanup_confirmed: false,
+                }),
+            })
+            .unwrap();
+
+        pool.poll(&mut store, 1, 12).unwrap();
+
+        assert!(!pool.completed.contains_key(&job.job_id));
+        assert!(matches!(
+            store.host_job(&job.job_id).unwrap().unwrap().state,
+            HostJobState::Unknown { .. }
+        ));
+        assert!(
+            store
+                .host_job(&job.job_id)
+                .unwrap()
+                .unwrap()
+                .process_receipt
+                .is_none()
         );
     }
 }
