@@ -14,7 +14,7 @@ use crate::store::Store;
 
 /// Handshake-based MCP revisions this server speaks.
 const SUPPORTED_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
-const FALLBACK_VERSION: &str = "2025-06-18";
+const FALLBACK_VERSION: &str = "2025-11-25";
 
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
