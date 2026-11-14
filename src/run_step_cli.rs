@@ -1938,6 +1938,14 @@ while (! -e $ARGV[0]) { select undef, undef, undef, 0.05; }
         )
         .unwrap();
         let status = supervisor.wait().unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        if status.signal() == Some(libc::SIGTERM) {
+            // Preserve the supervisor's cancellation instead of converting it to a test panic.
+            unsafe {
+                libc::signal(libc::SIGTERM, libc::SIG_DFL);
+                libc::raise(libc::SIGTERM);
+            }
+        }
         assert!(status.success(), "anchored supervisor failed: {status}");
     }
 

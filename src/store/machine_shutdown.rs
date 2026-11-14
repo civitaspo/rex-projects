@@ -3,6 +3,7 @@
 //! This is intentionally independent of Project and TicketRun desired lifecycle.
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use sha2::{Digest as _, Sha256};
 
 use super::{ConfigStore, validate_active_generation};
 
@@ -124,6 +125,7 @@ impl ConfigStore {
              VALUES (?1,?2,?2,?3,?4,?5,'draining',?4)",
             params![request_id, generation, cause_name(cause), now_unix, deadline],
         ).map_err(|error| error.to_string())?;
+        cancel_unstarted_launches(tx, generation, now_unix)?;
         Ok(())
     }
 
@@ -203,6 +205,158 @@ impl ConfigStore {
         ).map_err(|error| error.to_string())?;
         Ok(slots.saturating_add(host).saturating_add(qualifications))
     }
+}
+
+/// The shutdown barrier and these cancellations commit together, before drain-only processing.
+fn cancel_unstarted_launches(
+    tx: &rusqlite::Transaction<'_>,
+    generation: u64,
+    now_unix: i64,
+) -> Result<(), String> {
+    let candidates = tx
+        .prepare(
+            "SELECT reservation_json,reservation_digest FROM agent_launch_reservations
+         WHERE controller_generation=?1 AND lifecycle='reserved' AND launch_phase='not_started'",
+        )
+        .map_err(|error| error.to_string())?
+        .query_map([generation], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    for (json, digest) in candidates {
+        let Ok(reservation) =
+            crate::protocol::parse_unique::<crate::launch::AgentLaunchReservation>(json.as_bytes())
+        else {
+            continue;
+        };
+        if reservation.controller_generation != generation
+            || super::canonical_json(&reservation).as_deref() != Ok(json.as_str())
+            || reservation
+                .digest()
+                .map(|value| value.as_str().to_owned())
+                .as_deref()
+                != Ok(digest.as_str())
+        {
+            continue;
+        }
+        let request = super::canonical_json(&crate::launch::StartAgentEffectPayload {
+            schema_version: crate::launch::LAUNCH_SCHEMA_VERSION,
+            agent_run_id: reservation.agent_run_id.clone(),
+            launch_reservation_digest: crate::domain::ids::Digest::parse(digest.clone())?,
+        })?;
+        let request_digest = format!("{:x}", Sha256::digest(request.as_bytes()));
+        let run_id = reservation.agent_run_id.as_str();
+        let operation_id = reservation.operation_id.as_str();
+        let eligible: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_launch_reservations r
+             JOIN agent_runs a USING(agent_run_id)
+             JOIN effects e ON e.operation_id=r.operation_id
+             JOIN execution_slots s ON s.owner_kind='agent_run' AND s.owner_id=r.agent_run_id
+             WHERE r.agent_run_id=?1 AND r.project_id=?2 AND r.operation_id=?3
+               AND r.controller_generation=?4 AND r.project_epoch=?5
+               AND r.reservation_digest=?6 AND r.reservation_json=?7
+               AND r.lifecycle='reserved' AND r.launch_phase='not_started'
+               AND a.project_id=r.project_id AND a.launch_operation_id=r.operation_id
+               AND a.controller_generation=r.controller_generation AND a.state='launch_pending'
+               AND a.rex_session_id IS NULL AND a.rex_window_id IS NULL AND a.rex_block_id IS NULL
+               AND a.process_identity_json IS NULL AND a.started_at_unix IS NULL AND a.finished_at_unix IS NULL
+               AND e.project_id=r.project_id AND e.subject_type='agent_run' AND e.subject_id=r.agent_run_id
+               AND e.kind='start_agent' AND e.logical_key='start-agent:'||r.agent_run_id
+               AND e.request_json=?8 AND e.request_digest=?9 AND e.expected_revision IS NULL
+               AND e.status='pending' AND e.attempt_count=0 AND e.owner_generation IS NULL AND e.receipt_json IS NULL
+               AND s.pool=?10 AND s.slot_index=?11 AND s.project_id=r.project_id AND s.ticket_run_id IS ?12
+               AND s.reservation_epoch=r.project_epoch AND s.controller_generation=r.controller_generation
+               AND s.disposition='launch_pending' AND s.process_identity_json IS NULL
+               AND (SELECT COUNT(*) FROM execution_slots WHERE owner_kind='agent_run' AND owner_id=r.agent_run_id)=1
+               AND NOT EXISTS(SELECT 1 FROM agent_launch_authority WHERE agent_run_id=r.agent_run_id)
+               AND NOT EXISTS(SELECT 1 FROM agent_launch_state WHERE agent_run_id=r.agent_run_id)
+               AND NOT EXISTS(SELECT 1 FROM rex_view_blocks WHERE agent_run_id=r.agent_run_id))",
+            params![run_id,reservation.project_id.as_str(),operation_id,generation,reservation.project_epoch,
+                digest,json,request,request_digest,reservation.pool,reservation.slot_index,
+                reservation.ticket_run_id.as_ref().map(|id| id.as_str())],
+            |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if !eligible || !assigned_wakes_match_reservation(tx, &reservation)? {
+            continue;
+        }
+        let effect_changed = tx.execute(
+            "UPDATE effects SET status='cancelled',last_error='machine stopped before Agent launch' WHERE operation_id=?1",
+            [operation_id],
+        ).map_err(|error| error.to_string())?;
+        let run_changed = tx
+            .execute(
+                "UPDATE agent_runs SET state='cancelled',finished_at_unix=?2 WHERE agent_run_id=?1",
+                params![run_id, now_unix],
+            )
+            .map_err(|error| error.to_string())?;
+        let reservation_changed = tx.execute(
+            "UPDATE agent_launch_reservations SET lifecycle='cancelled',updated_at_unix=?2 WHERE agent_run_id=?1",
+            params![run_id,now_unix],
+        ).map_err(|error| error.to_string())?;
+        let slot_changed = tx.execute(
+            "UPDATE execution_slots SET disposition='released' WHERE pool=?1 AND slot_index=?2 AND owner_kind='agent_run' AND owner_id=?3",
+            params![reservation.pool,reservation.slot_index,run_id],
+        ).map_err(|error| error.to_string())?;
+        if [
+            effect_changed,
+            run_changed,
+            reservation_changed,
+            slot_changed,
+        ] != [1; 4]
+        {
+            return Err("unstarted launch cancellation did not update its exact owners".into());
+        }
+        for wake in &reservation.wake_snapshot.inputs {
+            let changed = tx
+                .execute(
+                    "UPDATE role_wake_inputs SET lifecycle='pending',consuming_agent_run_id=NULL
+                 WHERE wake_input_id=?1 AND consuming_agent_run_id=?2 AND lifecycle='assigned'",
+                    params![wake.wake_input_id, run_id],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err(
+                    "unstarted launch cancellation did not return its exact wake input".into(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn assigned_wakes_match_reservation(
+    tx: &rusqlite::Transaction<'_>,
+    reservation: &crate::launch::AgentLaunchReservation,
+) -> Result<bool, String> {
+    let count: usize = tx
+        .query_row(
+            "SELECT COUNT(*) FROM role_wake_inputs WHERE consuming_agent_run_id=?1",
+            [reservation.agent_run_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if count != reservation.wake_snapshot.inputs.len() {
+        return Ok(false);
+    }
+    for wake in &reservation.wake_snapshot.inputs {
+        let payload: Option<String> = tx.query_row(
+            "SELECT payload_json FROM role_wake_inputs WHERE wake_input_id=?1
+             AND project_id=?2 AND role_session_id=?3 AND consuming_agent_run_id=?4 AND lifecycle='assigned'
+             AND source_type=?5 AND source_id=?6 AND source_revision=?7 AND priority=?8",
+            params![wake.wake_input_id,reservation.project_id.as_str(),reservation.role_session_id,
+                reservation.agent_run_id.as_str(),wake.source_type,wake.source_id,wake.source_revision,wake.priority],
+            |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        if payload.and_then(|json| {
+            crate::protocol::parse_unique::<serde_json::Value>(json.as_bytes()).ok()
+        }) != Some(wake.payload_json.clone())
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn read_active(connection: &rusqlite::Connection) -> Result<Option<MachineShutdown>, String> {

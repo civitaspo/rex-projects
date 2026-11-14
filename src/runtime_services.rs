@@ -3977,21 +3977,12 @@ impl FactoryRuntimeServices for RuntimeServices {
         let mailbox_max_request_bytes = 1_048_576_u64;
         let mailbox_max_pending_requests = 32_u32;
         let Some(reservation) = fit_wake_snapshot_to_reservation(wake_snapshot, |mut snapshot| {
-            let seed = serde_json::to_vec(&(
-                "rex-projects-agent-run-v1",
+            let (run_id, operation_id) = role_launch_ids(
+                owner_generation,
                 &candidate.project_id,
                 &candidate.role_session_id,
-                snapshot
-                    .inputs
-                    .iter()
-                    .map(|input| input.wake_input_id)
-                    .collect::<Vec<_>>(),
-            ))
-            .map_err(|error| error.to_string())?;
-            let seed_digest = digest_bytes(&seed)?;
-            let short = &seed_digest.as_str()[..32];
-            let run_id = crate::domain::ids::AgentRunId::parse(format!("agent-{short}"))?;
-            let operation_id = crate::domain::ids::OperationId::parse(format!("start-{short}"))?;
+                snapshot.inputs.iter().map(|input| input.wake_input_id),
+            )?;
             snapshot.agent_run_id = run_id.as_str().to_owned();
             snapshot.digest = snapshot.content_digest()?;
             let run_root = self.state_root.join("agents").join(run_id.as_str());
@@ -4086,6 +4077,34 @@ pub(crate) fn fit_wake_snapshot_to_inbox(
     snapshot.digest = snapshot.content_digest()?;
     snapshot.validate()?;
     Ok(snapshot)
+}
+
+pub(crate) fn role_launch_ids(
+    owner_generation: u64,
+    project_id: &crate::domain::ids::ProjectId,
+    role_session_id: &str,
+    wake_ids: impl Iterator<Item = u64>,
+) -> Result<
+    (
+        crate::domain::ids::AgentRunId,
+        crate::domain::ids::OperationId,
+    ),
+    String,
+> {
+    let seed = serde_json::to_vec(&(
+        "rex-projects-agent-run-v1",
+        owner_generation,
+        project_id,
+        role_session_id,
+        wake_ids.collect::<Vec<_>>(),
+    ))
+    .map_err(|error| error.to_string())?;
+    let digest = digest_bytes(&seed)?;
+    let suffix = &digest.as_str()[..32];
+    Ok((
+        crate::domain::ids::AgentRunId::parse(format!("agent-{suffix}"))?,
+        crate::domain::ids::OperationId::parse(format!("start-{suffix}"))?,
+    ))
 }
 
 pub(crate) fn fit_wake_snapshot_to_reservation(
@@ -5524,20 +5543,12 @@ impl RuntimeServices {
                 );
             }
         }
-        let seed = serde_json::to_vec(&(
-            "rex-projects-agent-run-v1",
+        let (agent_run_id, operation_id) = role_launch_ids(
+            self.owner_generation,
             &candidate.project_id,
             &candidate.role_session_id,
-            wake_inputs
-                .iter()
-                .map(|input| input.wake_input_id)
-                .collect::<Vec<_>>(),
-        ))
-        .map_err(|error| error.to_string())?;
-        let seed_digest = digest_bytes(&seed)?;
-        let suffix = &seed_digest.as_str()[..32];
-        let agent_run_id = crate::domain::ids::AgentRunId::parse(format!("agent-{suffix}"))?;
-        let operation_id = crate::domain::ids::OperationId::parse(format!("start-{suffix}"))?;
+            wake_inputs.iter().map(|input| input.wake_input_id),
+        )?;
         let workspace = worker_context
             .as_ref()
             .map(|context| context.token.worktree_path().to_owned())
