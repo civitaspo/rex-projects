@@ -741,10 +741,6 @@ fn validate_config(config: &Config, profiles: &BTreeMap<ProfileId, Profile>) -> 
         ("runtime.max_ticket_runs", runtime.max_ticket_runs as u64),
         ("runtime.max_host_jobs", runtime.max_host_jobs as u64),
         (
-            "runtime.shutdown_grace_seconds",
-            runtime.shutdown_grace_seconds,
-        ),
-        (
             "runtime.max_blocks_per_tab",
             runtime.max_blocks_per_tab as u64,
         ),
@@ -764,6 +760,9 @@ fn validate_config(config: &Config, profiles: &BTreeMap<ProfileId, Profile>) -> 
         if value == 0 {
             return Err(format!("{name} must be positive"));
         }
+    }
+    if !(1..=300).contains(&runtime.shutdown_grace_seconds) {
+        return Err("runtime.shutdown_grace_seconds must be between 1 and 300".into());
     }
     if runtime.completed_blocks_to_keep >= runtime.max_blocks_per_tab {
         return Err(
@@ -1800,6 +1799,22 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
         );
+    }
+
+    #[test]
+    fn shutdown_grace_configuration_matches_the_controller_bounds() {
+        let config_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml");
+        let mut loaded = super::load(&config_path).unwrap();
+        for seconds in [1, 300] {
+            loaded.config.runtime.shutdown_grace_seconds = seconds;
+            super::validate_config(&loaded.config, &loaded.profiles).unwrap();
+        }
+        for seconds in [0, 301] {
+            loaded.config.runtime.shutdown_grace_seconds = seconds;
+            let error = super::validate_config(&loaded.config, &loaded.profiles).unwrap_err();
+            assert!(error.contains("runtime.shutdown_grace_seconds"), "{error}");
+        }
     }
 
     #[test]

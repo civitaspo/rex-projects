@@ -2207,6 +2207,17 @@ while (! -e $ARGV[0]) { select undef, undef, undef, 0.05; }
     #[cfg(unix)]
     #[test]
     fn runtime_services_reconnect_recovers_a_real_run_step_after_missed_block_close() {
+        connected_recovery_after_missed_block_close(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_drain_advances_past_an_unresolved_peer_to_close_a_real_run_step() {
+        connected_recovery_after_missed_block_close(true);
+    }
+
+    #[cfg(unix)]
+    fn connected_recovery_after_missed_block_close(include_unresolved_peer: bool) {
         use crate::adapters::rex::{RexCliTransport, RexIdentity};
         use crate::engine::factory_runtime::FactoryRuntimeObservationServices;
         use crate::runtime_services::{RuntimeExecutable, RuntimeServices};
@@ -2524,13 +2535,16 @@ esac
             .test_connection()
             .query_row("SELECT COUNT(*) FROM agent_runs", [], |row| row.get(0))
             .unwrap();
+        if include_unresolved_peer {
+            seed_unresolved_recovery_peer(&mut fixture);
+        }
         let short_drain_now = super::unix_now_seconds().unwrap();
         let short_drain_issues = services
             .machine_shutdown_tick(
                 &mut fixture.store,
                 fixture.generation,
                 short_drain_now,
-                short_drain_now + 16,
+                short_drain_now + 1,
             )
             .unwrap();
         assert!(!short_drain_issues.is_empty());
@@ -2545,13 +2559,43 @@ esac
                 &mut fixture.store,
                 fixture.generation,
                 super::unix_now_seconds().unwrap(),
-                super::unix_now_seconds().unwrap() + 30,
+                super::unix_now_seconds().unwrap() + 10,
             )
             .unwrap();
-        assert!(
-            drain_issues.is_empty(),
-            "shutdown drain issues: {drain_issues:?}"
-        );
+        if include_unresolved_peer {
+            assert!(!drain_issues.is_empty(), "unresolved peer must be reported");
+            assert!(
+                !closed.exists(),
+                "one bounded recovery pass must not skip the unresolved peer"
+            );
+            assert_eq!(
+                test_execution_slot_disposition(&fixture.store, &fixture.slot_owner_id),
+                "live",
+                "the real run remains owned until its own recovery observation"
+            );
+            assert_eq!(
+                test_execution_slot_disposition(&fixture.store, "aaa-unresolved-peer"),
+                "unknown",
+                "the unresolved peer remains held"
+            );
+            let next_drain_issues = services
+                .machine_shutdown_tick(
+                    &mut fixture.store,
+                    fixture.generation,
+                    super::unix_now_seconds().unwrap(),
+                    super::unix_now_seconds().unwrap() + 10,
+                )
+                .unwrap();
+            assert!(
+                next_drain_issues.is_empty(),
+                "eligible run should be handled on the next bounded pass: {next_drain_issues:?}"
+            );
+        } else {
+            assert!(
+                drain_issues.is_empty(),
+                "shutdown drain issues: {drain_issues:?}"
+            );
+        }
         assert!(closed.exists());
         let agent_runs_after_drain: i64 = fixture
             .store
@@ -2559,7 +2603,8 @@ esac
             .query_row("SELECT COUNT(*) FROM agent_runs", [], |row| row.get(0))
             .unwrap();
         assert_eq!(
-            agent_runs_after_drain, agent_runs_before_drain,
+            agent_runs_after_drain,
+            agent_runs_before_drain + i64::from(include_unresolved_peer),
             "drain-only processing must not dispatch another role"
         );
         let first_post_close = FactoryRuntimeObservationServices::recover_agents(
@@ -2569,7 +2614,10 @@ esac
             super::unix_now_seconds().unwrap(),
         )
         .unwrap();
-        assert_eq!(first_post_close.examined, 1);
+        assert_eq!(
+            first_post_close.examined,
+            if include_unresolved_peer { 2 } else { 1 }
+        );
         assert_eq!(
             test_execution_slot_disposition(&fixture.store, &fixture.slot_owner_id),
             "live",
@@ -2587,6 +2635,13 @@ esac
             test_execution_slot_disposition(&fixture.store, "unrelated-run"),
             "unknown"
         );
+        if include_unresolved_peer {
+            assert_eq!(
+                test_execution_slot_disposition(&fixture.store, "aaa-unresolved-peer"),
+                "unknown",
+                "the unresolved peer must remain held after the real run is closed"
+            );
+        }
         assert_eq!(
             fixture
                 .store
@@ -2722,7 +2777,7 @@ esac
             } else {
                 assert_eq!(slot, "live", "unknown slot dispositions fail closed");
             }
-            assert!(report.examined <= 1);
+            assert!(report.examined <= if include_unresolved_peer { 2 } else { 1 });
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(reconnected, "the production event reader must reconnect");
@@ -2738,6 +2793,13 @@ esac
             test_execution_slot_disposition(&fixture.store, "unrelated-run"),
             "unknown"
         );
+        if include_unresolved_peer {
+            assert_eq!(
+                test_execution_slot_disposition(&fixture.store, "aaa-unresolved-peer"),
+                "unknown",
+                "the unresolved peer remains owned after the verified run releases its slot"
+            );
+        }
         let events = fixture.store.test_connection().query_row(
             "SELECT COUNT(*) FROM agent_block_lifecycle_facts WHERE agent_run_id=?1 AND reservation_epoch=?2 AND fact_type='event_received'",
             rusqlite::params![fixture.authority.agent_run_id.as_str(), fixture.reservation.project_epoch],
@@ -2764,6 +2826,56 @@ esac
             );
         }
         shim.finished = true;
+    }
+
+    #[cfg(unix)]
+    fn seed_unresolved_recovery_peer(
+        fixture: &mut crate::store::agent_runtime::tests::PreparedBlockLossFixture,
+    ) {
+        let connection = fixture.store.test_connection();
+        let peer_id = crate::domain::ids::AgentRunId::parse("aaa-unresolved-peer").unwrap();
+        let peer_operation =
+            crate::domain::ids::OperationId::parse("aaa-unresolved-peer-op").unwrap();
+        let peer_session = "unresolved-peer-session";
+        let peer_block = "unresolved-peer-block";
+        let peer_descriptor = fixture
+            .authority
+            .descriptor_path
+            .with_extension("peer.json");
+        let peer_workspace = fixture.authority.workspace_path.join("unresolved-peer");
+        let peer_control = fixture.authority.control_dir.join("unresolved-peer");
+        fs::create_dir_all(&peer_control).unwrap();
+        let mut authority = fixture.authority.clone();
+        authority.agent_run_id = peer_id.clone();
+        authority.role_session_id = peer_session.into();
+        authority.operation_id = peer_operation.clone();
+        authority.rex_block_id = peer_block.into();
+        authority.descriptor_path = peer_descriptor.clone();
+        authority.workspace_path = peer_workspace.clone();
+        authority.control_dir = peer_control.clone();
+        let authority_json = serde_json::to_string(&authority).unwrap();
+        let authority_digest = authority.digest().unwrap();
+
+        connection.execute(
+            "INSERT INTO agent_runs(agent_run_id,project_id,config_source,config_revision,config_digest,role_session_id,logical_owner,finite_turn,launch_operation_id,state,controller_generation,role)
+             SELECT ?1,project_id,config_source,config_revision,config_digest,?2,'role:unresolved-peer',1,?3,'unknown',controller_generation,role
+             FROM agent_runs WHERE agent_run_id=?4",
+            rusqlite::params![peer_id.as_str(), peer_session, peer_operation.as_str(), fixture.slot_owner_id],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO agent_launch_authority(agent_run_id,project_id,role,role_session_id,parent_run_id,parent_role,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,launch_operation_id,operation_recipe_id,rex_view_id,descriptor_digest,runtime_binary_digest,descriptor_path,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,rex_block_id,workspace_path,control_dir,mailbox_capability_digest,authority_json,authority_digest,created_at_unix)
+             SELECT ?1,project_id,role,?2,parent_run_id,parent_role,ticket_run_id,ticket_revision,config_revision,config_digest,attempt,run_epoch,controller_generation,?3,operation_recipe_id,rex_view_id,descriptor_digest,runtime_binary_digest,?4,environment_snapshot_id,profile_id,profile_digest,instruction_digest,result_schema_digest,qualification_receipt_digest,rex_server_identity,rex_session_id,rex_window_id,?5,?6,?7,mailbox_capability_digest,?8,?9,created_at_unix
+             FROM agent_launch_authority WHERE agent_run_id=?10",
+            rusqlite::params![peer_id.as_str(), peer_session, peer_operation.as_str(), peer_descriptor.display().to_string(), peer_block, peer_workspace.display().to_string(), peer_control.display().to_string(), authority_json, authority_digest.as_str(), fixture.slot_owner_id],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO agent_launch_state(agent_run_id,state,last_observed_at_unix,updated_at_unix) VALUES (?1,'unknown',unixepoch(),unixepoch())",
+            [peer_id.as_str()],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO execution_slots(pool,slot_index,project_id,owner_kind,owner_id,reservation_epoch,controller_generation,disposition) SELECT 'agent',2,project_id,'agent_run',?1,1,controller_generation,'unknown' FROM agent_runs WHERE agent_run_id=?2",
+            rusqlite::params![peer_id.as_str(), peer_id.as_str()],
+        ).unwrap();
     }
 
     #[cfg(unix)]

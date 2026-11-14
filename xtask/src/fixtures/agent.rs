@@ -1841,7 +1841,9 @@ fn next_message(
                 }
             }
             Role::Coordinator if ordinal == 1 => {
-                if inbox
+                if context.require_human_instruction {
+                    inbox.validate_human_instruction(invocation)?;
+                } else if inbox
                     .planner_result(
                         &invocation.scope.project_id,
                         invocation.scope.ticket_run_id.as_deref(),
@@ -3340,12 +3342,127 @@ mod tests {
     use super::Role;
     use super::{
         AgentContext, FixtureAction, FixtureInbox, FixtureInvocation, FixtureLane, FixtureScope,
-        RunInputEvidence, next_message, parse_shell_words, prompt_json_field, prompt_ticket,
-        source_schema, validate_action, validate_coordinator_dispatch, validate_recipe_references,
-        validate_source_prompt, worker_assignment, worker_node_id, worker_node_id_for_lane,
+        RoleOutputKind, RunInputEvidence, next_message, parse_shell_words, prompt_json_field,
+        prompt_ticket, source_schema, validate_action, validate_coordinator_dispatch,
+        validate_recipe_references, validate_source_prompt, worker_assignment, worker_node_id,
+        worker_node_id_for_lane,
     };
     use rusqlite::Connection;
     use std::path::Path;
+
+    #[test]
+    fn coordinator_progress_instruction_advances_fixture_workflow_cursor() {
+        use sha2::{Digest as _, Sha256};
+
+        let recipes = crate::acceptance::profile_messages("coordinator", false).unwrap();
+        let recipes = crate::acceptance::coordinator_progress_messages(recipes).unwrap();
+        let context: AgentContext = serde_json::from_value(serde_json::json!({
+            "schema_version":1,
+            "scenario":"acceptance_coordinator",
+            "messages":recipes
+        }))
+        .unwrap();
+        let scope = FixtureScope {
+            scenario: "acceptance_coordinator".into(),
+            context: "coordinator.json".into(),
+            lane: FixtureLane::Workflow,
+            project_id: "operations_project".into(),
+            role: Role::Coordinator,
+            ticket_run_id: Some("ticket-run-1".into()),
+            work_node_id: None,
+        };
+        let invocation = |run_id: &str| FixtureInvocation {
+            scope: scope.clone(),
+            run_id: run_id.into(),
+            operation_id: Some(format!("start-{run_id}")),
+            attempt: Some(1),
+            run_epoch: Some(1),
+            subject_revision: Some(0),
+            prompt_digest: "a".repeat(64),
+        };
+        let dispatch = |run_id: &str| {
+            FixtureInbox::parse(
+                serde_json::json!({
+                    "run_id":run_id,
+                    "after":0,
+                    "next_after":1,
+                    "inputs":[{
+                        "wake_input_id":1,
+                        "source_type":"ticket_run_dispatch",
+                        "source_id":"ticket-run-1",
+                        "source_revision":0,
+                        "priority":30,
+                        "payload_json":{"ticket_run_id":"ticket-run-1","supervisor_evidence_id":"supervisor-evidence"},
+                        "host_artifacts":[]
+                    }]
+                }),
+                run_id,
+            )
+            .unwrap()
+        };
+        let root = tempfile::tempdir().unwrap();
+        let first = next_message(
+            &context,
+            &invocation("coordinator-first-progress"),
+            root.path(),
+            None,
+            "host prompt",
+            Some(&dispatch("coordinator-first-progress")),
+        )
+        .unwrap();
+        assert_eq!(first.kind, RoleOutputKind::Progress);
+
+        let body =
+            "Continue the bounded acceptance by acknowledging this durable human instruction.";
+        let body_digest = format!("{:x}", Sha256::digest(body.as_bytes()));
+        let instruction = FixtureInbox::parse(
+            serde_json::json!({
+                "run_id":"coordinator-after-instruction",
+                "after":1,
+                "next_after":2,
+                "inputs":[{
+                    "wake_input_id":2,
+                    "source_type":"human_instruction",
+                    "source_id":"acceptance-coordinator-instruction-1",
+                    "source_revision":0,
+                    "priority":100,
+                    "payload_json":{
+                        "schema_version":1,
+                        "request_id":"acceptance-coordinator-instruction-1",
+                        "project_id":"operations_project",
+                        "ticket_run_id":"ticket-run-1",
+                        "namespace":"fixture/acceptance",
+                        "ticket_id":"ticket-1",
+                        "expected_revision":0,
+                        "body":body,
+                        "body_digest":body_digest
+                    },
+                    "host_artifacts":[]
+                }]
+            }),
+            "coordinator-after-instruction",
+        )
+        .unwrap();
+        let mut instruction_context = context;
+        instruction_context.require_human_instruction = true;
+        let second = next_message(
+            &instruction_context,
+            &invocation("coordinator-after-instruction"),
+            root.path(),
+            None,
+            "host prompt",
+            Some(&instruction),
+        )
+        .expect("second Coordinator workflow turn should consume its Progress recipe");
+        assert_eq!(second.kind, RoleOutputKind::Progress);
+        assert!(
+            second.structured_result["summary"]
+                .as_str()
+                .unwrap()
+                .contains("durable human instruction")
+        );
+        assert_eq!(second.assertion, super::AgentAssertion::Succeeded);
+    }
 
     #[test]
     fn merge_decision_recipe_uses_the_public_inbox_prepared_body_identity() {

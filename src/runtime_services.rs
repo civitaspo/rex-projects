@@ -4482,14 +4482,11 @@ impl RuntimeServices {
             issues.push(format!("Agent result ingestion: {error}"));
         }
         // Leave ownership intact when a complete bounded observation cannot fit.
-        let Some(operation_seconds) = bounded_shutdown_rex_timeout_seconds(deadline_unix, now_unix)
-        else {
+        let Some(operation_timeout) = bounded_shutdown_rex_timeout(deadline_unix, now_unix) else {
             issues.push("shutdown deadline leaves no bounded Rex observation budget".into());
             return Ok(issues);
         };
-        let bounded_rex = self
-            .rex
-            .with_bounded_operation_timeout(Duration::from_secs(operation_seconds));
+        let bounded_rex = self.rex.with_bounded_operation_timeout(operation_timeout);
         let policy = crate::agent_recovery::RecoveryPolicy {
             rex_session_id: self.rex_identity.session_id.clone(),
             turn_timeout_seconds: self
@@ -4519,9 +4516,6 @@ impl RuntimeServices {
         let closed =
             self.close_recovered_agent_blocks_for_shutdown(store, &bounded_rex, &report)?;
         issues.extend(closed);
-        let _ = self
-            .agent_recovery
-            .tick(store, owner_generation, &bounded_rex, &policy)?;
         Ok(issues)
     }
 
@@ -5785,27 +5779,45 @@ impl RuntimeServices {
     }
 }
 
-fn bounded_shutdown_rex_timeout_seconds(deadline_unix: i64, now_unix: i64) -> Option<u64> {
-    // A pass uses at most 16 Rex calls. Four additional slices and two seconds cover
-    // their bounded cleanup/read grace and local bookkeeping.
-    let remaining_seconds = deadline_unix.saturating_sub(now_unix).saturating_sub(1);
-    if remaining_seconds <= 0 {
+fn bounded_shutdown_rex_timeout(deadline_unix: i64, now_unix: i64) -> Option<Duration> {
+    // Reserve one second for coarse timestamps and one for the bounded RPC cleanup grace.
+    let rpc_budget_seconds = deadline_unix.saturating_sub(now_unix).saturating_sub(2);
+    if rpc_budget_seconds <= 0 {
         return None;
     }
-    let rpc_budget_seconds = remaining_seconds.saturating_sub(1);
-    let operation_seconds = (rpc_budget_seconds / 20).min(5);
-    (operation_seconds > 0).then_some(operation_seconds as u64)
+    Some((Duration::from_secs(rpc_budget_seconds as u64) / 20).min(Duration::from_secs(5)))
 }
 
 #[cfg(test)]
 mod shutdown_budget_tests {
-    use super::bounded_shutdown_rex_timeout_seconds;
+    use super::bounded_shutdown_rex_timeout;
+    use std::time::Duration;
+
+    #[test]
+    fn short_shutdown_grace_still_has_a_rex_observation_budget() {
+        assert_eq!(
+            bounded_shutdown_rex_timeout(110, 100),
+            Some(Duration::from_millis(400))
+        );
+        assert_eq!(
+            bounded_shutdown_rex_timeout(103, 100),
+            Some(Duration::from_millis(50))
+        );
+    }
 
     #[test]
     fn expired_shutdown_deadline_never_becomes_an_unsigned_rpc_budget() {
-        assert_eq!(bounded_shutdown_rex_timeout_seconds(100, 101), None);
-        assert_eq!(bounded_shutdown_rex_timeout_seconds(100, 100), None);
-        assert_eq!(bounded_shutdown_rex_timeout_seconds(130, 100), Some(1));
+        assert_eq!(bounded_shutdown_rex_timeout(100, 101), None);
+        assert_eq!(bounded_shutdown_rex_timeout(100, 100), None);
+        assert_eq!(bounded_shutdown_rex_timeout(102, 100), None);
+        assert_eq!(
+            bounded_shutdown_rex_timeout(130, 100),
+            Some(Duration::from_millis(1400))
+        );
+        assert_eq!(
+            bounded_shutdown_rex_timeout(i64::MAX, i64::MIN),
+            Some(Duration::from_secs(5))
+        );
     }
 }
 

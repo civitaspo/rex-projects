@@ -3386,7 +3386,9 @@ fn prepare_profiles(
     Ok(())
 }
 
-fn coordinator_progress_messages(mut messages: Vec<Value>) -> Result<Vec<Value>, String> {
+pub(crate) fn coordinator_progress_messages(
+    mut messages: Vec<Value>,
+) -> Result<Vec<Value>, String> {
     let index = messages
         .iter()
         .position(|item| item["lane"] == "workflow")
@@ -3404,6 +3406,20 @@ fn coordinator_progress_messages(mut messages: Vec<Value>) -> Result<Vec<Value>,
     )
     .with_lane("workflow");
     messages.truncate(index + 1);
+    messages.push(
+        message(
+            "coordinator",
+            "progress",
+            json!({
+                "summary":"The Coordinator acknowledged the durable human instruction and recorded the next bounded step.",
+                "completed_node_keys":[],
+                "pending_node_keys":[],
+                "evidence":[],
+                "next_observation_at":null
+            }),
+        )
+        .with_lane("workflow"),
+    );
     Ok(messages)
 }
 
