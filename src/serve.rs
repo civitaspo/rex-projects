@@ -4,7 +4,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 
@@ -19,6 +19,10 @@ use crate::worktree;
 
 /// How many times a Coordinator is resumed after its block disappears.
 pub const MAX_RELAUNCHES: i64 = 3;
+/// How many failed attempts to open a Coordinator's block fail its Ticket.
+pub const MAX_LAUNCH_FAILURES: u32 = 5;
+/// How long the pane of a done Ticket stays open for the human to read.
+const DONE_PANE_RETENTION: chrono::Duration = chrono::Duration::minutes(10);
 const ACTOR: &str = "serve";
 
 /// Chooses the Tickets to dispatch now, taking one ready Ticket per Project
@@ -88,6 +92,10 @@ pub struct Serve<R: Rex> {
     /// The rex-projects executable that blocks run.
     pub exe: PathBuf,
     rotation: usize,
+    /// Failed launch attempts per Ticket and when to try again.
+    launch_failures: HashMap<String, (u32, Instant)>,
+    /// The first retry delay after a failed launch; it doubles each time.
+    pub retry_delay: Duration,
 }
 
 impl<R: Rex> Serve<R> {
@@ -98,6 +106,8 @@ impl<R: Rex> Serve<R> {
             rex,
             exe,
             rotation: 0,
+            launch_failures: HashMap::new(),
+            retry_delay: Duration::from_secs(10),
         }
     }
 
@@ -110,7 +120,59 @@ impl<R: Rex> Serve<R> {
                 println!("{}: reconcile failed: {err:#}", agent.id);
             }
         }
-        self.dispatch(config)
+        self.ensure_coordinators()?;
+        self.dispatch(config)?;
+        self.ensure_coordinators()
+    }
+
+    /// Every active Ticket should have a running Coordinator. Starts the
+    /// missing ones: a resume when the harness session is known, else a new
+    /// launch. Failed attempts back off and eventually fail the Ticket.
+    fn ensure_coordinators(&mut self) -> Result<()> {
+        for ticket in self.store.tickets(None)? {
+            if !ticket.state.is_active() {
+                self.launch_failures.remove(&ticket.id);
+                continue;
+            }
+            let Some(agent_id) = &ticket.coordinator_id else {
+                continue;
+            };
+            let Some(agent) = self.store.agent(agent_id)? else {
+                continue;
+            };
+            if agent.state == "running" {
+                self.launch_failures.remove(&ticket.id);
+                continue;
+            }
+            if agent.launches > MAX_RELAUNCHES {
+                self.fail(
+                    &ticket.id,
+                    &format!(
+                        "the Coordinator's block closed after {} launches",
+                        agent.launches
+                    ),
+                )?;
+                continue;
+            }
+            let failures = self.launch_failures.get(&ticket.id).copied();
+            if failures.is_some_and(|(_, retry_at)| Instant::now() < retry_at) {
+                continue;
+            }
+            let resume = agent.harness_session_id.is_some();
+            if let Err(err) = self.launch(&agent, &ticket, resume) {
+                let count = failures.map_or(1, |(count, _)| count + 1);
+                println!("{}: launch attempt {count} failed: {err:#}", agent.id);
+                if count >= MAX_LAUNCH_FAILURES {
+                    self.launch_failures.remove(&ticket.id);
+                    self.fail(&ticket.id, &format!("launch failed {count} times: {err:#}"))?;
+                } else {
+                    let delay = self.retry_delay * 2u32.pow(count - 1);
+                    self.launch_failures
+                        .insert(ticket.id.clone(), (count, Instant::now() + delay));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn append(&mut self, event: Event) -> Result<()> {
@@ -131,23 +193,12 @@ impl<R: Rex> Serve<R> {
                 reason: "block closed".into(),
             })?;
             println!("{}: block closed", agent.id);
-            if !ticket.state.is_active() || agent.role != "coordinator" {
-                return Ok(());
-            }
-            let result = if agent.launches <= MAX_RELAUNCHES {
-                self.launch(agent, &ticket, true)
-            } else {
-                Err(anyhow!(
-                    "the Coordinator's block closed after {} launches",
-                    agent.launches
-                ))
-            };
-            if let Err(err) = result {
-                self.fail(&ticket.id, &format!("{err:#}"))?;
-            }
             return Ok(());
         }
-        if matches!(ticket.state, TicketState::Abandoned | TicketState::Failed) {
+        let done_long_ago = ticket.state == TicketState::Done
+            && chrono::DateTime::parse_from_rfc3339(&ticket.updated_at)
+                .is_ok_and(|at| chrono::Utc::now().signed_duration_since(at) > DONE_PANE_RETENTION);
+        if done_long_ago || matches!(ticket.state, TicketState::Abandoned | TicketState::Failed) {
             self.rex.close_block(session, block)?;
             self.append(Event::AgentExited {
                 agent_id: agent.id.clone(),
@@ -306,8 +357,7 @@ impl<R: Rex> Serve<R> {
             agent_id: agent_id.clone(),
         })?;
         println!("{}: dispatched to {agent_id}", ticket.id);
-        let agent = self.store.agent(&agent_id)?.context("agent vanished")?;
-        self.launch(&agent, ticket, false)
+        Ok(())
     }
 }
 
@@ -635,13 +685,29 @@ mod tests {
     }
 
     #[test]
-    fn fails_a_ticket_whose_launch_fails() {
+    fn retries_failed_launches_then_fails_the_ticket() {
         let mut f = fixture();
+        f.serve.retry_delay = Duration::ZERO;
         f.serve.rex.fail_new_window = true;
         f.tick();
+        assert_eq!(f.state(), TicketState::Running, "one failure is retried");
+        for _ in 1..MAX_LAUNCH_FAILURES {
+            f.tick();
+        }
         assert_eq!(f.state(), TicketState::Failed);
-        assert_eq!(f.agent().state, "exited");
+        assert_eq!(f.agent().launches, 0);
+    }
+
+    #[test]
+    fn recovers_when_a_failed_launch_succeeds_on_retry() {
+        let mut f = fixture();
+        f.serve.retry_delay = Duration::ZERO;
+        f.serve.rex.fail_new_window = true;
         f.tick();
-        assert_eq!(f.state(), TicketState::Failed);
+        f.serve.rex.fail_new_window = false;
+        f.tick();
+        assert_eq!(f.state(), TicketState::Running);
+        let agent = f.agent();
+        assert_eq!((agent.state.as_str(), agent.launches), ("running", 1));
     }
 }
