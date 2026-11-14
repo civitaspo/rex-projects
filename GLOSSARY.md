@@ -1,107 +1,114 @@
 # rex-projects
 
-rex-projects coordinates Agents that deliver tickets and improve a Project's delivery practices.
+rex-projects is a Rex plugin that runs cooperating coding Agents to complete the Tickets of several Projects at once, and improves how they work over time.
 
-## Language
+## Loops
 
-**Project**.
-A collection of tickets and delivery practices, with an optional goal.
-_Avoid_ mission, workspace.
+**Inner loop**:
+The part of the system that turns an intent snapshot into verified results and reports what happened. rex-projects is the inner loop.
 
-**Goal Project**.
-A Project organized around explicit acceptance conditions for a goal.
+**Outer loop**:
+The part of the system that decides what to build, keeps intent current, and improves the Harness from what the inner loop reports. A Supervisor runs it.
 
-**Operations Project**.
-A Project organized around recurring work and declared operation recipes rather than a mandatory final goal.
+**Harness**:
+Everything around a model that shapes an Agent's results: the target repository's checks and docs, Playbooks, Skills, Roles, configuration, and rex-projects itself.
+_Avoid_: profile, when you mean the whole environment
 
-**Ticket**.
-An externally tracked unit of requested work that belongs to a Project.
-_Avoid_ task when referring to the external ticket.
+## Work
 
-**TicketRun**.
-One attempt to deliver a Ticket, including its planning, changes, operations, and retrospective.
+**Project**:
+One repository with a goal, an autonomy level, and its Tickets.
+_Avoid_: workspace, mission
 
-**Ticket status**.
-The normalized external tracker state, mapped to Triage, Backlog, Ready, In Progress, In Review, Done, or Canceled. In Review means required human review is pending. Other active delivery uses In Progress, with detailed phases and waiting reasons held internally.
+**Ticket**:
+A unit of work in a Project. A Project is complete when all of its Tickets have ended.
+_Avoid_: task, issue (for the local record)
 
-**Machine controller**.
-The single foreground rex-projects process that schedules all Projects on the machine and owns durable orchestration.
+**Brief**:
+The versioned intent of a Ticket. Amending a Brief creates a new version and delivers it to the Coordinator.
+_Avoid_: spec, prompt
 
-**Role session**.
-The continuing logical responsibility of a role across finite reasoning turns, parked waits, and provider process restarts.
+**External ref**:
+A link from a Ticket to an item in an external tracker. A Ticket may have several.
 
-**AgentRun**.
-One finite execution attempt of an Agent in an assigned role session.
+**Origin**:
+Where a Ticket came from, such as an external ref, a parent Ticket, or a Finding.
 
-**Ticket tab**.
-The single active Rex window for one external ticket, containing its Agent blocks across finite turns and TicketRun generations. Its logical view survives archival and read-only history reopening.
+**Stage**:
+The free-form name of the phase a Coordinator reports for a running Ticket. A Playbook defines the vocabulary.
+_Avoid_: phase state, status
 
-**Wake input**.
-A deduplicated durable event that makes a role session eligible for another finite turn, stored and consumed with its launch intent.
+**Ticket state**:
+One of `backlog`, `ready`, `running`, `waiting`, `verifying`, `done`, `abandoned`, or `failed`.
+_Avoid_: status, when you mean a Stage
 
-**Factory context**.
-Scoped child-process markers that let a personal hook select Rex's naming behavior and let human-only commands reject accidental Agent use. Factory role instructions and conservative observation supplement those markers. They are a cooperation contract, not human authentication.
+## Agents
 
-**Agent mailbox**.
-A run-scoped file exchange of requests and receipts between an Agent and the host controller, without Agent CLI access to SQLite. It works with provider sandboxes and broader automatic permissions.
+**Agent**:
+A logical worker with a Role inside a Ticket or Project. It outlives the processes that run it.
 
-**Managed clone**.
-A factory-owned repository clone shared by registered Projects, with isolated Worker worktrees.
+**Session**:
+One run of an Agent in a Rex block, with the harness conversation it can resume.
 
-**rex-projects hook**.
-A configured repeatable local check whose receipt binds the command, configuration, and outcome to the exact delivery head. It complements Git hooks, provider hooks, and remote checks.
+**Role**:
+A template for an Agent: base instructions, provider, and model.
 
-**Agent profile**.
-A named definition of a Coding Agent's execution settings and guidance, selected for a role.
+**Coordinator**:
+The one Agent per Ticket that plans the work, starts helper Agents, and reports the Ticket's progress. It does not implement.
 
-**Profile candidate**.
-A proposed change to an Agent profile's guidance, awaiting evaluation and a decision about ordinary use.
+**Helper Agent**:
+An Agent a Coordinator starts for part of a Ticket, such as a Worker, Verifier, or Reviewer.
 
-**Managed profile**.
-An ordinary Agent profile that consolidates accepted improvements for a Project and role.
+**Verifier**:
+A helper Agent that checks a change it did not write.
 
-**Supervisor**.
-The single Agent responsible for a Project's priorities, allocation, interventions, and learning across TicketRuns.
+**Postmortem**:
+The Agent that reviews an ended Ticket and records Findings.
+_Avoid_: retro agent
 
-**Coordinator**.
-The Agent responsible for delivery of one Ticket without implementing its changes.
+**Supervisor**:
+The long-lived Agent that runs the outer loop for one Project.
+_Avoid_: hypervisor, manager
 
-**Planner**.
-An Agent responsible for an implementation plan and its unresolved decisions.
+**Factory Project**:
+The Project whose repository is the shared rex-projects configuration. Its Supervisor improves shared Playbooks, Roles, and Skills.
 
-**Worker**.
-An Agent responsible for investigation and implementation of an assigned work item.
+## Control
 
-**Reviewer**.
-An Agent responsible for independent assessment of a plan or change at a specific revision.
+**Playbook**:
+A Markdown document that tells a Coordinator how to complete a kind of Ticket and declares its Stages, Gates, Verification, Roles, and budgets.
+_Avoid_: workflow definition, pipeline
 
-**Merge Decision**.
-An Agent responsible for assessing merge evidence and explaining risk to the human.
-_Avoid_ Merge Decition.
+**Gate**:
+A Stage a Coordinator may enter only after an Approval.
 
-**Merge procedure**.
-An ordered set of typed controller steps derived from one repository's merge instructions. It can prepare PR content, request or execute a merge, and verify the actual merged commit. Each step has its own durable receipt.
+**Approval**:
+A decision a Gate requires. Policy names who gives it: a human, the Supervisor, or nobody.
 
-**Operator**.
-An Agent responsible for configured release actions and confirmation of the required operational outcome.
+**Verification**:
+The checks and Verifier run that a Ticket must pass before it is done.
+_Avoid_: done check, acceptance
 
-**Postmortem**.
-An Agent responsible for an evidence-backed retrospective and reusable findings from a TicketRun.
+**Policy**:
+Human-owned settings for a Project: its autonomy level, approvers, and budgets. Agents cannot change it.
 
-**Operation recipe**.
-A declared delivery practice that maps a kind of Ticket to the work, evidence, and operational outcomes it requires.
+**Autonomy level**:
+How much of a Project's work runs without a human, from A0 (manual) to A3 (self-directing).
 
-**Human request**.
-A durable question or decision that identifies the subject, evidence, and continuation awaiting the human's answer.
+**Wake token**:
+A fixed line typed into an idle Agent's terminal so that it reads its inbox.
 
-**Review bundle**.
-The evidence and explanation a human needs to assess a particular change revision.
+## Learning
 
-**Finding**.
-A source-linked observation from a retrospective with an explicit scope and proposed improvement.
+**Finding**:
+An observation from a Postmortem, with evidence and a recurrence key.
 
-**Learning decision**.
-A Supervisor's recorded assessment of a group of Findings, including changes, unresolved questions, or a reason to make no change.
+**Improvement**:
+A proposed change to the Harness derived from Findings, with the layer it targets.
+_Avoid_: lesson, rule
 
-**Improvement proposal**.
-A reviewable change to Agent guidance that states its evidence, expected benefit, and a way to evaluate the result.
+**Fix ladder**:
+The preference order for where an Improvement lands, from mechanical checks in the repository down to time-limited notes.
+
+**Digest**:
+A periodic summary of merged changes, reverts, and Project health that a human samples.
