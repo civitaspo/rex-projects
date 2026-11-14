@@ -2667,8 +2667,16 @@ pub(crate) mod tests {
         ).unwrap();
     }
 
-    #[test]
-    fn reserved_start_is_idempotent_after_wakes_are_assigned_and_store_reopens() {
+    struct ReservedLaunchFixture {
+        temp: tempfile::TempDir,
+        store: ConfigStore,
+        reservation: AgentLaunchReservation,
+        view: RexView,
+        qualification: ProviderQualification,
+        result_schema: serde_json::Value,
+    }
+
+    fn reserved_launch_fixture() -> ReservedLaunchFixture {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("control")).unwrap();
         std::fs::create_dir(temp.path().join("workspace")).unwrap();
@@ -2917,6 +2925,252 @@ pub(crate) mod tests {
             store.prepare_role_launch(&reservation).unwrap(),
             LaunchPreparationOutcome::Prepared { .. }
         ));
+        ReservedLaunchFixture {
+            temp,
+            store,
+            reservation,
+            view,
+            qualification,
+            result_schema,
+        }
+    }
+
+    #[test]
+    fn machine_shutdown_cancels_an_unstarted_launch_and_preserves_its_wakes() {
+        let ReservedLaunchFixture {
+            temp,
+            mut store,
+            reservation,
+            ..
+        } = reserved_launch_fixture();
+        let generation = reservation.controller_generation;
+        ConfigStore::append_control(
+            temp.path(),
+            "stop-before-create",
+            &crate::store::ControlCommand {
+                request_id: "stop-before-create".into(),
+                kind: "machine_stop".into(),
+                project_id: None,
+                lifecycle: None,
+                applied_config: None,
+                created_at_unix: 100,
+            },
+            generation,
+        )
+        .unwrap();
+        store.process_next_control(generation, 30).unwrap().unwrap();
+
+        assert_eq!(store.machine_shutdown_unresolved_owners().unwrap(), 0);
+        let states: (String, String, String) = store.connection.query_row(
+            "SELECT a.state,r.lifecycle,e.status FROM agent_runs a JOIN agent_launch_reservations r USING(agent_run_id) JOIN effects e ON e.operation_id=r.operation_id WHERE a.agent_run_id=?1",
+            [reservation.agent_run_id.as_str()],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(
+            states,
+            ("cancelled".into(), "cancelled".into(), "cancelled".into())
+        );
+        let wake: (String, Option<String>) = store.connection.query_row(
+            "SELECT lifecycle,consuming_agent_run_id FROM role_wake_inputs WHERE wake_input_id=1",
+            [], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(wake, ("pending".into(), None));
+        assert!(
+            store
+                .next_due_effect(generation, i64::MAX)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .mark_agent_launch_create_attempted(generation, &reservation)
+                .is_err()
+        );
+        store
+            .begin_signal_shutdown(
+                generation,
+                "stop-before-create",
+                crate::store::machine_shutdown::MachineShutdownCause::Sigterm,
+                101,
+                30,
+            )
+            .unwrap();
+        assert_eq!(store.machine_shutdown_unresolved_owners().unwrap(), 0);
+
+        store
+            .set_machine_shutdown_status(
+                generation,
+                "stop-before-create",
+                crate::store::machine_shutdown::MachineShutdownStatus::Stopped,
+                None,
+                102,
+            )
+            .unwrap();
+        store.stop_owner(generation).unwrap();
+        let next_generation = store
+            .start_owner(&crate::store::OwnerMetadata {
+                owner_nonce: "resumed".into(),
+                state_root: temp.path().display().to_string(),
+                config_source: "factory".into(),
+                process_start_identity: "resumed-start".into(),
+                executable_path: "/tmp/rex-projects".into(),
+                executable_digest: digest('9').as_str().into(),
+                rex_endpoint: None,
+                rex_server_identity: None,
+                rex_session_id: None,
+                rex_block_id: None,
+            })
+            .unwrap();
+        let ids = |generation| {
+            crate::runtime_services::role_launch_ids(
+                generation,
+                &reservation.project_id,
+                &reservation.role_session_id,
+                reservation
+                    .wake_snapshot
+                    .inputs
+                    .iter()
+                    .map(|wake| wake.wake_input_id),
+            )
+            .unwrap()
+        };
+        assert_eq!(ids(generation), ids(generation));
+        assert_ne!(ids(generation), ids(next_generation));
+        let mut resumed = reservation.clone();
+        (resumed.agent_run_id, resumed.operation_id) = ids(next_generation);
+        resumed.controller_generation = next_generation;
+        resumed.control_dir = temp.path().join("resumed-control");
+        std::fs::create_dir(&resumed.control_dir).unwrap();
+        resumed.mailbox_directory = resumed.control_dir.clone();
+        resumed.descriptor_path = temp.path().join("resumed-package.json");
+        resumed.wake_snapshot.agent_run_id = resumed.agent_run_id.as_str().into();
+        resumed.wake_snapshot.digest = resumed.wake_snapshot.content_digest().unwrap();
+        resumed.mailbox_capability_digest = Digest::parse(
+            crate::mailbox::MailboxDescriptor::capability_digest(
+                resumed.agent_run_id.as_str(),
+                resumed.mailbox_expires_at_unix,
+                crate::mailbox::MailboxLimits {
+                    max_request_bytes: resumed.mailbox_max_request_bytes as usize,
+                    max_pending_requests: resumed.mailbox_max_pending_requests as usize,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.prepare_role_launch(&resumed).unwrap(),
+            LaunchPreparationOutcome::Prepared { .. }
+        ));
+        assert!(matches!(
+            store.prepare_role_launch(&resumed).unwrap(),
+            LaunchPreparationOutcome::Prepared { .. }
+        ));
+        let owner: String = store
+            .connection
+            .query_row(
+                "SELECT owner_id FROM execution_slots WHERE disposition='launch_pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, resumed.agent_run_id.as_str());
+    }
+
+    #[test]
+    fn machine_shutdown_retains_unproven_or_mismatched_launches() {
+        for mutation in [
+            "UPDATE agent_launch_reservations SET launch_phase='create_attempted'",
+            "UPDATE agent_launch_reservations SET launch_phase='ambiguous'",
+            "UPDATE effects SET status='claimed',attempt_count=1,owner_generation=1",
+            "UPDATE effects SET attempt_count=1",
+            "UPDATE agent_runs SET rex_block_id='observed-block'",
+            "UPDATE agent_runs SET process_identity_json='{}'",
+            "UPDATE execution_slots SET reservation_epoch=99",
+            "UPDATE execution_slots SET controller_generation=99",
+            "UPDATE role_wake_inputs SET payload_json='{}'",
+            "UPDATE role_wake_inputs SET lifecycle='consumed'",
+        ] {
+            let ReservedLaunchFixture {
+                temp: _temp,
+                mut store,
+                reservation,
+                ..
+            } = reserved_launch_fixture();
+            store.connection.execute(mutation, []).unwrap();
+            let wake_before: (String, Option<String>, String) = store.connection.query_row(
+                "SELECT lifecycle,consuming_agent_run_id,payload_json FROM role_wake_inputs WHERE wake_input_id=1",
+                [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            ).unwrap();
+            store
+                .begin_signal_shutdown(
+                    reservation.controller_generation,
+                    "stop-before-create",
+                    crate::store::machine_shutdown::MachineShutdownCause::Sigterm,
+                    100,
+                    30,
+                )
+                .unwrap();
+            assert_eq!(
+                store.machine_shutdown_unresolved_owners().unwrap(),
+                1,
+                "{mutation}"
+            );
+            let wake_after: (String, Option<String>, String) = store.connection.query_row(
+                "SELECT lifecycle,consuming_agent_run_id,payload_json FROM role_wake_inputs WHERE wake_input_id=1",
+                [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            ).unwrap();
+            assert_eq!(wake_before, wake_after, "{mutation}");
+        }
+    }
+
+    #[test]
+    fn machine_shutdown_rolls_back_the_barrier_and_cancellation_together() {
+        let ReservedLaunchFixture {
+            temp: _temp,
+            mut store,
+            reservation,
+            ..
+        } = reserved_launch_fixture();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_shutdown_cancellation BEFORE UPDATE OF state ON agent_runs
+             WHEN NEW.state='cancelled' BEGIN SELECT RAISE(ABORT,'cancellation fixture'); END;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .begin_signal_shutdown(
+                    reservation.controller_generation,
+                    "stop-before-create",
+                    crate::store::machine_shutdown::MachineShutdownCause::Sigterm,
+                    100,
+                    30,
+                )
+                .is_err()
+        );
+        assert!(store.active_machine_shutdown().unwrap().is_none());
+        assert_eq!(store.machine_shutdown_unresolved_owners().unwrap(), 1);
+        let effect: String = store
+            .connection
+            .query_row("SELECT status FROM effects", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(effect, "pending");
+    }
+
+    #[test]
+    fn reserved_start_is_idempotent_after_wakes_are_assigned_and_store_reopens() {
+        let ReservedLaunchFixture {
+            temp,
+            mut store,
+            reservation,
+            view,
+            qualification,
+            result_schema,
+        } = reserved_launch_fixture();
+        let generation = reservation.controller_generation;
+        let project = reservation.project_id.clone();
+        let reviewer_payload = reservation.wake_snapshot.inputs[0].payload_json.clone();
         crate::start_agent::register_reserved_mailbox(&mut store, generation, &reservation)
             .unwrap();
         let mailbox_descriptor =
