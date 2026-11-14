@@ -21,6 +21,25 @@ rex-projects events --follow
 
 Run `rex-projects ui` for the Ticket dashboard. It lists Tickets by Project with the ones that need you first. Press Enter to jump to a Ticket's Coordinator, `r` to ready a backlog Ticket, `a` to show old finished Tickets, and `q` to quit.
 
+## Running Tickets
+
+`rex-projects serve` dispatches ready Tickets. Each one gets a git worktree under `${XDG_STATE_HOME:-~/.local/state}/rex-projects/worktrees/` and a Coordinator Agent in a Rex tab of the session `rxp:<project>`. Start it from the plugin's controller action, or run it in any Rex terminal.
+
+Agents run unattended, so give the provider the permission mode you want, for example:
+
+```toml
+[providers.claude]
+args = ["--permission-mode", "auto"]
+
+[providers.codex]
+# A Ticket worktree commits into its repository's .git, outside the sandbox's workspace.
+args = ["-a", "never", "-s", "workspace-write", "-c", "sandbox_workspace_write.writable_roots=[\"/path/to/repo/.git\"]"]
+```
+
+rex-projects lets Codex call its own MCP tools without asking, so `-a never` does not block a Coordinator's reports.
+
+Claude Code asks whether to trust a new folder, and that prompt stops a Coordinator until you answer it. In our runs, a Ticket worktree was trusted once its Project repository had been trusted, so open `claude` once in each Project repository if you have not already. A Coordinator that reports no status for a minute, as when it waits on this prompt, appears under "Needs you" in the dashboard. Codex asks the same question and says that trusting a worktree applies to its repository root.
+
 ## Rex plugin
 
 Put `rex-projects` on the `PATH` of your login shell, then load the plugin from `~/.config/rex/init.lua`:
@@ -33,7 +52,7 @@ require("rex_projects").setup({
 })
 ```
 
-Adjust the path to your clone. The plugin adds two actions: `rex_projects_dashboard` opens the dashboard as a floating layer, and `rex_projects_serve` shows the control session `rxp`, creating it with `rex-projects serve` when it is missing. Keys are bound only when given.
+Adjust the path to your clone. Jumping from the dashboard to a Ticket in another session asks the Rex app to switch sessions, which needs Remote Control turned on in Rex Settings under Rex Server. Without it, the dashboard still zooms the Coordinator's pane in its session and says that the app did not switch. The plugin adds two actions: `rex_projects_dashboard` opens the dashboard as a floating layer, and `rex_projects_serve` shows the control session `rxp`, creating it with `rex-projects serve` when it is missing. Keys are bound only when given.
 
 ## External trackers
 

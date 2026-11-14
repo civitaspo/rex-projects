@@ -24,8 +24,10 @@ pub struct Status {
 }
 
 pub trait Rex {
-    /// Returns the ID of the session labelled `label`, creating it if needed.
-    fn ensure_session(&mut self, label: &str) -> Result<String>;
+    /// Returns the Project's session: `known` if it still exists, else the
+    /// session labelled `label`, else a new one. Agents sometimes rename
+    /// their session, so the label of `known` is set back to `label`.
+    fn ensure_session(&mut self, label: &str, known: Option<&str>) -> Result<String>;
     /// Opens a background window with one terminal block running `command`.
     fn new_window(
         &mut self,
@@ -87,14 +89,24 @@ fn string(value: &Value, pointer: &str) -> Result<String> {
 }
 
 impl Rex for RexCli {
-    fn ensure_session(&mut self, label: &str) -> Result<String> {
+    fn ensure_session(&mut self, label: &str, known: Option<&str>) -> Result<String> {
         let list = self.call("session.list", json!({}))?;
-        let found = list["sessions"].as_array().and_then(|sessions| {
-            sessions
-                .iter()
-                .find(|s| s["label"] == label)
-                .and_then(|s| s["session_id"].as_str())
-        });
+        let sessions = list["sessions"].as_array().cloned().unwrap_or_default();
+        if let Some(known) = known
+            && let Some(session) = sessions.iter().find(|s| s["session_id"] == known)
+        {
+            if session["label"] != label {
+                self.call(
+                    "session.set_label",
+                    json!({ "session_id": known, "label": label }),
+                )?;
+            }
+            return Ok(known.to_owned());
+        }
+        let found = sessions
+            .iter()
+            .find(|s| s["label"] == label)
+            .and_then(|s| s["session_id"].as_str());
         if let Some(id) = found {
             return Ok(id.to_owned());
         }
@@ -201,7 +213,17 @@ pub mod fake {
     }
 
     impl Rex for FakeRex {
-        fn ensure_session(&mut self, label: &str) -> Result<String> {
+        fn ensure_session(&mut self, label: &str, known: Option<&str>) -> Result<String> {
+            let renamed = self
+                .sessions
+                .iter()
+                .find(|(_, id)| Some(id.as_str()) == known)
+                .map(|(old, id)| (old.clone(), id.clone()));
+            if let Some((old, id)) = renamed {
+                self.sessions.remove(&old);
+                self.sessions.insert(label.to_owned(), id.clone());
+                return Ok(id);
+            }
             if let Some(id) = self.sessions.get(label) {
                 return Ok(id.clone());
             }

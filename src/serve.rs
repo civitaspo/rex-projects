@@ -102,6 +102,7 @@ impl<R: Rex> Serve<R> {
     }
 
     pub fn tick(&mut self, config: &Config) -> Result<()> {
+        self.keep_session_labels()?;
         for agent in self.store.agents(true)? {
             if agent.state == "running"
                 && let Err(err) = self.reconcile(config, &agent)
@@ -192,10 +193,37 @@ impl<R: Rex> Serve<R> {
         })
     }
 
+    /// Sets each live Project session's label back to `rxp:<project>`, in
+    /// case an Agent renamed it.
+    fn keep_session_labels(&mut self) -> Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        for agent in self.store.agents(true)? {
+            if let Some(session) = agent.rex_session_id
+                && seen.insert(session.clone())
+            {
+                self.rex
+                    .ensure_session(&session_label(&agent.project_id), Some(&session))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The session this Project's Agents last ran in, if any.
+    fn known_session(&self, project_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .store
+            .agents(false)?
+            .into_iter()
+            .filter(|a| a.project_id == project_id)
+            .filter_map(|a| a.rex_session_id)
+            .next_back())
+    }
+
     fn launch(&mut self, agent: &Agent, ticket: &Ticket, resume: bool) -> Result<()> {
+        let known = self.known_session(&ticket.project_id)?;
         let session = self
             .rex
-            .ensure_session(&format!("rxp:{}", ticket.project_id))?;
+            .ensure_session(&session_label(&ticket.project_id), known.as_deref())?;
         let command: Vec<String> = [
             self.exe.as_os_str(),
             "--config-dir".as_ref(),
@@ -281,6 +309,10 @@ impl<R: Rex> Serve<R> {
         let agent = self.store.agent(&agent_id)?.context("agent vanished")?;
         self.launch(&agent, ticket, false)
     }
+}
+
+fn session_label(project_id: &str) -> String {
+    format!("rxp:{project_id}")
 }
 
 pub fn coordinator_id(ticket_id: &str) -> String {
@@ -485,6 +517,31 @@ mod tests {
         fn events(&self) -> usize {
             self.serve.store.events_since(0, 1000).unwrap().len()
         }
+    }
+
+    #[test]
+    fn keeps_the_project_session_when_an_agent_renames_it() {
+        let mut f = fixture();
+        f.tick();
+        let session = f.agent().rex_session_id.unwrap();
+        let id = f.serve.rex.sessions.remove("rxp:demo").unwrap();
+        f.serve.rex.sessions.insert("add-a-feature".into(), id);
+
+        f.tick();
+        assert_eq!(f.serve.rex.sessions.get("rxp:demo"), Some(&session));
+        assert!(!f.serve.rex.sessions.contains_key("add-a-feature"));
+
+        f.serve.rex.sessions.remove("rxp:demo");
+        f.serve
+            .rex
+            .sessions
+            .insert("renamed-again".into(), session.clone());
+        f.close_block();
+        f.tick();
+        let resumed = f.agent();
+        assert_eq!(resumed.launches, 2);
+        assert_eq!(resumed.rex_session_id, Some(session.clone()));
+        assert_eq!(f.serve.rex.sessions.len(), 1, "no second session");
     }
 
     #[test]

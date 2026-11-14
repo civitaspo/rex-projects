@@ -24,6 +24,7 @@ const NEEDS_YOU: &str = "Needs you";
 const REFRESH: Duration = Duration::from_secs(1);
 /// Terminal Tickets older than this are hidden unless `a` shows all.
 const TERMINAL_RETENTION: chrono::Duration = chrono::Duration::days(1);
+const SILENCE: chrono::Duration = chrono::Duration::seconds(60);
 
 /// Where a Ticket's Coordinator runs in Rex.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,10 +62,23 @@ impl TicketRow {
 }
 
 /// Whether a human should look at the Ticket now.
-pub fn needs_you(ticket: &Ticket, coordinator: Option<&Agent>) -> bool {
+pub fn needs_you(ticket: &Ticket, coordinator: Option<&Agent>, now: DateTime<Utc>) -> bool {
     ticket.state == TicketState::Waiting
-        || coordinator
-            .is_some_and(|a| a.state != "exited" && a.activity.as_deref() == Some("blocked"))
+        || coordinator.is_some_and(|a| {
+            a.state != "exited"
+                && (a.activity.as_deref() == Some("blocked") || is_silent(ticket, a, now))
+        })
+}
+
+/// A running Coordinator that has not reported any status a minute after its
+/// launch is usually stuck on a prompt the harness does not report, such as
+/// a folder trust dialog.
+pub fn is_silent(ticket: &Ticket, coordinator: &Agent, now: DateTime<Utc>) -> bool {
+    ticket.state.is_active()
+        && coordinator.state == "running"
+        && coordinator.activity.is_none()
+        && DateTime::parse_from_rfc3339(&coordinator.updated_at)
+            .is_ok_and(|at| now.signed_duration_since(at) > SILENCE)
 }
 
 /// Whether a terminal Ticket ended long enough ago to hide by default.
@@ -105,8 +119,10 @@ pub fn build_rows(
                 Some(a) => a.activity.clone().unwrap_or_else(|| "-".to_owned()),
                 None => "-".to_owned(),
             };
+            let silent = coordinator.is_some_and(|a| is_silent(t, a, now));
             let text = match (&t.question, &t.summary) {
                 (Some(q), _) if t.state == TicketState::Waiting => format!("? {q}"),
+                _ if silent => "No status from the Coordinator; check its pane".to_owned(),
                 (_, Some(s)) => s.clone(),
                 _ => t.title.clone(),
             };
@@ -125,7 +141,7 @@ pub fn build_rows(
                 stage: t.stage.clone().unwrap_or_else(|| "-".to_owned()),
                 activity,
                 text: text.replace('\n', " "),
-                needs_you: needs_you(t, coordinator),
+                needs_you: needs_you(t, coordinator, now),
                 target,
             }
         })
@@ -253,8 +269,18 @@ fn jump(row: &TicketRow) -> Result<()> {
         .as_ref()
         .with_context(|| format!("{} has no Coordinator block", row.ticket_id))?;
     let current = std::env::var("REX_SESSION").ok();
-    for args in jump_commands(target, current.as_deref()) {
-        run_rex(&args)?;
+    let mut commands = jump_commands(target, current.as_deref()).into_iter();
+    if let Some(zoom) = commands.next() {
+        run_rex(&zoom)?;
+    }
+    for select in commands {
+        run_rex(&select).with_context(|| {
+            format!(
+                "zoomed {} in its session, but the app did not switch to it; \
+                 turn on Remote Control in Rex Settings under Rex Server",
+                row.ticket_id
+            )
+        })?;
     }
     Ok(())
 }
@@ -489,6 +515,26 @@ mod tests {
                 window: Some("window:1".to_owned()),
                 block: "block:1".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn a_coordinator_silent_for_a_minute_needs_you() {
+        let mut t = ticket("a", 1, TicketState::Running);
+        t.coordinator_id = Some("agent-1".to_owned());
+        let mut agent = coordinator("agent-1", "unused");
+        agent.activity = None;
+        agent.updated_at = "2026-11-15T11:59:30Z".to_owned();
+        let fresh = HashMap::from([("agent-1".to_owned(), agent.clone())]);
+        agent.updated_at = "2026-11-15T11:58:00Z".to_owned();
+        let silent = HashMap::from([("agent-1".to_owned(), agent)]);
+
+        assert!(!build_rows(std::slice::from_ref(&t), &fresh, now(), false)[0].needs_you);
+        let rows = build_rows(&[t], &silent, now(), false);
+        assert!(rows[0].needs_you);
+        assert_eq!(
+            rows[0].text,
+            "No status from the Coordinator; check its pane"
         );
     }
 
