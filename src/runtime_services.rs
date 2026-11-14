@@ -2009,6 +2009,179 @@ impl RuntimeServices {
     }
 }
 
+#[cfg(all(test, unix))]
+mod machine_shutdown_host_process_tests {
+    use super::*;
+    use crate::domain::ids::Digest;
+    use crate::process::ProcessRequest;
+    use crate::store::host_jobs::{HostJobIntent, HostJobKind, OperationMethod};
+    use crate::store::{ConfigStore, ExpectedRevision, OwnerMetadata};
+    use std::ffi::OsString;
+    use std::time::Duration;
+
+    fn host_job(job_id: &str) -> HostJobIntent {
+        HostJobIntent {
+            job_id: job_id.into(),
+            effect_operation_id: format!("effect:{job_id}"),
+            project_id: "goal_project".into(),
+            subject_id: "ticket-50".into(),
+            lane_id: format!("operation:{job_id}"),
+            kind: HostJobKind::OperationAdapter,
+            operation_method: Some(OperationMethod::Invoke),
+            request_digest: format!("request:{job_id}"),
+            configuration_digest: "config".into(),
+            environment_snapshot_id: Digest::parse("e".repeat(64)).unwrap(),
+            environment_policy_digest: Digest::parse("f".repeat(64)).unwrap(),
+            head: "head".into(),
+            source_digest: "source".into(),
+            max_attempts: 1,
+            retry_when_absent: false,
+        }
+    }
+
+    fn request(marker: &Path) -> ProcessRequest {
+        ProcessRequest {
+            executable: PathBuf::from("/bin/sh"),
+            args: vec![
+                OsString::from("-c"),
+                OsString::from("printf 'invoked\\n' >> \"$MARKER\"; printf 'fixed result'"),
+            ],
+            stdin: Vec::new(),
+            cwd: None,
+            clear_environment: true,
+            environment: [(OsString::from("MARKER"), marker.as_os_str().to_owned())]
+                .into_iter()
+                .collect(),
+            timeout: Duration::from_secs(2),
+            shutdown_grace: Duration::from_millis(100),
+            stdout_limit: 1024,
+            stderr_tail_limit: 1024,
+        }
+    }
+
+    #[test]
+    fn shutdown_tick_drains_finished_process_before_rex_deadline_return() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let state_root = std::fs::canonicalize(state_root).unwrap();
+        let rex = temp.path().join("rex fixture");
+        let rex_script = "#!/bin/sh\ncase \"$*\" in\n  *'whoami --json'*) printf '%s\\n' '{\"endpoint\":\"unix:///tmp/shutdown-host-job.sock\",\"instance_id\":\"shutdown-host-job\",\"host_id\":\"fixture-host\",\"rex_version\":\"1.0\"}' ;;\n  *'api list --json'*) printf '%s\\n' '{\"methods\":{\"session.view\":{},\"session.new_window\":{},\"session.new_split\":{},\"session.focus_block\":{},\"session.zoom_block\":{},\"block.close\":{}}}' ;;\n  *'events'*) exit 0 ;;\n  *) exit 64 ;;\nesac\n";
+        std::fs::write(&rex, rex_script).unwrap();
+        std::fs::set_permissions(&rex, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let config_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixture/config.toml");
+        let mut applied = crate::config::load(&config_path).unwrap();
+        applied.config.runtime.rex_binary = rex.display().to_string();
+        applied.config.runtime.environment.source = crate::config::EnvironmentSource::Inherit;
+        applied.config.adapters.tickets.command =
+            vec![std::env::current_exe().unwrap().display().to_string()];
+        applied
+            .profiles
+            .get_mut(&crate::domain::ids::ProfileId::parse("judgment_claude").unwrap())
+            .unwrap()
+            .command = vec![std::env::current_exe().unwrap().display().to_string()];
+        applied
+            .config
+            .repositories
+            .get_mut(&crate::domain::ids::RepositoryId::parse("example").unwrap())
+            .unwrap()
+            .clone_url = "https://github.com/example/example.git".into();
+        let environment = crate::environment::capture(&applied.config.runtime.environment).unwrap();
+        let mut store = ConfigStore::open_test(&state_root).unwrap();
+        store
+            .apply_snapshot("fixture", &applied, ExpectedRevision::Bootstrap)
+            .unwrap();
+        let generation = store
+            .start_owner(&OwnerMetadata {
+                owner_nonce: "shutdown-host-job-fixture".into(),
+                state_root: state_root.display().to_string(),
+                config_source: config_path.display().to_string(),
+                process_start_identity: crate::cli::observed_process_start_identity(
+                    std::process::id(),
+                )
+                .unwrap(),
+                executable_path: std::env::current_exe().unwrap().display().to_string(),
+                executable_digest: "c".repeat(64),
+                rex_endpoint: Some("unix:///tmp/shutdown-host-job.sock".into()),
+                rex_server_identity: Some("shutdown-host-job".into()),
+                rex_session_id: Some("fixture-controller-session".into()),
+                rex_block_id: Some("fixture-controller-block".into()),
+            })
+            .unwrap();
+        let runtime_binary = std::env::current_exe().unwrap();
+        let mut services = RuntimeServices::new(
+            &applied,
+            &environment,
+            &config_path,
+            &state_root,
+            generation,
+            &RexIdentity {
+                endpoint: "unix:///tmp/shutdown-host-job.sock".into(),
+                instance_id: "shutdown-host-job".into(),
+                session_id: "fixture-controller-session".into(),
+                block_id: Some("fixture-controller-block".into()),
+            },
+            RuntimeExecutable {
+                path: &runtime_binary,
+                digest: &Digest::parse("a".repeat(64)).unwrap(),
+            },
+        )
+        .unwrap();
+
+        let marker = temp.path().join("invocations");
+        let job = host_job("shutdown-host-operation");
+        let queued = host_job("shutdown-host-queued");
+        store.enqueue_host_job(generation, &queued, 10).unwrap();
+        {
+            let pool = services.delivery.host_jobs();
+            let mut pool = pool.lock().unwrap();
+            assert_eq!(
+                pool.submit_or_poll(&mut store, generation, &job, request(&marker), None, 10)
+                    .unwrap(),
+                crate::host_jobs::HostJobProgress::Running
+            );
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let issues = loop {
+            let issues = services
+                .machine_shutdown_tick(&mut store, generation, 20, 21)
+                .unwrap();
+            if store
+                .host_job(&job.job_id)
+                .unwrap()
+                .unwrap()
+                .process_receipt
+                .is_some()
+            {
+                break issues;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("Rex observation budget"))
+        );
+        let record = store.host_job(&job.job_id).unwrap().unwrap();
+        let raw = record.process_receipt.unwrap();
+        assert!(raw.cleanup_confirmed);
+        assert_eq!(raw.stdout, b"fixed result");
+        assert!(record.receipt_json.is_none());
+        assert_eq!(record.state, crate::store::host_jobs::HostJobState::Running);
+        assert_eq!(
+            store.host_job(&queued.job_id).unwrap().unwrap().state,
+            crate::store::host_jobs::HostJobState::Pending
+        );
+        assert_eq!(std::fs::read_to_string(marker).unwrap().lines().count(), 1);
+        assert_eq!(store.machine_shutdown_unresolved_owners().unwrap(), 0);
+    }
+}
+
 fn create_private_qualification_tree(root: &Path) -> Result<(), String> {
     let parent = root
         .parent()
@@ -4495,6 +4668,19 @@ impl RuntimeServices {
             32,
         ) {
             issues.push(format!("Agent result ingestion: {error}"));
+        }
+        {
+            let host_jobs = self.delivery.host_jobs();
+            match host_jobs.lock() {
+                Ok(mut pool) => {
+                    if let Err(error) =
+                        pool.drain_finished_processes(store, owner_generation, now_unix)
+                    {
+                        issues.push(format!("host process result collection: {error}"));
+                    }
+                }
+                Err(_) => issues.push("host process pool lock is poisoned".into()),
+            }
         }
         // Leave ownership intact when a complete bounded observation cannot fit.
         let Some(operation_timeout) = bounded_shutdown_rex_timeout(deadline_unix, now_unix) else {

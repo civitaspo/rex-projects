@@ -808,7 +808,7 @@ mod tests {
             .connection
             .execute_batch(
                 "DROP TRIGGER agent_launch_phase_transitions;
-             DROP TABLE machine_shutdowns;
+             ALTER TABLE host_effect_jobs DROP COLUMN process_receipt_json; DELETE FROM schema_migrations WHERE version=24; DROP TABLE machine_shutdowns;
              DELETE FROM schema_migrations WHERE version=23;
              DROP TABLE provider_qualification_candidate_targets;
              DELETE FROM schema_migrations WHERE version=22;

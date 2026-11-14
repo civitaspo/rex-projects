@@ -231,7 +231,7 @@ mod tests {
         let legacy = Connection::open(&database).unwrap();
         legacy
             .execute_batch(
-                "DROP TABLE machine_shutdowns;
+                "ALTER TABLE host_effect_jobs DROP COLUMN process_receipt_json; DELETE FROM schema_migrations WHERE version=24; DROP TABLE machine_shutdowns;
                  DELETE FROM schema_migrations WHERE version=23;
                  DROP TABLE learning_decisions;
                  DROP TABLE provider_qualification_candidate_targets;

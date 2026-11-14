@@ -40,7 +40,7 @@ pub(crate) mod provider_qualification_candidate_target;
 #[path = "store/rex_view_tables.rs"]
 pub(crate) mod rex_view_tables;
 
-pub const SCHEMA_VERSION: i64 = 23;
+pub const SCHEMA_VERSION: i64 = 24;
 #[path = "store/accepted_plans.rs"]
 pub mod accepted_plans;
 pub mod agent_runtime;
@@ -654,6 +654,9 @@ impl ConfigStore {
         if existing_version >= 22 {
             provider_qualification_candidate_target::validate_v22_schema(&connection)?;
         }
+        if existing_version >= 24 {
+            host_jobs::validate_v24_host_process_receipts(&connection)?;
+        }
         connection
             .execute_batch(
                 "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
@@ -791,12 +794,19 @@ impl ConfigStore {
             }
             machine_shutdown::migrate_v23(&connection)?;
         }
+        if existing_version < 24 {
+            if existing_version > 0 {
+                backup_before_migration(&connection, state_root)?;
+            }
+            host_jobs::migrate_v24_host_process_receipts(&connection)?;
+        }
         artifact_registry::validate_v12_schema(&connection)?;
         agent_launch_phase::validate_v18_schema(&connection)?;
         learning_store::validate_v19_learning_batches(&connection)?;
         learning_store::validate_v21_topic_publications(&connection)?;
         provider_qualification_candidate_target::validate_v22_schema(&connection)?;
         machine_shutdown::validate_v23_schema(&connection)?;
+        host_jobs::validate_v24_host_process_receipts(&connection)?;
         Ok(Self {
             connection,
             _machine_lock: machine_lock,

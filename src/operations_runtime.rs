@@ -254,11 +254,14 @@ impl crate::operations::BoundedCommandRunner for PooledOperationCommandRunner<'_
                 unix_now()?,
             )?;
         match progress {
-            HostJobProgress::ProcessCompleted(receipt) => {
+            HostJobProgress::ProcessCompleted {
+                receipt,
+                intent: completed_intent,
+            } => {
                 let safe_receipt = serde_json::json!({
                     "operation_id": operation_id,
                     "method": method,
-                    "request_digest": intent.request_digest,
+                    "request_digest": completed_intent.request_digest,
                     "status_code": receipt.status_code,
                     "stdout_truncated": receipt.stdout_truncated,
                     "stderr_truncated": receipt.stderr_truncated,
@@ -1081,10 +1084,198 @@ mod tests {
     use crate::domain::types::{ApprovalMode, OperationSource};
     use crate::effects::{AbsentProof, EffectRequest};
     use crate::human::review_bundle_digest;
-    use crate::operations::{DeliveryFacts, validate_recipe};
+    use crate::operations::{BoundedCommandRunner, DeliveryFacts, validate_recipe};
     use crate::store::{ConfigStore, ExpectedRevision, OwnerMetadata, ProjectRecord};
 
     const SOURCE_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn pooled_operation_replays_original_result_after_environment_values_change() {
+        use crate::host_jobs::{HostJobPool, environment_policy_digest};
+        use crate::operations::OperationSubject;
+        use crate::store::host_jobs::HostJobState;
+        use std::ffi::OsString;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let temp = tempdir().unwrap();
+        let applied = applied_config(temp.path());
+        let target = applied.config.operation_recipes["rollout"].targets[0].clone();
+        let project_id = ProjectId::parse("goal_project").unwrap();
+        let ticket_id = TicketId::parse("ticket-50").unwrap();
+        let ticket_run_id = TicketRunId::parse("run-50").unwrap();
+        let operation_id = OperationId::parse("operation-replay-50").unwrap();
+        let digest = Digest::parse("a".repeat(64)).unwrap();
+        let subject = OperationSubject {
+            project_id: project_id.clone(),
+            ticket_id: ticket_id.clone(),
+            ticket_run_id: ticket_run_id.clone(),
+            ticket_revision: Revision(1),
+            operation_id: operation_id.clone(),
+            recipe_id: "rollout".into(),
+            plan_digest: digest.clone(),
+            config_digest: applied.digest.clone(),
+            target_id: target.id.clone(),
+            action_id: target.action.clone(),
+            repository_id: target.repository.clone(),
+            environment: target.environment.clone(),
+            source_sha: SOURCE_SHA.into(),
+            expected_preconditions: BTreeMap::new(),
+        };
+        let operation = OperationEffectRequest {
+            project_id: project_id.clone(),
+            ticket_id,
+            ticket_run_id,
+            ticket_revision: Revision(1),
+            config_revision: Revision(1),
+            config_digest: applied.digest.clone(),
+            recipe_id: "rollout".into(),
+            plan_digest: digest,
+            delivery_facts: DeliveryFacts {
+                merge_commits: BTreeMap::new(),
+                planned_revisions: BTreeMap::new(),
+            },
+            subject,
+            target,
+            approval_request_id: None,
+        };
+        let effect = EffectIntent {
+            project_id,
+            subject_type: "operation".into(),
+            subject_id: operation_id.to_string(),
+            operation_id: operation_id.to_string(),
+            logical_key: "operation:replay".into(),
+            kind: "operation".into(),
+            request_json: "{}".into(),
+            request_digest: "request-digest".into(),
+            expected_revision: None,
+        };
+        let marker = temp.path().join("operation-invocations");
+        let host_environment = BTreeMap::from([
+            (OsString::from("PATH"), OsString::from("/bin:/usr/bin")),
+            (OsString::from("MARKER"), marker.as_os_str().to_owned()),
+            (
+                OsString::from("RESULT"),
+                OsString::from("fixed operation result"),
+            ),
+        ]);
+        let policy_digest =
+            environment_policy_digest("rex-projects-host-operation-v1", &host_environment).unwrap();
+        let capture_config = crate::config::EnvironmentConfig {
+            source: crate::config::EnvironmentSource::Inherit,
+            ..Default::default()
+        };
+        let first_capture = crate::environment::capture(&capture_config).unwrap();
+        let second_capture = crate::environment::capture(&capture_config).unwrap();
+        let first_snapshot = first_capture.metadata().id.clone();
+        let second_snapshot = second_capture.metadata().id.clone();
+        assert_ne!(first_snapshot, second_snapshot);
+
+        let mut store = crate::store::host_jobs::in_memory_test_store();
+        let first_pool = Arc::new(Mutex::new(HostJobPool::new(1, 1).unwrap()));
+        let command = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf 'invoked\\n' >> \"$MARKER\"; printf '%s' \"$RESULT\"".into(),
+        ];
+        let stdin = br#"{"method":"operation.invoke"}"#;
+        let first_binding = HostJobEnvironmentBinding {
+            snapshot_id: first_snapshot,
+            policy_digest: policy_digest.clone(),
+        };
+        let mut first_runner = PooledOperationCommandRunner {
+            store: &mut store,
+            owner_generation: 1,
+            pool: Arc::clone(&first_pool),
+            host_environment: &host_environment,
+            environment: &first_binding,
+            operation: &operation,
+            effect: &effect,
+            round: 1,
+            shutdown_grace: Duration::from_millis(100),
+        };
+        assert!(matches!(
+            first_runner
+                .run_argv(&command, stdin, Duration::from_secs(2), 1024, 1024)
+                .unwrap(),
+            crate::operations::CommandRunResult::Pending
+        ));
+        drop(first_runner);
+        let job_id = stable_host_job_id(operation_id.as_str(), "operation.invoke", 1);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            first_pool
+                .lock()
+                .unwrap()
+                .drain_finished_processes(&mut store, 1, 2)
+                .unwrap();
+            if store
+                .host_job(&job_id)
+                .unwrap()
+                .and_then(|record| record.process_receipt)
+                .is_some()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "operation child did not finish");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let original_intent = store.host_job(&job_id).unwrap().unwrap().intent;
+        drop(first_pool);
+
+        let second_marker = temp.path().join("second-environment-invocations");
+        let mut second_environment = host_environment.clone();
+        second_environment.insert(
+            OsString::from("MARKER"),
+            second_marker.as_os_str().to_owned(),
+        );
+        second_environment.insert(
+            OsString::from("RESULT"),
+            OsString::from("new environment result"),
+        );
+        assert_eq!(
+            environment_policy_digest("rex-projects-host-operation-v1", &second_environment)
+                .unwrap(),
+            policy_digest
+        );
+        let second_pool = Arc::new(Mutex::new(HostJobPool::new(1, 1).unwrap()));
+        let second_binding = HostJobEnvironmentBinding {
+            snapshot_id: second_snapshot,
+            policy_digest,
+        };
+        let mut second_runner = PooledOperationCommandRunner {
+            store: &mut store,
+            owner_generation: 1,
+            pool: Arc::clone(&second_pool),
+            host_environment: &second_environment,
+            environment: &second_binding,
+            operation: &operation,
+            effect: &effect,
+            round: 1,
+            shutdown_grace: Duration::from_millis(100),
+        };
+        let completion = match second_runner
+            .run_argv(&command, stdin, Duration::from_secs(2), 1024, 1024)
+            .unwrap()
+        {
+            crate::operations::CommandRunResult::Completed(completion) => completion,
+            other => panic!("expected replayed operation completion, got {other:?}"),
+        };
+        assert_eq!(completion.exit_code, Some(0));
+        assert_eq!(completion.stdout, b"fixed operation result");
+        assert_eq!(std::fs::read_to_string(marker).unwrap().lines().count(), 1);
+        assert!(!second_marker.exists());
+        let final_record = store.host_job(&job_id).unwrap().unwrap();
+        assert_eq!(final_record.intent, original_intent);
+        assert!(matches!(final_record.state, HostJobState::Succeeded));
+        let final_receipt: serde_json::Value =
+            serde_json::from_str(final_record.receipt_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            final_receipt["request_digest"],
+            original_intent.request_digest
+        );
+    }
 
     fn applied_config(state_path: &Path) -> AppliedConfig {
         let mut config: Config = toml::from_str(include_str!("../examples/fixture/config.toml"))
