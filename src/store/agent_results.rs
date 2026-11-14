@@ -5561,6 +5561,87 @@ pub(crate) mod tests {
 
     #[test]
     fn host_validated_blocked_worker_can_receive_one_coordinator_recovery_wake() {
+        host_validated_worker_continuation_candidate(
+            crate::engine::orchestration::AgentAssertion::Blocked {
+                reason: "missing dependency".into(),
+            },
+            serde_json::json!({
+                "summary":"blocked on a missing dependency",
+                "completed_node_keys":[], "pending_node_keys":["node-a"],
+                "evidence":[], "next_observation_at":null
+            }),
+            true,
+        );
+    }
+
+    #[test]
+    fn host_validated_worker_with_pending_progress_can_receive_one_coordinator_recovery_wake() {
+        host_validated_worker_continuation_candidate(
+            crate::engine::orchestration::AgentAssertion::Succeeded,
+            serde_json::json!({
+                "summary":"investigation is complete; implementation remains",
+                "completed_node_keys":[], "pending_node_keys":["node-a"],
+                "evidence":[], "next_observation_at":null
+            }),
+            true,
+        );
+    }
+
+    #[test]
+    fn host_validated_worker_with_nonready_progress_is_not_a_recovery_candidate() {
+        for (assertion, progress) in [
+            (
+                crate::engine::orchestration::AgentAssertion::Succeeded,
+                serde_json::json!({
+                    "summary":"node is reported complete",
+                    "completed_node_keys":["node-a"], "pending_node_keys":[],
+                    "evidence":[], "next_observation_at":null
+                }),
+            ),
+            (
+                crate::engine::orchestration::AgentAssertion::Succeeded,
+                serde_json::json!({
+                    "summary":"the assigned node appears in both sets",
+                    "completed_node_keys":["node-a"], "pending_node_keys":["node-a"],
+                    "evidence":[], "next_observation_at":null
+                }),
+            ),
+            (
+                crate::engine::orchestration::AgentAssertion::Succeeded,
+                serde_json::json!({
+                    "summary":"no node state is reported",
+                    "completed_node_keys":[], "pending_node_keys":[],
+                    "evidence":[], "next_observation_at":null
+                }),
+            ),
+            (
+                crate::engine::orchestration::AgentAssertion::Succeeded,
+                serde_json::json!({
+                    "summary":"check again later",
+                    "completed_node_keys":[], "pending_node_keys":["node-a"],
+                    "evidence":[], "next_observation_at":"2099-01-01T00:00:00Z"
+                }),
+            ),
+            (
+                crate::engine::orchestration::AgentAssertion::Failed {
+                    reason: "the turn reported failure".into(),
+                },
+                serde_json::json!({
+                    "summary":"failed turn with an unfinished node",
+                    "completed_node_keys":[], "pending_node_keys":["node-a"],
+                    "evidence":[], "next_observation_at":null
+                }),
+            ),
+        ] {
+            host_validated_worker_continuation_candidate(assertion, progress, false);
+        }
+    }
+
+    fn host_validated_worker_continuation_candidate(
+        prior_assertion: crate::engine::orchestration::AgentAssertion,
+        prior_progress: serde_json::Value,
+        expect_candidate: bool,
+    ) {
         use crate::config::ProjectConfig;
         use crate::domain::ids::{
             AgentRunId, OperationId, ProfileId, RepositoryId, TicketId, TicketNamespace,
@@ -5921,11 +6002,9 @@ pub(crate) mod tests {
                 schema_version: 1,
                 message_id: "blocked-worker-result-with-artifact".into(),
                 kind: RoleOutputKind::Progress,
-                assertion: AgentAssertion::Blocked {
-                    reason: "missing dependency".into(),
-                },
-                result_digest: Some(digest(&serde_json::to_vec(&blocked).unwrap()).unwrap()),
-                structured_result: blocked.clone(),
+                assertion: prior_assertion.clone(),
+                result_digest: Some(digest(&serde_json::to_vec(&prior_progress).unwrap()).unwrap()),
+                structured_result: prior_progress.clone(),
                 artifact_refs: Vec::new(),
             },
             Some(worker_id.clone()),
@@ -6351,6 +6430,33 @@ pub(crate) mod tests {
                 &configuration_digest,
             )
             .unwrap();
+        if !expect_candidate {
+            assert!(candidates.is_empty());
+            assert_eq!(
+                crate::engine::factory_runtime::queue_ready_worker_recovery_wakes(
+                    &mut worker.store,
+                    worker.owner_generation,
+                    12,
+                    &readiness_config,
+                    &configuration_digest,
+                )
+                .unwrap(),
+                0
+            );
+            assert!(
+                worker
+                    .store
+                    .pending_role_wake_inputs(
+                        &project,
+                        &format!("ticket_run:{ticket}:coordinator"),
+                        8,
+                    )
+                    .unwrap()
+                    .iter()
+                    .all(|wake| wake.source_type != "worker_recovery_ready")
+            );
+            return;
+        }
         assert_eq!(candidates.len(), 1);
         let recovery_summary =
             crate::runtime_services::verified_worker_recovery_summary(candidates.clone(), |path| {
@@ -6375,10 +6481,7 @@ pub(crate) mod tests {
         ).unwrap();
         let evidence_submission: RoleResultSubmission =
             crate::protocol::parse_unique(evidence_json.as_bytes()).unwrap();
-        assert!(matches!(
-            evidence_submission.assertion,
-            AgentAssertion::Blocked { .. }
-        ));
+        assert_eq!(evidence_submission.assertion, prior_assertion);
         assert!(
             mailbox
                 .pending(u64::try_from(super::unix_now().unwrap()).unwrap())
@@ -10118,7 +10221,9 @@ impl ConfigStore {
         use crate::delivery_runtime::{
             CommitWorkerManifestEffectPayload, CommitWorkerManifestEffectReceipt,
         };
-        use crate::engine::orchestration::{AgentAssertion, WorkerRecoveryCandidate};
+        use crate::engine::orchestration::{
+            AgentAssertion, RoleOutputKind, RoleResultPayload, WorkerRecoveryCandidate,
+        };
         use crate::engine::reducer::Phase;
 
         if run.phase != Phase::Implementing
@@ -10254,6 +10359,22 @@ impl ConfigStore {
             }
             let submission: RoleResultSubmission =
                 crate::protocol::parse_unique(result_json.as_bytes())?;
+            let resumable_result = match submission.assertion {
+                AgentAssertion::Blocked { .. } => true,
+                AgentAssertion::Succeeded if submission.kind == RoleOutputKind::Progress => {
+                    match RoleResultPayload::parse(submission.kind, submission.structured_result)? {
+                        RoleResultPayload::Progress(progress) => {
+                            progress.pending_node_keys.contains(&assignment.node_id)
+                                && !progress.completed_node_keys.contains(&assignment.node_id)
+                                && progress.next_observation_at.is_none()
+                        }
+                        _ => false,
+                    }
+                }
+                AgentAssertion::Succeeded
+                | AgentAssertion::Failed { .. }
+                | AgentAssertion::Cancelled { .. } => false,
+            };
             if submission.binding.agent_run_id != prior_id
                 || submission.binding.role != Role::Worker
                 || submission
@@ -10261,7 +10382,7 @@ impl ConfigStore {
                     .ticket_revision
                     .map(|revision| revision.0)
                     != Some(run.revision)
-                || !matches!(submission.assertion, AgentAssertion::Blocked { .. })
+                || !resumable_result
             {
                 continue;
             }
@@ -10399,8 +10520,8 @@ impl ConfigStore {
         Ok(candidates)
     }
 
-    /// Persist a Coordinator-only nudge when a previously blocked Worker becomes
-    /// eligible for host-verified recovery. This contains no Worker authorization;
+    /// Persist a Coordinator-only nudge when a terminal Worker becomes eligible for
+    /// same-node continuation. This contains no Worker authorization;
     /// a later Coordinator result must still request and pass the normal recovery
     /// candidate validation before a replacement can launch.
     pub fn queue_worker_recovery_ready_wake(
