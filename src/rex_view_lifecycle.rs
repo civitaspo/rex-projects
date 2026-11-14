@@ -1258,6 +1258,84 @@ esac
 
     #[cfg(unix)]
     #[test]
+    fn repeated_terminal_status_anchor_observations_preserve_the_archive() {
+        for (exit_code, expected, conflicting) in [
+            (0, RexBlockLifecycle::Completed, RexBlockLifecycle::Failed),
+            (1, RexBlockLifecycle::Failed, RexBlockLifecycle::Completed),
+        ] {
+            let mut fixture = StatusAnchorFixture::new(
+                serde_json::json!({"last_exit":{"exit_code":exit_code},"home":"/fixture/home"}),
+                false,
+            );
+            fixture.record_created();
+            fixture.maintain();
+            let first = fixture
+                .terminal
+                .store
+                .rex_view_anchor(&fixture.view.view.view_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(first.lifecycle, expected);
+            assert!(first.process_absent_confirmed);
+            assert!(first.archive_digest.is_some());
+
+            fixture.maintain();
+
+            assert_eq!(
+                fixture
+                    .terminal
+                    .store
+                    .rex_view_anchor(&fixture.view.view.view_id)
+                    .unwrap()
+                    .unwrap(),
+                first
+            );
+            assert_eq!(
+                fixture
+                    .terminal
+                    .store
+                    .read_rex_view_anchor_archive(&first.view_id, &first.block_id)
+                    .unwrap()
+                    .as_deref(),
+                Some("rex-projects status output\n")
+            );
+            assert!(!fixture.root.join("closed").exists());
+            for (lifecycle, absent) in [
+                (conflicting, true),
+                (RexBlockLifecycle::Active, false),
+                (expected, false),
+            ] {
+                assert!(
+                    fixture
+                        .terminal
+                        .store
+                        .observe_rex_view_anchor(
+                            fixture.terminal.owner_generation,
+                            &first.view_id,
+                            lifecycle,
+                            absent,
+                        )
+                        .is_err()
+                );
+            }
+            fixture.close_archived_anchor().unwrap();
+            assert!(
+                fixture
+                    .terminal
+                    .store
+                    .observe_rex_view_anchor(
+                        fixture.terminal.owner_generation,
+                        &first.view_id,
+                        expected,
+                        true,
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn actual_rex_process_shape_archives_a_proven_one_shot_status_anchor() {
         let mut fixture = StatusAnchorFixture::new(
             serde_json::json!({"last_exit":{"exit_code":0},"home":"/fixture/home"}),
