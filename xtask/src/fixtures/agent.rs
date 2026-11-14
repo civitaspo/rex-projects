@@ -1676,6 +1676,7 @@ fn next_message(
         && let Some(inbox) = inbox
         && inbox.ticket_observation()?.is_none()
     {
+        let instruction_notice = inbox.human_instruction_notice()?;
         if let Some(ticket_run_id) =
             inbox.coordinator_spawn_request(&invocation.scope.project_id)?
         {
@@ -1704,7 +1705,9 @@ fn next_message(
                 artifact_refs: Vec::new(),
             });
         }
-        if let Some(ticket_run_id) = inbox.coordinator_plan_ready(&invocation.scope.project_id)? {
+        if let Some(ticket_run_id) =
+            inbox.coordinator_result(&invocation.scope.project_id, "plan_ready")?
+        {
             let progress = json!({
                 "summary":format!("Acknowledged the validated Coordinator plan for TicketRun {ticket_run_id}; the host owns plan acceptance and work-node admission."),
                 "completed_node_keys":[],
@@ -1721,6 +1724,62 @@ fn next_message(
                 schema_version: 1,
                 message_id: format!(
                     "fixture-supervisor-coordinator-plan-ready-{:x}",
+                    Sha256::digest(invocation.run_id.as_bytes())
+                ),
+                kind: RoleOutputKind::Progress,
+                assertion: AgentAssertion::Succeeded,
+                structured_result: progress,
+                result_digest: format!("{:x}", Sha256::digest(bytes)),
+                artifact_refs: Vec::new(),
+            });
+        }
+        if let Some(ticket_run_id) =
+            inbox.coordinator_result(&invocation.scope.project_id, "progress")?
+        {
+            let progress = json!({
+                "summary":format!("Acknowledged the validated Coordinator Progress for TicketRun {ticket_run_id}; the host owns further scheduling."),
+                "completed_node_keys":[],
+                "pending_node_keys":[],
+                "evidence":[],
+                "next_observation_at":null
+            });
+            validate_payload(RoleOutputKind::Progress, &progress)?;
+            ledger_tx.commit().map_err(|error| error.to_string())?;
+            let bytes = serde_json::to_vec(&progress).map_err(|error| {
+                format!("serialize Supervisor Coordinator-progress acknowledgement: {error}")
+            })?;
+            return Ok(AgentMessage {
+                schema_version: 1,
+                message_id: format!(
+                    "fixture-supervisor-coordinator-progress-{:x}",
+                    Sha256::digest(invocation.run_id.as_bytes())
+                ),
+                kind: RoleOutputKind::Progress,
+                assertion: AgentAssertion::Succeeded,
+                structured_result: progress,
+                result_digest: format!("{:x}", Sha256::digest(bytes)),
+                artifact_refs: Vec::new(),
+            });
+        }
+        if let Some(ticket_run_id) = instruction_notice {
+            let progress = json!({
+                "summary":format!("Acknowledged a durable human instruction notice for TicketRun {ticket_run_id}; the Coordinator owns the requested work."),
+                "completed_node_keys":[],
+                "pending_node_keys":[],
+                "evidence":[],
+                "next_observation_at":null
+            });
+            validate_payload(RoleOutputKind::Progress, &progress)?;
+            ledger_tx.commit().map_err(|error| {
+                format!("commit Supervisor human-instruction acknowledgement: {error}")
+            })?;
+            let bytes = serde_json::to_vec(&progress).map_err(|error| {
+                format!("serialize Supervisor human-instruction acknowledgement: {error}")
+            })?;
+            return Ok(AgentMessage {
+                schema_version: 1,
+                message_id: format!(
+                    "fixture-supervisor-human-instruction-{:x}",
                     Sha256::digest(invocation.run_id.as_bytes())
                 ),
                 kind: RoleOutputKind::Progress,
@@ -2346,7 +2405,11 @@ impl FixtureInbox {
         Ok(Some(ticket_run_id.to_owned()))
     }
 
-    fn coordinator_plan_ready(&self, project_id: &str) -> Result<Option<String>, String> {
+    fn coordinator_result(
+        &self,
+        project_id: &str,
+        result_kind: &str,
+    ) -> Result<Option<String>, String> {
         let plans = self
             .inputs
             .iter()
@@ -2356,8 +2419,7 @@ impl FixtureInbox {
                 (payload.get("kind").and_then(Value::as_str) == Some("validated_agent_result")
                     && payload.pointer("/source/role").and_then(Value::as_str)
                         == Some("coordinator")
-                    && payload.pointer("/result/kind").and_then(Value::as_str)
-                        == Some("plan_ready"))
+                    && payload.pointer("/result/kind").and_then(Value::as_str) == Some(result_kind))
                 .then_some((item, payload))
             })
             .collect::<Vec<_>>();
@@ -2456,10 +2518,26 @@ impl FixtureInbox {
             || !host_result
                 .get("artifact_refs")
                 .is_some_and(Value::is_array)
-            || structured.get("plan").is_none_or(|plan| !plan.is_object())
-            || !structured
-                .get("unresolved_questions")
-                .is_some_and(Value::is_array)
+            || (result_kind == "plan_ready"
+                && (structured.get("plan").is_none_or(|plan| !plan.is_object())
+                    || !structured
+                        .get("unresolved_questions")
+                        .is_some_and(Value::is_array)))
+            || (result_kind == "progress"
+                && (structured
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                    || !structured
+                        .get("completed_node_keys")
+                        .is_some_and(Value::is_array)
+                    || !structured
+                        .get("pending_node_keys")
+                        .is_some_and(Value::is_array)
+                    || !structured.get("evidence").is_some_and(Value::is_array)
+                    || structured
+                        .get("next_observation_at")
+                        .is_none_or(|value| !value.is_null() && !value.is_string())))
             || source
                 .get("ticket_revision")
                 .and_then(Value::as_u64)
@@ -2478,7 +2556,57 @@ impl FixtureInbox {
             || !is_sha256_digest(result_digest)
             || structured_digest.as_deref() != Some(result_digest)
         {
-            return Err("Supervisor Coordinator plan-ready result failed its project, TicketRun, source, or plan binding".into());
+            return Err(format!(
+                "Supervisor Coordinator {result_kind} result failed its project, TicketRun, source, or result binding"
+            ));
+        }
+        Ok(Some(ticket_run_id.to_owned()))
+    }
+
+    fn human_instruction_notice(&self) -> Result<Option<String>, String> {
+        let notices = self
+            .inputs
+            .iter()
+            .filter(|item| {
+                item.get("source_type").and_then(Value::as_str) == Some("human_instruction_notice")
+            })
+            .collect::<Vec<_>>();
+        let [item] = notices.as_slice() else {
+            return if notices.is_empty() {
+                Ok(None)
+            } else {
+                Err("Supervisor inbox contains multiple human instruction notices".into())
+            };
+        };
+        let payload = item
+            .get("payload_json")
+            .ok_or("human instruction notice omitted its payload")?;
+        let request_id = payload
+            .get("request_id")
+            .and_then(Value::as_str)
+            .filter(|request_id| !request_id.is_empty())
+            .ok_or("human instruction notice omitted its request ID")?;
+        let ticket_run_id = payload
+            .get("ticket_run_id")
+            .and_then(Value::as_str)
+            .filter(|ticket_run_id| !ticket_run_id.is_empty())
+            .ok_or("human instruction notice omitted its TicketRun ID")?;
+        let revision = payload
+            .get("revision")
+            .and_then(Value::as_u64)
+            .filter(|revision| *revision > 0)
+            .ok_or("human instruction notice omitted its positive revision")?;
+        if payload.get("schema_version").and_then(Value::as_u64) != Some(1)
+            || payload.get("kind").and_then(Value::as_str) != Some("human_instruction_notice")
+            || item.get("source_id").and_then(Value::as_str) != Some(request_id)
+            || item.get("source_revision").and_then(Value::as_u64) != Some(revision)
+            || item.get("priority").and_then(Value::as_i64) != Some(80)
+            || !payload
+                .get("body_digest")
+                .and_then(Value::as_str)
+                .is_some_and(is_sha256_digest)
+        {
+            return Err("Supervisor human instruction notice failed its source, revision, or digest binding".into());
         }
         Ok(Some(ticket_run_id.to_owned()))
     }
@@ -3960,12 +4088,20 @@ mod tests {
     }
 
     fn coordinator_plan_ready_inbox(run_id: &str) -> FixtureInbox {
-        use sha2::{Digest as _, Sha256};
-
         let structured = serde_json::json!({
             "plan":{"nodes":[],"requested_investigation_children":0},
             "unresolved_questions":[]
         });
+        coordinator_result_inbox(run_id, "plan_ready", structured)
+    }
+
+    fn coordinator_result_inbox(
+        run_id: &str,
+        kind: &str,
+        structured: serde_json::Value,
+    ) -> FixtureInbox {
+        use sha2::{Digest as _, Sha256};
+
         let result_digest = format!(
             "{:x}",
             Sha256::digest(serde_json::to_vec(&structured).unwrap())
@@ -3994,10 +4130,36 @@ mod tests {
                             "config_digest":"f".repeat(64),"profile_digest":"a".repeat(64)
                         },
                         "result":{
-                            "message_id":"coordinator-plan-ready-a",
+                            "message_id":format!("coordinator-{kind}-a"),
                             "assertion":{"assertion":"succeeded"},"artifact_refs":[],
-                            "kind":"plan_ready","structured_result":structured
+                            "kind":kind,"structured_result":structured
                         }
+                    },
+                    "host_artifacts":[]
+                }]
+            }),
+            run_id,
+        )
+        .unwrap()
+    }
+
+    fn human_instruction_notice_inbox(run_id: &str) -> FixtureInbox {
+        FixtureInbox::parse(
+            serde_json::json!({
+                "run_id":run_id,"after":0,"next_after":1,
+                "inputs":[{
+                    "wake_input_id":1,
+                    "source_type":"human_instruction_notice",
+                    "source_id":"instruction-request-a",
+                    "source_revision":1,
+                    "priority":80,
+                    "payload_json":{
+                        "schema_version":1,
+                        "kind":"human_instruction_notice",
+                        "ticket_run_id":"ticket-run-a",
+                        "revision":1,
+                        "request_id":"instruction-request-a",
+                        "body_digest":"b".repeat(64)
                     },
                     "host_artifacts":[]
                 }]
@@ -4045,6 +4207,54 @@ mod tests {
             Some(inbox),
         )
         .unwrap()
+    }
+
+    fn publish_and_run_supervisor_inbox(
+        root: &Path,
+        run_id: &str,
+        inbox: FixtureInbox,
+    ) -> Result<super::AgentMessage, String> {
+        use rex_projects::agent_api::{AgentWakeSnapshot, publish_wake_snapshot, read_inbox};
+        use rex_projects::domain::ids::{Digest, ProjectId};
+
+        let mut snapshot = AgentWakeSnapshot {
+            schema_version: 1,
+            project_id: ProjectId::parse("operations_project").unwrap(),
+            role_session_id: "project:operations_project:supervisor".into(),
+            agent_run_id: run_id.into(),
+            digest: Digest::parse("0".repeat(64)).unwrap(),
+            worker_correction_context: None,
+            inputs: serde_json::from_value(serde_json::Value::Array(inbox.inputs))
+                .map_err(|error| format!("parse Supervisor wake snapshot fixture: {error}"))?,
+        };
+        snapshot.digest = snapshot
+            .content_digest()
+            .map_err(|error| format!("digest Supervisor wake snapshot fixture: {error}"))?;
+        publish_wake_snapshot(root, snapshot)
+            .map_err(|error| format!("publish Supervisor wake snapshot fixture: {error}"))?;
+        let public_inputs = read_inbox(root, run_id, 0)
+            .map_err(|error| format!("read Supervisor public inbox fixture: {error}"))?;
+        let next_after = public_inputs
+            .last()
+            .map(|item| item.wake_input_id)
+            .unwrap_or(0);
+        let inbox = FixtureInbox::parse(
+            serde_json::json!({
+                "run_id":run_id,
+                "after":0,
+                "next_after":next_after,
+                "inputs":serde_json::to_value(public_inputs).map_err(|error| format!("serialize Supervisor public inbox fixture: {error}"))?
+            }),
+            run_id,
+        )?;
+        next_message(
+            &supervisor_context(),
+            &supervisor_invocation(run_id),
+            root,
+            None,
+            "host prompt",
+            Some(&inbox),
+        )
     }
 
     #[test]
@@ -4159,6 +4369,176 @@ mod tests {
             recorded, 0,
             "plan acknowledgement must not consume a recipe"
         );
+    }
+
+    #[test]
+    fn supervisor_acknowledges_coordinator_progress_and_instruction_wakes_without_recipe_use() {
+        use sha2::{Digest as _, Sha256};
+
+        let progress = coordinator_result_inbox(
+            "supervisor-after-progress",
+            "progress",
+            serde_json::json!({
+                "summary":"The Coordinator recorded its bounded assessment.",
+                "completed_node_keys":[],
+                "pending_node_keys":[],
+                "evidence":[],
+                "next_observation_at":null
+            }),
+        );
+        let mut notice = human_instruction_notice_inbox("supervisor-after-progress");
+        notice.inputs[0]["wake_input_id"] = serde_json::json!(9);
+        let mut combined = progress.clone();
+        combined.inputs.extend(notice.inputs.clone());
+        combined.next_after = 9;
+        let mut invalid_combined = combined.clone();
+        invalid_combined.inputs[1]["source_id"] = serde_json::json!("other-request");
+
+        for (run_id, inbox, expected_summary) in [
+            (
+                "supervisor-after-progress",
+                combined,
+                "Acknowledged the validated Coordinator Progress",
+            ),
+            (
+                "supervisor-progress-only",
+                coordinator_result_inbox(
+                    "supervisor-progress-only",
+                    "progress",
+                    serde_json::json!({
+                        "summary":"The Coordinator recorded its bounded assessment.",
+                        "completed_node_keys":[],"pending_node_keys":[],
+                        "evidence":[],"next_observation_at":null
+                    }),
+                ),
+                "Acknowledged the validated Coordinator Progress",
+            ),
+            (
+                "supervisor-instruction-only",
+                human_instruction_notice_inbox("supervisor-instruction-only"),
+                "Acknowledged a durable human instruction notice",
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let message = publish_and_run_supervisor_inbox(root.path(), run_id, inbox).unwrap();
+            assert_eq!(message.kind, RoleOutputKind::Progress);
+            assert_eq!(message.assertion, super::AgentAssertion::Succeeded);
+            assert!(
+                message.structured_result["summary"]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected_summary)
+            );
+            super::validate_payload(message.kind, &message.structured_result).unwrap();
+
+            let emitted_path = root.path().join("supervisor-result.jsonl");
+            let mut emitted_file = std::fs::File::create(&emitted_path).unwrap();
+            super::emit_to(
+                super::Provider::Codex,
+                "acceptance_supervisor",
+                Role::Supervisor,
+                &[],
+                &serde_json::to_vec(&message).unwrap(),
+                &mut emitted_file,
+            )
+            .unwrap();
+            drop(emitted_file);
+            let emitted = std::fs::read(emitted_path).unwrap();
+            let (_, parsed) = rex_projects::providers::parse_result(
+                rex_projects::domain::types::AgentAdapter::Codex,
+                &emitted,
+                &rex_projects::roles::result_schema(Role::Supervisor),
+            )
+            .unwrap();
+            assert_eq!(parsed["kind"], "progress");
+
+            let invocations = Connection::open(root.path().join("invocations.sqlite")).unwrap();
+            let count: i64 = invocations
+                .query_row(
+                    "SELECT COUNT(*) FROM invocations WHERE run_id=?1",
+                    [run_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "wake acknowledgements must not advance recipes");
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        assert!(
+            publish_and_run_supervisor_inbox(
+                root.path(),
+                "supervisor-progress-with-invalid-notice",
+                invalid_combined,
+            )
+            .is_err(),
+            "a valid Progress must not hide a malformed notice in the same batch"
+        );
+
+        for mutate in [
+            (
+                "progress project mismatch",
+                "progress",
+                "/payload_json/source/project_id",
+                serde_json::json!("other-project"),
+            ),
+            (
+                "progress ticket mismatch",
+                "progress",
+                "/payload_json/source/ticket_run_id",
+                serde_json::json!("other-ticket"),
+            ),
+            (
+                "progress digest mismatch",
+                "progress",
+                "/payload_json/result_digest",
+                serde_json::json!("0".repeat(64)),
+            ),
+            (
+                "notice ticket missing",
+                "notice",
+                "/payload_json/ticket_run_id",
+                serde_json::json!(""),
+            ),
+            (
+                "notice source mismatch",
+                "notice",
+                "/source_id",
+                serde_json::json!("other-request"),
+            ),
+        ] {
+            let run_id = format!(
+                "supervisor-invalid-{}",
+                Sha256::digest(mutate.0.as_bytes())[..4]
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
+            let mut inbox = if mutate.1 == "progress" {
+                coordinator_result_inbox(
+                    &run_id,
+                    "progress",
+                    serde_json::json!({
+                        "summary":"The Coordinator recorded its bounded assessment.",
+                        "completed_node_keys":[],"pending_node_keys":[],
+                        "evidence":[],"next_observation_at":null
+                    }),
+                )
+            } else {
+                human_instruction_notice_inbox(&run_id)
+            };
+            let item = &mut inbox.inputs[0];
+            if mutate.2 == "/source_id" {
+                item["source_id"] = mutate.3.clone();
+            } else {
+                *item.pointer_mut(mutate.2).unwrap() = mutate.3.clone();
+            }
+            let root = tempfile::tempdir().unwrap();
+            assert!(
+                publish_and_run_supervisor_inbox(root.path(), &run_id, inbox).is_err(),
+                "invalid wake must not be acknowledged: {}",
+                mutate.0
+            );
+        }
     }
 
     #[test]

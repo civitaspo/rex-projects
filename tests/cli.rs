@@ -838,7 +838,7 @@ fn supervisor_fixture_cli_handles_learning_batch_and_preserves_ticket_dispatch()
     use sha2::{Digest as _, Sha256};
     use std::path::{Path, PathBuf};
 
-    fn invoke_fixture(inbox_item: AgentWakeItem, label: &str) -> serde_json::Value {
+    fn invoke_fixture(inbox_items: Vec<AgentWakeItem>, label: &str) -> serde_json::Value {
         let temp = tempfile::tempdir().unwrap();
         let run_id = format!("supervisor-{label}");
         let control_dir = temp.path().join("run/control");
@@ -861,7 +861,7 @@ fn supervisor_fixture_cli_handles_learning_batch_and_preserves_ticket_dispatch()
             agent_run_id: run_id.clone(),
             digest: Digest::parse("0".repeat(64)).unwrap(),
             worker_correction_context: None,
-            inputs: vec![inbox_item],
+            inputs: inbox_items,
         };
         snapshot.digest = snapshot.content_digest().unwrap();
         rex_projects::agent_api::publish_wake_snapshot(&control_dir, snapshot.clone()).unwrap();
@@ -1006,7 +1006,7 @@ fn supervisor_fixture_cli_handles_learning_batch_and_preserves_ticket_dispatch()
     batch_payload["batch_id"] = serde_json::json!(batch_id);
     batch_payload["batch_digest"] = serde_json::json!(batch_digest);
     let learning = invoke_fixture(
-        AgentWakeItem {
+        vec![AgentWakeItem {
             wake_input_id: 4,
             source_type: "learning_batch".into(),
             source_id: batch_id.clone(),
@@ -1016,7 +1016,7 @@ fn supervisor_fixture_cli_handles_learning_batch_and_preserves_ticket_dispatch()
             host_artifact_source_evidence_ids: vec![],
             host_artifacts: vec![],
             host_completion_context: None,
-        },
+        }],
         "learning-batch",
     );
     assert_eq!(learning["kind"], "learning_decision");
@@ -1031,7 +1031,7 @@ fn supervisor_fixture_cli_handles_learning_batch_and_preserves_ticket_dispatch()
     );
 
     let ticket = invoke_fixture(
-        AgentWakeItem {
+        vec![AgentWakeItem {
             wake_input_id: 1,
             source_type: "ticket_observation".into(),
             source_id: "fixture/acceptance:T-42:ready".into(),
@@ -1045,7 +1045,7 @@ fn supervisor_fixture_cli_handles_learning_batch_and_preserves_ticket_dispatch()
             host_artifact_source_evidence_ids: vec![],
             host_artifacts: vec![],
             host_completion_context: None,
-        },
+        }],
         "ticket-dispatch",
     );
     assert_eq!(ticket["kind"], "dispatch_request");
@@ -1053,6 +1053,78 @@ fn supervisor_fixture_cli_handles_learning_batch_and_preserves_ticket_dispatch()
     assert_eq!(
         ticket["structured_result"]["expected_ticket_revision"],
         "rev-opaque-42"
+    );
+
+    let coordinator_result = serde_json::json!({
+        "summary":"Coordinator made progress and is waiting for the human instruction.",
+        "completed_node_keys":[],
+        "pending_node_keys":[],
+        "evidence":[],
+        "next_observation_at":null
+    });
+    let coordinator_digest = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&coordinator_result).unwrap())
+    );
+    let evidence_id = "b".repeat(64);
+    let supervisor_wake = invoke_fixture(
+        vec![
+            AgentWakeItem {
+                wake_input_id: 5,
+                source_type: "agent_result".into(),
+                source_id: evidence_id.clone(),
+                source_revision: 1,
+                priority: 0,
+                payload_json: serde_json::json!({
+                    "schema_version":1,"kind":"validated_agent_result",
+                    "evidence_id":evidence_id,"result_digest":coordinator_digest,
+                    "host_observation":{
+                        "authority_digest":"c".repeat(64),
+                        "terminal_digest":"d".repeat(64),
+                        "process_absence_digest":"e".repeat(64)
+                    },
+                    "source":{
+                        "role":"coordinator","project_id":"operations_project",
+                        "ticket_run_id":"ticket-run-a","ticket_revision":1,
+                        "role_session_id":"ticket_run:ticket-run-a:coordinator",
+                        "agent_run_id":"coordinator-run-a","parent_run_id":"supervisor-run-a",
+                        "attempt":1,"run_epoch":1,"profile_id":"fixture_coordinator",
+                        "config_digest":"f".repeat(64),"profile_digest":"a".repeat(64)
+                    },
+                    "result":{
+                        "message_id":"coordinator-progress-a",
+                        "assertion":{"assertion":"succeeded"},"artifact_refs":[],
+                        "kind":"progress","structured_result":coordinator_result
+                    }
+                }),
+                host_artifact_source_evidence_ids: vec![],
+                host_artifacts: vec![],
+                host_completion_context: None,
+            },
+            AgentWakeItem {
+                wake_input_id: 7,
+                source_type: "human_instruction_notice".into(),
+                source_id: "instruction-request-a".into(),
+                source_revision: 1,
+                priority: 80,
+                payload_json: serde_json::json!({
+                    "schema_version":1,"kind":"human_instruction_notice",
+                    "ticket_run_id":"ticket-run-a","revision":1,
+                    "request_id":"instruction-request-a","body_digest":"b".repeat(64)
+                }),
+                host_artifact_source_evidence_ids: vec![],
+                host_artifacts: vec![],
+                host_completion_context: None,
+            },
+        ],
+        "coordinator-progress-and-human-notice",
+    );
+    assert_eq!(supervisor_wake["kind"], "progress");
+    assert!(
+        supervisor_wake["structured_result"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("Coordinator Progress")
     );
 }
 
