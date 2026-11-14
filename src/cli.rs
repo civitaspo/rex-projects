@@ -43,6 +43,15 @@ pub enum Command {
     /// Maintain the state database.
     #[command(subcommand)]
     Db(DbCommand),
+    /// Serve the Agent-facing MCP server on stdio. Requires REXP_AGENT_ID.
+    Mcp,
+    /// Handle a harness hook. Reads the hook input from stdin.
+    Hook {
+        /// `claude` or `codex`.
+        provider: String,
+        /// `session-start` or `user-prompt-submit`.
+        event: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -81,6 +90,12 @@ pub enum TicketCommand {
     },
     /// Mark a backlog Ticket ready to run.
     Ready { id: String },
+    /// Mark a waiting Ticket answered so its Coordinator continues.
+    Answer {
+        id: String,
+        #[arg(long)]
+        text: Option<String>,
+    },
     /// Stop a Ticket and mark it abandoned.
     Cancel {
         id: String,
@@ -140,6 +155,10 @@ pub fn actor() -> String {
 }
 
 pub fn run(cli: Cli) -> Result<()> {
+    if let Command::Hook { provider, event } = &cli.command {
+        crate::hook::main(cli.config_dir, cli.state_dir, provider, event);
+        return Ok(());
+    }
     let paths = Paths::resolve(cli.config_dir, cli.state_dir)?;
     match cli.command {
         Command::Config(ConfigCommand::Check) => {
@@ -175,6 +194,19 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         Command::Ticket(command) => ticket(&paths, command),
         Command::Events(args) => events(&paths, args),
+        Command::Mcp => {
+            let agent_id = std::env::var("REXP_AGENT_ID")
+                .ok()
+                .filter(|id| !id.is_empty())
+                .context("REXP_AGENT_ID must be set to serve MCP")?;
+            let launch = std::env::var("REXP_AGENT_LAUNCH")
+                .ok()
+                .map(|l| l.parse::<i64>().context("invalid REXP_AGENT_LAUNCH"))
+                .transpose()?;
+            crate::mcp::Server::new(paths, agent_id, launch)
+                .serve(std::io::stdin().lock(), std::io::stdout().lock())
+        }
+        Command::Hook { .. } => unreachable!("handled above"),
         Command::Db(DbCommand::Rebuild) => {
             Store::open(&paths.db_file())?.rebuild()?;
             println!("rebuilt projections from the event log");
@@ -266,6 +298,16 @@ fn ticket(paths: &Paths, command: TicketCommand) -> Result<()> {
                 },
             )?;
             println!("{id} is ready");
+        }
+        TicketCommand::Answer { id, text } => {
+            store.append(
+                &actor(),
+                Event::TicketAnswered {
+                    ticket_id: id.clone(),
+                    answer: text,
+                },
+            )?;
+            println!("{id} is running");
         }
         TicketCommand::Cancel { id, reason } => {
             store.append(
