@@ -21,6 +21,5 @@ jobs:
       contents: read
     with:
       version: ${{ inputs.version || '' }}
-      version-files: '["Cargo.toml","Cargo.lock"]'
     secrets:
       CSM_CI_CLIENT_APP_PRIVATE_KEY: ${{ secrets.CSM_CI_CLIENT_APP_PRIVATE_KEY }}

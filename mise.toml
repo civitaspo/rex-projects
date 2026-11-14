@@ -8,7 +8,6 @@
 "aqua:suzuki-shunsuke/ghalint" = "1.6.0"
 "aqua:suzuki-shunsuke/pinact" = "5.0.2"
 "github:github/gh-actions-lock" = { version = "v0.4.1", bin = "gh-actions-lock" }
-rust = { version = "1.99.1", profile = "minimal", components = ["clippy", "rustfmt"] }
 
 [tasks.lint]
 run = [
@@ -21,8 +20,6 @@ run = [
   "git ls-files '*.lua' | while IFS= read -r file; do selene \"$file\" || exit; done",
   "ast-grep scan",
   "ast-grep test --skip-snapshot-tests",
-  "cargo fmt --all -- --check",
-  "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings",
 ]
 
 [tasks.actions-lock]
@@ -37,15 +34,7 @@ run = [
   "disable-checkout-persist-credentials",
   "mise run actions-lock",
   "git ls-files '*.lua' | while IFS= read -r file; do stylua \"$file\" || exit; done",
-  "cargo fmt --all",
 ]
 
 [tasks.test]
-run = [
-  "test -s README.md && test -s LICENSE",
-  "ast-grep test --skip-snapshot-tests",
-  "cargo test --workspace --all-features --locked",
-]
-
-[tasks.build]
-run = "cargo build --workspace --all-targets --all-features --locked"
+run = "test -s README.md && test -s LICENSE && ast-grep test --skip-snapshot-tests"
