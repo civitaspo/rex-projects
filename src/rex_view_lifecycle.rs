@@ -190,19 +190,11 @@ pub fn maintain_view(
                 .into_iter()
                 .find(|candidate| candidate.view.view_id == view.view.view_id)
                 .ok_or_else(|| error.to_string())?;
-            store.begin_rex_view_close(owner_generation, &candidate, now_unix, 0)?;
-            let absence_recheck = ticket_window_display_absent(transport, &window);
-            let still_absent = absence_recheck.as_ref().is_ok_and(|absent| *absent);
-            store.finish_rex_view_close(owner_generation, &candidate.view.view_id, still_absent)?;
-            match absence_recheck {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Err(
-                        "Rex ticket window absence changed during metadata retirement".into(),
-                    );
-                }
-                Err(error) => return Err(error),
+            if !ticket_window_display_absent(transport, &window)? {
+                return Err("Rex ticket window absence changed during metadata retirement".into());
             }
+            store.begin_rex_view_close(owner_generation, &candidate, now_unix, 0)?;
+            store.finish_rex_view_close(owner_generation, &candidate.view.view_id, true)?;
             return Ok(());
         }
         Err(error) => return Err(error.to_string()),
@@ -2091,7 +2083,7 @@ esac
 
     #[cfg(unix)]
     #[test]
-    fn failed_absence_recheck_leaves_view_unknown_not_close_pending() {
+    fn failed_absence_recheck_preserves_terminal_proof_for_later_retry() {
         let mut fixture =
             CompletedBlockFixture::new(serde_json::json!({"last_exit":{"exit_code":0}}));
         fixture.hide_user_block();
@@ -2100,6 +2092,7 @@ esac
         fixture.add_terminal_ticket_run();
         fixture.hide_window();
         fixture.fail_absence_recheck();
+        let block_before = fixture.owned_block();
 
         let result = maintain_view(
             &mut fixture.terminal.store,
@@ -2124,7 +2117,27 @@ esac
             .into_iter()
             .find(|view| view.view.view_id == fixture.view.view.view_id)
             .unwrap();
-        assert_eq!(view.lifecycle, "unknown");
+        assert_eq!(view.lifecycle, "active");
+        let block_after = fixture.owned_block();
+        assert_eq!(block_after.block.lifecycle, block_before.block.lifecycle);
+        assert_eq!(
+            block_after.block.process_absent_confirmed,
+            block_before.block.process_absent_confirmed
+        );
+        assert_eq!(block_after.archive_digest, block_before.archive_digest);
+        assert!(!fixture.root.join("closed").exists());
+
+        std::fs::remove_file(fixture.root.join("fail-second-inventory")).unwrap();
+        fixture.maintain(1);
+        let view = fixture
+            .terminal
+            .store
+            .rex_view_history(&fixture.view.view.project_id)
+            .unwrap()
+            .into_iter()
+            .find(|view| view.view.view_id == fixture.view.view.view_id)
+            .unwrap();
+        assert_eq!(view.lifecycle, "closed");
         assert!(!fixture.root.join("closed").exists());
     }
 
