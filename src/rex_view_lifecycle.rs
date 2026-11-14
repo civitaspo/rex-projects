@@ -170,9 +170,43 @@ pub fn maintain_view(
         initial_block_id: None,
         disposition: CreateDisposition::Existing,
     };
-    let rex_blocks = transport
-        .list_window_blocks(&window, &label)
-        .map_err(|error| error.to_string())?;
+    let rex_blocks = match transport.list_window_blocks(&window, &label) {
+        Ok(blocks) => blocks,
+        Err(error) if view.view.kind == RexViewKind::Ticket => {
+            // A missing ticket window can be retired only after Rex confirms
+            // that the exact recorded window is already absent. This path
+            // never treats window absence as Agent termination and never
+            // issues Rex close operations.
+            if !ticket_window_display_absent(transport, &window)? {
+                return Err(error.to_string());
+            }
+            store.mark_rex_view_terminal(owner_generation, &view.view.view_id, now_unix)?;
+            // With the display already absent, there is no remaining UI
+            // resource for the normal ticket-tab retention to protect. The
+            // existing process/archive/user-hold guards still decide whether
+            // metadata can retire; present windows keep the configured policy.
+            let candidate = store
+                .rex_view_cleanup_candidates(now_unix, 0)?
+                .into_iter()
+                .find(|candidate| candidate.view.view_id == view.view.view_id)
+                .ok_or_else(|| error.to_string())?;
+            store.begin_rex_view_close(owner_generation, &candidate, now_unix, 0)?;
+            let absence_recheck = ticket_window_display_absent(transport, &window);
+            let still_absent = absence_recheck.as_ref().is_ok_and(|absent| *absent);
+            store.finish_rex_view_close(owner_generation, &candidate.view.view_id, still_absent)?;
+            match absence_recheck {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(
+                        "Rex ticket window absence changed during metadata retirement".into(),
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     let mut records = store.rex_view_blocks(&view.view.view_id)?;
     let mut anchor = store.rex_view_anchor(&view.view.view_id)?;
     if anchor.is_none()
@@ -368,6 +402,16 @@ pub fn maintain_view(
         close_result?;
     }
     Ok(())
+}
+
+fn ticket_window_display_absent(
+    transport: &RexCliTransport,
+    expected: &RexWindow,
+) -> Result<bool, String> {
+    let inventory = transport
+        .observe_complete_session()
+        .map_err(|error| error.to_string())?;
+    Ok(inventory.ticket_window_is_absent(&expected.window_id, &expected.label))
 }
 
 fn is_tracked_view_block(
@@ -1701,6 +1745,10 @@ esac
             for (name, value) in [
                 ("before.json", before),
                 ("after.json", make_view(vec![user_block])),
+                (
+                    "missing.json",
+                    serde_json::json!({"session_id":authority.rex_session_id,"windows":[]}),
+                ),
                 ("process.json", observation),
                 (
                     "whoami.json",
@@ -1722,7 +1770,16 @@ case "$*" in
   *"whoami --json"*) /bin/cat "$fixture_dir/whoami.json" ;;
   *"api list --json"*) /bin/cat "$fixture_dir/api.json" ;;
   *"session.view"*)
-    if [ -f "$fixture_dir/closed" ]; then
+    if [ -f "$fixture_dir/missing" ]; then
+      if [ -f "$fixture_dir/fail-second-inventory" ]; then
+        count=0
+        if [ -f "$fixture_dir/view-count" ]; then count=$(/bin/cat "$fixture_dir/view-count"); fi
+        count=$((count + 1))
+        printf '%s\n' "$count" > "$fixture_dir/view-count"
+        if [ "$count" -ge 3 ]; then exit 4; fi
+      fi
+      /bin/cat "$fixture_dir/missing.json"
+    elif [ -f "$fixture_dir/closed" ]; then
       /bin/cat "$fixture_dir/after.json"
     else
       /bin/cat "$fixture_dir/before.json"
@@ -1766,6 +1823,56 @@ esac
                     completed_ticket_tab_retention_seconds: 3600,
                 },
                 None,
+            )
+            .unwrap();
+        }
+
+        fn hide_user_block(&self) {
+            for name in ["before.json", "after.json"] {
+                let path = self.root.join(name);
+                let mut inventory: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                inventory["windows"][0]["layers"][0]["blocks"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|block| block["block_id"] != "user-notes");
+                std::fs::write(path, serde_json::to_vec(&inventory).unwrap()).unwrap();
+            }
+        }
+
+        fn add_terminal_ticket_run(&mut self) {
+            self.terminal
+                .store
+                .test_connection()
+                .execute(
+                    "UPDATE ticket_runs SET internal_phase='done' WHERE project_id=?1 AND namespace='fixture' AND ticket_id='T-1'",
+                    [self.view.view.project_id.as_str()],
+                )
+                .unwrap();
+        }
+
+        fn hide_window(&self) {
+            std::fs::write(self.root.join("missing"), "").unwrap();
+        }
+
+        fn fail_absence_recheck(&self) {
+            std::fs::write(self.root.join("fail-second-inventory"), "").unwrap();
+            std::fs::write(self.root.join("view-count"), "0\n").unwrap();
+        }
+
+        fn replace_missing_window(&self, window_id: &str, label: &str) {
+            let path = self.root.join("missing.json");
+            std::fs::write(
+                path,
+                serde_json::to_vec(&serde_json::json!({
+                    "session_id": self.view.view.rex_session_id,
+                    "windows": [{
+                        "window_id": window_id,
+                        "label": label,
+                        "layers": [{"blocks": []}]
+                    }]
+                }))
+                .unwrap(),
             )
             .unwrap();
         }
@@ -1818,6 +1925,207 @@ esac
             .unwrap();
         assert!(has_block_capacity(&records, &observed, 2));
         assert_eq!(observed[0].block_id, "user-notes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn already_absent_completed_ticket_window_is_retired_without_rex_mutation() {
+        let mut fixture =
+            CompletedBlockFixture::new(serde_json::json!({"last_exit":{"exit_code":0}}));
+        fixture.hide_user_block();
+        fixture.maintain(1);
+        fixture.maintain(1);
+        let archive_digest = fixture.owned_block().archive_digest.unwrap();
+        fixture.add_terminal_ticket_run();
+        fixture.hide_window();
+
+        let slots_before: String = fixture
+            .terminal
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT COALESCE(group_concat(pool||':'||slot_index||':'||owner_id||':'||disposition, '|'), '') FROM (SELECT pool,slot_index,owner_id,disposition FROM execution_slots ORDER BY pool,slot_index)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let authority_before = fixture
+            .terminal
+            .store
+            .agent_launch_authority(fixture.terminal.terminal.agent_run_id())
+            .unwrap();
+
+        let result = maintain_view(
+            &mut fixture.terminal.store,
+            fixture.terminal.owner_generation,
+            100,
+            &fixture.view,
+            &fixture.transport,
+            RexViewLifecyclePolicy {
+                max_blocks_per_tab: 2,
+                completed_blocks_to_keep: 1,
+                completed_ticket_tab_retention_seconds: 3600,
+            },
+            None,
+        );
+
+        assert!(result.is_ok(), "{result:?}");
+        let history = fixture
+            .terminal
+            .store
+            .rex_view_history(&fixture.view.view.project_id)
+            .unwrap();
+        let view = history
+            .iter()
+            .find(|view| view.view.view_id == fixture.view.view.view_id)
+            .unwrap();
+        assert_eq!(view.lifecycle, "closed");
+        let block = fixture.owned_block();
+        assert_eq!(block.block.lifecycle, RexBlockLifecycle::Closed);
+        assert_eq!(block.archive_digest.unwrap(), archive_digest);
+        assert!(!fixture.root.join("closed").exists());
+        let slots_after: String = fixture
+            .terminal
+            .store
+            .test_connection()
+            .query_row(
+                "SELECT COALESCE(group_concat(pool||':'||slot_index||':'||owner_id||':'||disposition, '|'), '') FROM (SELECT pool,slot_index,owner_id,disposition FROM execution_slots ORDER BY pool,slot_index)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let authority_after = fixture
+            .terminal
+            .store
+            .agent_launch_authority(fixture.terminal.terminal.agent_run_id())
+            .unwrap();
+        assert_eq!(slots_after, slots_before);
+        assert_eq!(authority_after, authority_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_completed_ticket_window_with_user_block_is_not_retired() {
+        let mut fixture =
+            CompletedBlockFixture::new(serde_json::json!({"last_exit":{"exit_code":0}}));
+        fixture.maintain(1);
+        fixture.maintain(1);
+        fixture.add_terminal_ticket_run();
+        fixture.hide_window();
+
+        let result = maintain_view(
+            &mut fixture.terminal.store,
+            fixture.terminal.owner_generation,
+            100,
+            &fixture.view,
+            &fixture.transport,
+            RexViewLifecyclePolicy {
+                max_blocks_per_tab: 2,
+                completed_blocks_to_keep: 1,
+                completed_ticket_tab_retention_seconds: 3600,
+            },
+            None,
+        );
+
+        assert!(result.is_err());
+        let history = fixture
+            .terminal
+            .store
+            .rex_view_history(&fixture.view.view.project_id)
+            .unwrap();
+        let view = history
+            .iter()
+            .find(|view| view.view.view_id == fixture.view.view.view_id)
+            .unwrap();
+        assert_eq!(view.lifecycle, "active");
+        assert!(!fixture.root.join("closed").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_ticket_window_prevents_missing_view_retirement() {
+        let label = owned_ticket_window_label("fixture", "T-1").unwrap();
+        for same_label in [true, false] {
+            let mut fixture =
+                CompletedBlockFixture::new(serde_json::json!({"last_exit":{"exit_code":0}}));
+            fixture.hide_user_block();
+            fixture.maintain(1);
+            fixture.maintain(1);
+            fixture.add_terminal_ticket_run();
+            fixture.hide_window();
+            let (replacement_id, replacement_label) = if same_label {
+                ("replacement-window", label.as_str())
+            } else {
+                (fixture.view.view.rex_window_id.as_str(), "renamed-window")
+            };
+            fixture.replace_missing_window(replacement_id, replacement_label);
+
+            let result = maintain_view(
+                &mut fixture.terminal.store,
+                fixture.terminal.owner_generation,
+                100,
+                &fixture.view,
+                &fixture.transport,
+                RexViewLifecyclePolicy {
+                    max_blocks_per_tab: 2,
+                    completed_blocks_to_keep: 1,
+                    completed_ticket_tab_retention_seconds: 3600,
+                },
+                None,
+            );
+
+            assert!(result.is_err());
+            let history = fixture
+                .terminal
+                .store
+                .rex_view_history(&fixture.view.view.project_id)
+                .unwrap();
+            let view = history
+                .iter()
+                .find(|view| view.view.view_id == fixture.view.view.view_id)
+                .unwrap();
+            assert_eq!(view.lifecycle, "active");
+            assert!(!fixture.root.join("closed").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_absence_recheck_leaves_view_unknown_not_close_pending() {
+        let mut fixture =
+            CompletedBlockFixture::new(serde_json::json!({"last_exit":{"exit_code":0}}));
+        fixture.hide_user_block();
+        fixture.maintain(1);
+        fixture.maintain(1);
+        fixture.add_terminal_ticket_run();
+        fixture.hide_window();
+        fixture.fail_absence_recheck();
+
+        let result = maintain_view(
+            &mut fixture.terminal.store,
+            fixture.terminal.owner_generation,
+            100,
+            &fixture.view,
+            &fixture.transport,
+            RexViewLifecyclePolicy {
+                max_blocks_per_tab: 2,
+                completed_blocks_to_keep: 1,
+                completed_ticket_tab_retention_seconds: 3600,
+            },
+            None,
+        );
+
+        assert!(result.is_err());
+        let view = fixture
+            .terminal
+            .store
+            .rex_view_history(&fixture.view.view.project_id)
+            .unwrap()
+            .into_iter()
+            .find(|view| view.view.view_id == fixture.view.view.view_id)
+            .unwrap();
+        assert_eq!(view.lifecycle, "unknown");
+        assert!(!fixture.root.join("closed").exists());
     }
 
     #[cfg(unix)]
