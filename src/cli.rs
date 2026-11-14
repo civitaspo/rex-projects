@@ -60,6 +60,12 @@ pub enum Command {
         #[arg(long)]
         once: bool,
     },
+    /// Show the Ticket dashboard.
+    Ui {
+        /// Quit after jumping to a Ticket, for a floating layer.
+        #[arg(long)]
+        popup: bool,
+    },
     /// Run Agents. Used by the Rex blocks that `serve` opens.
     #[command(subcommand)]
     Agent(AgentCommand),
@@ -235,6 +241,7 @@ pub fn run(cli: Cli) -> Result<()> {
             crate::serve::run(&paths, Duration::from_millis(interval_ms), once)
         }
         Command::Agent(AgentCommand::Exec { agent_id }) => crate::provider::exec(&paths, &agent_id),
+        Command::Ui { popup } => crate::ui::run(&paths, popup),
     }
 }
 

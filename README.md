@@ -19,6 +19,22 @@ rex-projects ticket list
 rex-projects events --follow
 ```
 
+Run `rex-projects ui` for the Ticket dashboard. It lists Tickets by Project with the ones that need you first. Press Enter to jump to a Ticket's Coordinator, `r` to ready a backlog Ticket, `a` to show old finished Tickets, and `q` to quit.
+
+## Rex plugin
+
+Put `rex-projects` on the `PATH` of your login shell, then load the plugin from `~/.config/rex/init.lua`:
+
+```lua
+package.path = os.getenv("HOME") .. "/src/github.com/civitaspo/rex-projects/lua/?/init.lua;" .. package.path
+require("rex_projects").setup({
+  bin = "rex-projects",
+  keys = { dashboard = "ctrl+a>p", serve = "ctrl+a>shift+p" },
+})
+```
+
+Adjust the path to your clone. The plugin adds two actions: `rex_projects_dashboard` opens the dashboard as a floating layer, and `rex_projects_serve` shows the control session `rxp`, creating it with `rex-projects serve` when it is missing. Keys are bound only when given.
+
 ## Development
 
 Install the pinned tools with `mise install`. Run `mise run lint` and `mise run test` to check changes. Run `mise run fix` to apply supported automatic fixes.
