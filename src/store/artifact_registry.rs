@@ -1751,6 +1751,8 @@ mod tests {
             .execute_batch(
                 "PRAGMA foreign_keys=OFF;
                  BEGIN IMMEDIATE;
+                 DROP TABLE machine_shutdowns;
+                 DELETE FROM schema_migrations WHERE version=23;
                  DROP TABLE learning_decisions;
                  DROP TABLE learning_findings;
                  DROP TABLE learning_batches;

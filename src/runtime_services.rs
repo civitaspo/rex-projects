@@ -4463,6 +4463,116 @@ impl crate::engine::factory_runtime::FactoryRuntimeObservationServices for Runti
 }
 
 impl RuntimeServices {
+    /// One drain-only pass. It can ingest a completed spool and reconcile/close owned Agent
+    /// blocks, but it never calls FactoryRuntime role dispatch or effect scheduling.
+    pub(crate) fn machine_shutdown_tick(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+        deadline_unix: i64,
+    ) -> Result<Vec<String>, String> {
+        let mut issues = Vec::new();
+        if let Err(error) = store.ingest_shutdown_spooled_agent_result_at(
+            &self.artifacts,
+            owner_generation,
+            now_unix,
+            32,
+        ) {
+            issues.push(format!("Agent result ingestion: {error}"));
+        }
+        // Leave ownership intact when a complete bounded observation cannot fit.
+        let Some(operation_timeout) = bounded_shutdown_rex_timeout(deadline_unix, now_unix) else {
+            issues.push("shutdown deadline leaves no bounded Rex observation budget".into());
+            return Ok(issues);
+        };
+        let bounded_rex = self.rex.with_bounded_operation_timeout(operation_timeout);
+        let policy = crate::agent_recovery::RecoveryPolicy {
+            rex_session_id: self.rex_identity.session_id.clone(),
+            turn_timeout_seconds: self
+                .applied_config
+                .profiles
+                .iter()
+                .map(|(profile_id, profile)| (profile_id.clone(), profile.turn_timeout_seconds))
+                .collect(),
+            heartbeat_stale_after_seconds: 30,
+            max_observations_per_tick: 1,
+            now_unix,
+        };
+        let report = self
+            .agent_recovery
+            .tick(store, owner_generation, &bounded_rex, &policy)?;
+        for observation in &report.observations {
+            if matches!(
+                observation.disposition,
+                crate::agent_recovery::AgentRecoveryDisposition::Unresolved { .. }
+            ) {
+                issues.push(format!(
+                    "{}: {:?}",
+                    observation.agent_run_id, observation.disposition
+                ));
+            }
+        }
+        let closed =
+            self.close_recovered_agent_blocks_for_shutdown(store, &bounded_rex, &report)?;
+        issues.extend(closed);
+        Ok(issues)
+    }
+
+    /// Close only Agent blocks whose current-generation recovery pass just proved the
+    /// immutable launch authority, Rex ownership, and process identities. The regular
+    /// recovery pass after closure remains responsible for cleanup and slot release.
+    pub(crate) fn close_recovered_agent_blocks_for_shutdown(
+        &self,
+        store: &ConfigStore,
+        rex: &crate::adapters::rex::RexCliTransport,
+        report: &crate::agent_recovery::AgentRecoveryReport,
+    ) -> Result<Vec<String>, String> {
+        let mut errors = Vec::new();
+        for observation in &report.observations {
+            if !matches!(
+                observation.disposition,
+                crate::agent_recovery::AgentRecoveryDisposition::Adopted
+                    | crate::agent_recovery::AgentRecoveryDisposition::AdoptedWithAttention
+                    | crate::agent_recovery::AgentRecoveryDisposition::AlreadyAdopted
+            ) {
+                continue;
+            }
+            let Some(authority) = store.agent_launch_authority(&observation.agent_run_id)? else {
+                errors.push(format!(
+                    "{}: immutable launch authority is missing",
+                    observation.agent_run_id
+                ));
+                continue;
+            };
+            if authority.rex_server_identity != self.rex_identity.instance_id
+                || authority.rex_session_id != self.rex_identity.session_id
+            {
+                errors.push(format!(
+                    "{}: launch authority is outside the current Rex owner",
+                    observation.agent_run_id
+                ));
+                continue;
+            }
+            let window = crate::adapters::rex::TicketWindow {
+                server_instance_id: authority.rex_server_identity,
+                session_id: authority.rex_session_id,
+                window_id: authority.rex_window_id,
+                label: String::new(),
+                initial_block_id: Some(authority.rex_block_id.clone()),
+                disposition: crate::adapters::rex::CreateDisposition::Existing,
+            };
+            if let Err(error) = rex.close_agent_block(
+                &window,
+                observation.agent_run_id.as_str(),
+                &authority.rex_block_id,
+            ) {
+                errors.push(format!("{}: {error}", observation.agent_run_id));
+            }
+        }
+        Ok(errors)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn stage_postmortem_artifacts(
         artifact_store: &ArtifactStore,
@@ -5666,6 +5776,48 @@ impl RuntimeServices {
         )?;
         let _ = now_unix;
         Ok(view)
+    }
+}
+
+fn bounded_shutdown_rex_timeout(deadline_unix: i64, now_unix: i64) -> Option<Duration> {
+    // Reserve one second for coarse timestamps and one for the bounded RPC cleanup grace.
+    let rpc_budget_seconds = deadline_unix.saturating_sub(now_unix).saturating_sub(2);
+    if rpc_budget_seconds <= 0 {
+        return None;
+    }
+    Some((Duration::from_secs(rpc_budget_seconds as u64) / 20).min(Duration::from_secs(5)))
+}
+
+#[cfg(test)]
+mod shutdown_budget_tests {
+    use super::bounded_shutdown_rex_timeout;
+    use std::time::Duration;
+
+    #[test]
+    fn short_shutdown_grace_still_has_a_rex_observation_budget() {
+        assert_eq!(
+            bounded_shutdown_rex_timeout(110, 100),
+            Some(Duration::from_millis(400))
+        );
+        assert_eq!(
+            bounded_shutdown_rex_timeout(103, 100),
+            Some(Duration::from_millis(50))
+        );
+    }
+
+    #[test]
+    fn expired_shutdown_deadline_never_becomes_an_unsigned_rpc_budget() {
+        assert_eq!(bounded_shutdown_rex_timeout(100, 101), None);
+        assert_eq!(bounded_shutdown_rex_timeout(100, 100), None);
+        assert_eq!(bounded_shutdown_rex_timeout(102, 100), None);
+        assert_eq!(
+            bounded_shutdown_rex_timeout(130, 100),
+            Some(Duration::from_millis(1400))
+        );
+        assert_eq!(
+            bounded_shutdown_rex_timeout(i64::MAX, i64::MIN),
+            Some(Duration::from_secs(5))
+        );
     }
 }
 

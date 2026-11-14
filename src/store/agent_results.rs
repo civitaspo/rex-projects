@@ -1931,6 +1931,7 @@ pub fn ingest_next_spooled_agent_result(
         owner_generation,
         candidate_limit,
         None,
+        true,
     )
 }
 
@@ -1947,6 +1948,27 @@ pub fn ingest_next_spooled_agent_result_at(
         owner_generation,
         candidate_limit,
         Some(now_unix),
+        true,
+    )
+}
+
+/// Shutdown drains newly completed run-step spools without replaying reducer work that was
+/// already persisted before shutdown. Such evidence remains unacknowledged for the next normal
+/// controller start, while independent terminal spools can still be durably ingested.
+pub fn ingest_shutdown_spooled_agent_result_at(
+    store: &mut ConfigStore,
+    artifact_store: &crate::artifacts::ArtifactStore,
+    owner_generation: u64,
+    now_unix: i64,
+    candidate_limit: usize,
+) -> Result<Option<IngestedAgentResult>, String> {
+    ingest_next_spooled_agent_result_inner(
+        store,
+        artifact_store,
+        owner_generation,
+        candidate_limit,
+        Some(now_unix),
+        false,
     )
 }
 
@@ -1956,17 +1978,20 @@ fn ingest_next_spooled_agent_result_inner(
     owner_generation: u64,
     candidate_limit: usize,
     now_unix: Option<i64>,
+    return_existing_pending_result: bool,
 ) -> Result<Option<IngestedAgentResult>, String> {
     if candidate_limit == 0 || candidate_limit > 128 {
         return Err("Agent result candidate limit must be between 1 and 128".into());
     }
-    let pending = if let Some(now) = now_unix {
-        pending_agent_results_at(store, artifact_store, owner_generation, now, 1)?
-    } else {
-        pending_agent_results(store, artifact_store, owner_generation, 1)?
-    };
-    if let Some(existing) = pending.into_iter().next() {
-        return Ok(Some(existing));
+    if return_existing_pending_result {
+        let pending = if let Some(now) = now_unix {
+            pending_agent_results_at(store, artifact_store, owner_generation, now, 1)?
+        } else {
+            pending_agent_results(store, artifact_store, owner_generation, 1)?
+        };
+        if let Some(existing) = pending.into_iter().next() {
+            return Ok(Some(existing));
+        }
     }
 
     if let Some(result) =
@@ -5099,6 +5124,62 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(terminal_count, 0);
+    }
+
+    #[test]
+    fn shutdown_spool_ingestion_does_not_replay_existing_reducer_backlog() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = spooled_result_test_store();
+        store.connection.execute_batch(
+            "CREATE TABLE merge_observation_deferrals(source_evidence_id TEXT,state TEXT,next_attempt_at_unix INTEGER,ticket_run_id TEXT,project_id TEXT,ticket_run_revision INTEGER);
+             CREATE TABLE ticket_runs(ticket_run_id TEXT,project_id TEXT,revision INTEGER,internal_phase TEXT,activity TEXT);",
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO agent_result_evidence(evidence_id,agent_run_id,message_id,result_json,received_at_unix)
+             VALUES ('old-evidence','already-finished-run','old-message','not-json',1)",
+            [],
+        ).unwrap();
+        spooled_candidate(
+            &store.connection,
+            temp.path(),
+            "another-run",
+            1,
+            TurnOutcome::MissingResult,
+            None,
+        );
+        let artifacts =
+            crate::artifacts::ArtifactStore::open(&temp.path().join("artifacts")).unwrap();
+
+        assert!(ingest_next_spooled_agent_result_at(&mut store, &artifacts, 7, 10, 8).is_err());
+
+        let ingested =
+            ingest_shutdown_spooled_agent_result_at(&mut store, &artifacts, 7, 10, 8).unwrap();
+
+        assert!(ingested.is_none());
+        let old_evidence: String = store
+            .connection
+            .query_row(
+                "SELECT result_json FROM agent_result_evidence WHERE evidence_id='old-evidence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            old_evidence, "not-json",
+            "shutdown leaves reducer backlog untouched"
+        );
+        let slot: String = store
+            .connection
+            .query_row(
+                "SELECT disposition FROM execution_slots WHERE owner_id='another-run'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            slot, "live",
+            "an incomplete spool does not release its owner"
+        );
     }
 
     #[test]
@@ -8583,6 +8664,22 @@ impl ConfigStore {
         candidate_limit: usize,
     ) -> Result<Option<IngestedAgentResult>, String> {
         ingest_next_spooled_agent_result_at(
+            self,
+            artifact_store,
+            owner_generation,
+            now_unix,
+            candidate_limit,
+        )
+    }
+
+    pub fn ingest_shutdown_spooled_agent_result_at(
+        &mut self,
+        artifact_store: &crate::artifacts::ArtifactStore,
+        owner_generation: u64,
+        now_unix: i64,
+        candidate_limit: usize,
+    ) -> Result<Option<IngestedAgentResult>, String> {
+        ingest_shutdown_spooled_agent_result_at(
             self,
             artifact_store,
             owner_generation,

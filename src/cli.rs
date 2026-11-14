@@ -3366,7 +3366,8 @@ fn runtime_status(
         "rejected_commands":status.rejected_commands,
         "pending_effects":status.pending_effects,
         "uncertain_effects":status.uncertain_effects,
-        "occupied_slots":status.occupied_slots
+        "occupied_slots":status.occupied_slots,
+        "machine_shutdown":{"request_id":status.machine_shutdown_request_id,"status":status.machine_shutdown_status,"deadline_unix":status.machine_shutdown_deadline_unix,"error":status.machine_shutdown_error}
     });
     if json {
         print_json(&report)
@@ -3399,6 +3400,18 @@ fn runtime_status(
             status.uncertain_effects,
             status.occupied_slots
         );
+        if let Some(shutdown) = &status.machine_shutdown_status {
+            println!(
+                "Machine shutdown {}: request {}, deadline {:?}{}",
+                shutdown,
+                status.machine_shutdown_request_id.as_deref().unwrap_or("?"),
+                status.machine_shutdown_deadline_unix,
+                status
+                    .machine_shutdown_error
+                    .as_deref()
+                    .map_or_else(String::new, |error| format!("; {error}")),
+            );
+        }
         Ok(())
     }
 }
@@ -3633,83 +3646,171 @@ fn run_controller(
     )
     .map_err(CliError::unexpected)?;
     install_stop_signals();
-    let started = unix_now_i64()?;
-    let mut should_stop = false;
+    let mut shutdown = store
+        .active_machine_shutdown()
+        .map_err(CliError::unavailable)?;
+    let mut received_signal = 0;
     loop {
-        let mut consumed = 0;
-        while consumed < 100 {
-            let Some(command) = store
-                .process_next_control(generation)
-                .map_err(CliError::unexpected)?
-            else {
-                break;
-            };
-            consumed += 1;
-            if let Some(applied) = command.applied_config
-                && (applied.revision != snapshot.revision
-                    || applied.digest != snapshot.config.digest)
-            {
-                snapshot = store.load_snapshot(&config_source)
-                    .map_err(CliError::unexpected)?
-                    .filter(|loaded| loaded.revision == applied.revision && loaded.config.digest == applied.digest)
-                    .ok_or_else(|| CliError::unexpected("applied configuration snapshot is missing or does not match its durable receipt"))?;
-                environment =
-                    crate::environment::capture(&snapshot.config.config.runtime.environment)
-                        .map_err(|error| CliError::unavailable(error.to_string()))?;
-                let rebuilt = crate::runtime_services::RuntimeServices::new(
-                    &snapshot.config,
-                    &environment,
-                    &canonical_source,
-                    &state_root,
-                    generation,
-                    &rex_identity,
-                    crate::runtime_services::RuntimeExecutable {
-                        path: &executable_path,
-                        digest: &runtime_executable_digest,
-                    },
-                );
-                services = match rebuilt {
-                    Ok(services) => services,
-                    Err(error) => {
-                        let _ = store.stop_owner(generation);
-                        return Err(CliError::unavailable(error));
-                    }
-                };
-            }
-            if command.kind == "machine_stop" {
-                should_stop = true;
-                break;
-            }
-        }
         store
             .heartbeat_owner(generation)
             .map_err(CliError::unavailable)?;
-        if should_stop || STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+        let signal = STOP_SIGNAL_REQUESTED.swap(0, std::sync::atomic::Ordering::SeqCst);
+        if signal != 0 {
+            received_signal = signal;
+        }
+        if !once && signal != 0 && shutdown.is_none() {
+            let cause = if signal == libc::SIGINT {
+                crate::store::machine_shutdown::MachineShutdownCause::Sigint
+            } else {
+                crate::store::machine_shutdown::MachineShutdownCause::Sigterm
+            };
+            shutdown = Some(
+                store
+                    .begin_signal_shutdown(
+                        generation,
+                        &generated_request_id()?,
+                        cause,
+                        unix_now_i64()?,
+                        snapshot.config.config.runtime.shutdown_grace_seconds,
+                    )
+                    .map_err(CliError::unavailable)?,
+            );
+        }
+        if shutdown.is_none() {
+            let mut consumed = 0;
+            while consumed < 100 {
+                if should_defer_controller_work(once) {
+                    break;
+                }
+                let Some(command) = store
+                    .process_next_control(
+                        generation,
+                        snapshot.config.config.runtime.shutdown_grace_seconds,
+                    )
+                    .map_err(CliError::unexpected)?
+                else {
+                    break;
+                };
+                consumed += 1;
+                if command.kind == "machine_stop" {
+                    shutdown = store
+                        .active_machine_shutdown()
+                        .map_err(CliError::unavailable)?;
+                    break;
+                }
+                if let Some(applied) = command.applied_config
+                    && (applied.revision != snapshot.revision
+                        || applied.digest != snapshot.config.digest)
+                {
+                    snapshot = store.load_snapshot(&config_source).map_err(CliError::unexpected)?
+                        .filter(|loaded| loaded.revision == applied.revision && loaded.config.digest == applied.digest)
+                        .ok_or_else(|| CliError::unexpected("applied configuration snapshot is missing or does not match its durable receipt"))?;
+                    environment =
+                        crate::environment::capture(&snapshot.config.config.runtime.environment)
+                            .map_err(|error| CliError::unavailable(error.to_string()))?;
+                    services = crate::runtime_services::RuntimeServices::new(
+                        &snapshot.config,
+                        &environment,
+                        &canonical_source,
+                        &state_root,
+                        generation,
+                        &rex_identity,
+                        crate::runtime_services::RuntimeExecutable {
+                            path: &executable_path,
+                            digest: &runtime_executable_digest,
+                        },
+                    )
+                    .map_err(CliError::unavailable)?;
+                }
+            }
+        }
+        if shutdown.is_none() && should_defer_controller_work(once) {
+            // Persist the signal as a machine-stop barrier at the next loop head before
+            // another qualifier, effect, or Agent turn can start.
+            continue;
+        }
+        if once && shutdown.is_some() {
+            // `--once` is a normal bounded tick. Leave a durable stop barrier for a
+            // foreground owner instead of closing parked Agent blocks here.
             break;
         }
-        let tick_now = unix_now_i64()?;
-        if once {
-            crate::engine::factory_runtime::FactoryRuntime::tick_once(
-                &mut store,
-                generation,
-                tick_now,
-                &mut services,
-            )
-            .map_err(CliError::unavailable)?;
-        } else {
-            if let Err(error) = services.tick_provider_qualification_jobs(&mut store, tick_now) {
-                eprintln!("rex-projects provider qualification: {error}");
+        if let Some(intent) = shutdown.as_ref().filter(|_| !once) {
+            let now = unix_now_i64()?;
+            let issues = services
+                .machine_shutdown_tick(&mut store, generation, now, intent.deadline_unix)
+                .unwrap_or_else(|error| vec![format!("drain tick: {error}")]);
+            let unresolved = store
+                .machine_shutdown_unresolved_owners()
+                .map_err(CliError::unavailable)?;
+            if unresolved == 0 {
+                store
+                    .set_machine_shutdown_status(
+                        generation,
+                        &intent.request_id,
+                        crate::store::machine_shutdown::MachineShutdownStatus::Stopped,
+                        None,
+                        now,
+                    )
+                    .map_err(CliError::unavailable)?;
+                shutdown = Some(crate::store::machine_shutdown::MachineShutdown {
+                    status: crate::store::machine_shutdown::MachineShutdownStatus::Stopped,
+                    last_error: None,
+                    ..intent.clone()
+                });
+                break;
             }
-            let tick = crate::engine::factory_runtime::FactoryRuntime::tick(
-                &mut store,
-                generation,
-                tick_now,
-                &snapshot.config.config,
-                &mut services,
-            )
-            .map_err(CliError::unavailable)?;
-            for error in tick.external_errors {
-                eprintln!("rex-projects runtime: {error}");
+            if now >= intent.deadline_unix {
+                let mut details = vec![format!("{unresolved} owned process/slot claim(s) remain")];
+                details.extend(issues);
+                store
+                    .set_machine_shutdown_status(
+                        generation,
+                        &intent.request_id,
+                        crate::store::machine_shutdown::MachineShutdownStatus::Incomplete,
+                        Some(&details.join("; ")),
+                        now,
+                    )
+                    .map_err(CliError::unavailable)?;
+                shutdown = Some(crate::store::machine_shutdown::MachineShutdown {
+                    status: crate::store::machine_shutdown::MachineShutdownStatus::Incomplete,
+                    last_error: Some(details.join("; ")),
+                    ..intent.clone()
+                });
+                break;
+            }
+        }
+        if shutdown.is_none() {
+            let tick_now = unix_now_i64()?;
+            if once {
+                crate::engine::factory_runtime::FactoryRuntime::tick_once(
+                    &mut store,
+                    generation,
+                    tick_now,
+                    &mut services,
+                )
+                .map_err(CliError::unavailable)?;
+            } else {
+                if should_defer_controller_work(once) {
+                    continue;
+                }
+                if let Err(error) = services.tick_provider_qualification_jobs(&mut store, tick_now)
+                {
+                    eprintln!("rex-projects provider qualification: {error}");
+                }
+                if should_defer_controller_work(once) {
+                    continue;
+                }
+                let tick = crate::engine::factory_runtime::FactoryRuntime::tick(
+                    &mut store,
+                    generation,
+                    tick_now,
+                    &snapshot.config.config,
+                    &mut services,
+                )
+                .map_err(CliError::unavailable)?;
+                for error in tick.external_errors {
+                    eprintln!("rex-projects runtime: {error}");
+                }
             }
         }
         publish_owner_projection(
@@ -3720,7 +3821,7 @@ fn run_controller(
             snapshot.config.digest.as_str(),
         )
         .map_err(CliError::unexpected)?;
-        if once {
+        if once && shutdown.is_none() {
             break;
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -3730,11 +3831,34 @@ fn run_controller(
         return Err(CliError::unavailable(error.to_string()));
     }
     let _ = std::fs::remove_file(projection);
-    if !once && STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
-        return Err(CliError::unavailable(format!(
-            "controller received a termination signal after {} seconds",
-            unix_now_i64()?.saturating_sub(started)
-        )));
+    let late_signal = STOP_SIGNAL_REQUESTED.load(std::sync::atomic::Ordering::SeqCst);
+    if late_signal != 0 {
+        received_signal = late_signal;
+    }
+    if received_signal == libc::SIGINT {
+        return Err(CliError {
+            code: 130,
+            message: "controller drained after SIGINT".into(),
+        });
+    }
+    if received_signal == libc::SIGTERM {
+        return Err(CliError {
+            code: 143,
+            message: "controller drained after SIGTERM".into(),
+        });
+    }
+    if let Some(intent) = shutdown {
+        if intent.status == crate::store::machine_shutdown::MachineShutdownStatus::Incomplete {
+            return Err(CliError {
+                code: 5,
+                message: format!(
+                    "controller shutdown incomplete: {}",
+                    intent.last_error.as_deref().unwrap_or("owned work remains")
+                ),
+            });
+        }
+        println!("Foreground controller drained and stopped.");
+        return Ok(());
     }
     if !once {
         println!("Foreground controller stopped after a durable stop request.");
@@ -3742,10 +3866,14 @@ fn run_controller(
     Ok(())
 }
 
-static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static STOP_SIGNAL_REQUESTED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
-extern "C" fn request_stop(_: libc::c_int) {
-    STOP_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+fn should_defer_controller_work(once: bool) -> bool {
+    !once && STOP_SIGNAL_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) != 0
+}
+
+extern "C" fn request_stop(signal: libc::c_int) {
+    STOP_SIGNAL_REQUESTED.store(signal, std::sync::atomic::Ordering::SeqCst);
 }
 
 fn install_stop_signals() {
@@ -5079,11 +5207,23 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        Cli, Command, ProviderCommand, TicketCommand, factory_context_present,
-        read_effective_snapshot, read_trial_matrix_file, resolve_executable, terminal_safe,
+        Cli, Command, ProviderCommand, STOP_SIGNAL_REQUESTED, TicketCommand,
+        factory_context_present, read_effective_snapshot, read_trial_matrix_file,
+        resolve_executable, should_defer_controller_work, terminal_safe,
     };
     use crate::config;
     use crate::store::{ConfigStore, ExpectedRevision};
+
+    #[test]
+    fn foreground_signal_defers_new_work_but_once_keeps_its_existing_semantics() {
+        STOP_SIGNAL_REQUESTED.store(libc::SIGTERM, std::sync::atomic::Ordering::SeqCst);
+        assert!(should_defer_controller_work(false));
+        assert!(
+            !should_defer_controller_work(true),
+            "--once does not adopt the foreground signal-drain behavior"
+        );
+        STOP_SIGNAL_REQUESTED.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
 
     #[test]
     fn trial_matrix_reader_rejects_symlinks_oversize_and_fifos() {
