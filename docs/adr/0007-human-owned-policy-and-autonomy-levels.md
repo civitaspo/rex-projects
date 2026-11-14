@@ -4,7 +4,7 @@ status: accepted
 
 # Human-owned policy and autonomy levels
 
-Each Project has an autonomy level, approvers for each kind of Approval, and budgets. These live in `policy.toml`, which only humans edit. They are kept separate from configuration that Improvements may change.
+Each Project has an autonomy level, approvers for each kind of Approval, the kinds of Approval every Ticket requires before it can complete, and budgets. These live in `policy.toml`, which only humans edit. They are kept separate from configuration that Improvements may change.
 
 | Level | Human | Delegated to the Supervisor or automation |
 | --- | --- | --- |

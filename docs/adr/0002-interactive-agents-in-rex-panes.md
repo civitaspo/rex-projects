@@ -10,9 +10,13 @@ rex-projects observes Agents through three structured channels and never scrapes
 
 - the Coordinator's own reports through MCP (`report`, `ask`, `complete`);
 - Rex `program_status` (OSC 7501), which the harness emits as `working`, `idle`, or `blocked`;
-- harness hooks: SessionStart records the resumable session ID and transcript path, Stop marks a turn's end, and UserPromptSubmit records human interventions.
+- harness hooks: SessionStart records the transcript path, Stop marks a turn's end, and UserPromptSubmit records human interventions.
 
-When an Agent's block disappears, rex-projects resumes a Coordinator with the harness's resume command in the same tab, a bounded number of times. For a helper Agent, it only notifies the Coordinator. It does not try to prove that the process has exited before releasing capacity. It records the process IDs it saw and shows anomalies to the human.
+The resumable session ID does not depend on hooks. rex-projects chooses Claude Code's ID at launch (`--session-id`). For Codex, it reads the ID from the session log whose working directory is the Agent's worktree.
+
+When an Agent's block disappears, rex-projects resumes a Coordinator with the harness's resume command in the Ticket's tab, recreating the tab if it closed, a bounded number of times. For a helper Agent, it only notifies the Coordinator. It does not try to prove that the process has exited before releasing capacity. It records the process IDs it saw and shows anomalies to the human.
+
+To fence a process that outlives its block, every launch of an Agent has a generation number, passed to the harness as `REXP_AGENT_LAUNCH`. The MCP server and hooks reject writes whose generation is not the Agent's latest, so an old process cannot change the Ticket after a new one resumes.
 
 ## Considered Options
 
@@ -25,4 +29,5 @@ The following must be verified on the target harness versions before M1:
 
 - whether Codex emits `program_status`. If it does not, hooks emit OSC 7501 instead;
 - whether Codex runs MCP servers and hooks outside its sandbox, so that they can write the state database;
-- whether resuming in the same tab continues the work.
+- whether the Codex session log reliably identifies the session by working directory;
+- whether resuming continues the work.

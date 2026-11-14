@@ -10,7 +10,13 @@ Messages to an Agent go into its inbox in the state database, and the Agent read
 2. When a human submits a prompt, the UserPromptSubmit hook adds unread messages as context.
 3. When the Agent is `idle` and has unread messages, `serve` types one fixed line, the wake token (for example `/rxp-inbox`), into its terminal.
 
-`serve` never types a message body, and it never types while the Agent is `blocked`, for example on a permission prompt. Replies never trigger further replies.
+`serve` never types a message body. It types the wake token only when all of these hold, rechecking them immediately before typing:
+
+- the Agent's status is `idle`, not `blocked` (for example on a permission prompt);
+- the Agent has been `idle` for at least 30 seconds, so a human who is mid-reply has time to submit;
+- the terminal's current input line is empty, read from the terminal screen right before typing.
+
+The check and the keystrokes are not atomic, so a short race window remains. If the token lands in a permission prompt or in a human's partial input, it is harmless text: the harness rejects it or the human sees it and deletes it, and the messages stay unread for the next attempt. Replies never trigger further replies.
 
 ## Considered Options
 
