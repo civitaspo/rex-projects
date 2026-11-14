@@ -1552,7 +1552,7 @@ impl ConfigStore {
             .ok_or("Rex anchor lifecycle is invalid")?;
         let now = now_unix()?;
         let changed = tx.execute(
-            "UPDATE rex_view_anchors SET lifecycle=?2,process_absent_confirmed=?3,terminal_at_unix=CASE WHEN ?2 IN ('completed','failed') THEN COALESCE(terminal_at_unix,?4) WHEN ?2='active' THEN NULL ELSE terminal_at_unix END WHERE view_id=?1 AND lifecycle!='closed' AND (lifecycle IN ('active','unknown') OR ?2='unknown' OR (?2='closed' AND process_absent_confirmed=1))",
+            "UPDATE rex_view_anchors SET lifecycle=?2,process_absent_confirmed=?3,terminal_at_unix=CASE WHEN ?2 IN ('completed','failed') THEN COALESCE(terminal_at_unix,?4) WHEN ?2='active' THEN NULL ELSE terminal_at_unix END WHERE view_id=?1 AND lifecycle!='closed' AND (lifecycle IN ('active','unknown') OR (lifecycle=?2 AND process_absent_confirmed=?3) OR ?2='unknown' OR (?2='closed' AND process_absent_confirmed=1))",
             params![view_id.as_str(),lifecycle,process_absent_confirmed,now],
         ).map_err(|error| error.to_string())?;
         if changed != 1 {
