@@ -1,4 +1,2 @@
-std = "lua51+rex"
-
 [rules]
 multiple_statements = "allow"

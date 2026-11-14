@@ -10,9 +10,6 @@ workflows:
     '.github/workflows/csm-ci-release.yml': []
     '.github/workflows/pull_request.yml': []
     '.github/workflows/push.yml': []
-    '.github/workflows/wc-build.yml':
-        - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
-        - 'jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c'
     '.github/workflows/wc-checks.yml':
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c'
