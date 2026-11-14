@@ -49,9 +49,11 @@ fn operational_supervisor_wakes_reach_inbox_and_dispatch_while_learning_stays_pe
         "batch_id": "learning-issued-fixture",
         "project_id": project_id.as_str()
     });
+    let mut bootstrap_message = dispatch_message("43", ticket_revision);
+    bootstrap_message.message_id = "supervisor-operational-wake-bootstrap".into();
     let mut fixture = crate::store::agent_results::host_validation_fixture::host_validated_result(
         Role::Supervisor,
-        dispatch_message("43", ticket_revision),
+        bootstrap_message,
     )
     .unwrap();
     fixture
@@ -206,10 +208,11 @@ fn operational_supervisor_wakes_reach_inbox_and_dispatch_while_learning_stays_pe
         .collect();
     let supervisor_run_id =
         crate::domain::ids::AgentRunId::parse("agent-supervisor-operational-wake-test").unwrap();
+    let fixture_root = std::fs::canonicalize(fixture._temp.path()).unwrap();
     let result_fixture =
         crate::store::agent_results::host_validation_fixture::host_validated_supervisor_result_in_with_wake_inputs(
             &mut fixture.store,
-            fixture._temp.path(),
+            &fixture_root,
             fixture.owner_generation,
             project_id.clone(),
             dispatch_message("43", ticket_revision),
@@ -218,21 +221,34 @@ fn operational_supervisor_wakes_reach_inbox_and_dispatch_while_learning_stays_pe
         )
         .unwrap();
     let binding = &result_fixture.ingested.validated.binding;
-    let control_dir: String = fixture
+    let reservation_json: String = fixture
         .store
         .test_connection()
         .query_row(
-            "SELECT control_dir FROM agent_launch_authority WHERE agent_run_id=?1",
+            "SELECT reservation_json FROM agent_launch_reservations WHERE agent_run_id=?1",
             [binding.agent_run_id.as_str()],
             |row| row.get(0),
         )
         .unwrap();
+    let reservation: crate::launch::AgentLaunchReservation =
+        serde_json::from_str(&reservation_json).unwrap();
+    // Host-result fixtures nest their mailbox; the production CLI shares the inbox root.
+    crate::mailbox::MailboxCapability::create(
+        binding.agent_run_id.as_str(),
+        &reservation.control_dir,
+        reservation.mailbox_expires_at_unix,
+        crate::mailbox::MailboxLimits {
+            max_request_bytes: reservation.mailbox_max_request_bytes as usize,
+            max_pending_requests: reservation.mailbox_max_pending_requests as usize,
+        },
+    )
+    .unwrap();
     let inbox_bytes = crate::cli::dispatch_agent_inbox_for_test(&[
         "rex-projects",
         "agent",
         "inbox",
         "--control-dir",
-        &control_dir,
+        reservation.control_dir.to_str().unwrap(),
         "--run",
         binding.agent_run_id.as_str(),
         "--json",
@@ -304,7 +320,7 @@ fn operational_supervisor_wakes_reach_inbox_and_dispatch_while_learning_stays_pe
         .store
         .test_connection()
         .query_row(
-            "SELECT ticket_run_id,ticket_revision FROM ticket_runs WHERE project_id=?1 AND ticket_id='43'",
+            "SELECT ticket_run_id,revision FROM ticket_runs WHERE project_id=?1 AND ticket_id='43'",
             [project_id.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
