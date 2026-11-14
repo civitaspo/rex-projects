@@ -52,6 +52,23 @@ pub enum Command {
         /// `session-start` or `user-prompt-submit`.
         event: String,
     },
+    /// Dispatch ready Tickets to Coordinators in Rex and watch them.
+    Serve {
+        #[arg(long, default_value_t = 2000)]
+        interval_ms: u64,
+        /// Run one reconcile-and-dispatch pass, then exit.
+        #[arg(long)]
+        once: bool,
+    },
+    /// Run Agents. Used by the Rex blocks that `serve` opens.
+    #[command(subcommand)]
+    Agent(AgentCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentCommand {
+    /// Prepare an Agent's files and replace this process with its harness.
+    Exec { agent_id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -102,6 +119,8 @@ pub enum TicketCommand {
         #[arg(long, default_value = "cancelled by a human")]
         reason: String,
     },
+    /// Remove the worktree and branch of an ended Ticket.
+    Cleanup { id: String },
 }
 
 #[derive(Debug, Args)]
@@ -212,6 +231,10 @@ pub fn run(cli: Cli) -> Result<()> {
             println!("rebuilt projections from the event log");
             Ok(())
         }
+        Command::Serve { interval_ms, once } => {
+            crate::serve::run(&paths, Duration::from_millis(interval_ms), once)
+        }
+        Command::Agent(AgentCommand::Exec { agent_id }) => crate::provider::exec(&paths, &agent_id),
     }
 }
 
@@ -318,6 +341,11 @@ fn ticket(paths: &Paths, command: TicketCommand) -> Result<()> {
                 },
             )?;
             println!("{id} is abandoned");
+        }
+        TicketCommand::Cleanup { id } => {
+            let config = Config::load(&paths.config_file())?;
+            crate::worktree::cleanup_ticket(paths, &config, &store, &id)?;
+            println!("removed the worktree of {id}");
         }
     }
     Ok(())
