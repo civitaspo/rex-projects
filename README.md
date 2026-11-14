@@ -21,6 +21,19 @@ rex-projects events --follow
 
 Run `rex-projects ui` for the Ticket dashboard. It lists Tickets by Project with the ones that need you first. Press Enter to jump to a Ticket's Coordinator, `r` to ready a backlog Ticket, `a` to show old finished Tickets, and `q` to quit.
 
+## Running Tickets
+
+`rex-projects serve` dispatches ready Tickets. Each one gets a git worktree under `${XDG_STATE_HOME:-~/.local/state}/rex-projects/worktrees/` and a Coordinator Agent in a Rex tab of the session `rxp:<project>`. Start it from the plugin's controller action, or run it in any Rex terminal.
+
+Agents run unattended, so give the provider the permission mode you want, for example:
+
+```toml
+[providers.claude]
+args = ["--permission-mode", "auto"]
+```
+
+Claude Code asks whether to trust each new folder, and that prompt would stop a Coordinator. Trust the worktrees directory once: run `claude` in `${XDG_STATE_HOME:-~/.local/state}/rex-projects/worktrees` and accept. New worktrees under it are then trusted. Codex needs the same directory in its trusted projects.
+
 ## Rex plugin
 
 Put `rex-projects` on the `PATH` of your login shell, then load the plugin from `~/.config/rex/init.lua`:
