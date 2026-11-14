@@ -1,0 +1,22 @@
+[package]
+name = "rex-projects"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/civitaspo/rex-projects"
+description = "Run cooperating coding Agents on many Projects at once inside Rex"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+clap = { version = "4", features = ["derive", "env"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true
