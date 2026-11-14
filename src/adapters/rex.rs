@@ -501,6 +501,13 @@ pub struct RexCapabilities {
     pub methods: BTreeSet<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RexBlockConfiguration {
+    Matches,
+    NotExposed,
+    Mismatch,
+}
+
 /// Authoritative startup identity returned by Rex, pinned for this controller
 /// lifetime. The endpoint is never inferred from environment variable names.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1430,46 +1437,84 @@ impl RexCliTransport {
             .map_err(|_| RexError::Protocol("Rex block capture is not UTF-8 text".into()))
     }
 
-    /// Confirm a recorded owned block still has its original terminal command configuration.
-    /// A matching label alone is insufficient because users can reuse terminal blocks.
-    pub fn agent_block_matches_spec(
+    pub(crate) fn observe_block_configuration(
         &self,
         window: &TicketWindow,
         spec: &AgentBlockSpec,
         block_id: &str,
-    ) -> Result<bool, RexError> {
+    ) -> Result<RexBlockConfiguration, RexError> {
         self.check_window(window)?;
         let expected = terminal_block(spec)?;
         let expected_label = owned_block_label(&spec.run_id)?;
         let view = self.session_view()?;
+        if view.get("session_id").and_then(Value::as_str) != Some(self.session_id.as_str()) {
+            return Err(RexError::Uncertain);
+        }
         let windows = view
             .get("windows")
             .and_then(Value::as_array)
             .ok_or_else(|| RexError::Protocol("session view has no windows".into()))?;
+        let occurrences = windows
+            .iter()
+            .filter_map(|window| window.get("layers").and_then(Value::as_array))
+            .flatten()
+            .filter_map(|layer| layer.get("blocks").and_then(Value::as_array))
+            .flatten()
+            .filter(|block| block.get("block_id").and_then(Value::as_str) == Some(block_id))
+            .count();
+        if occurrences != 1 {
+            return Ok(RexBlockConfiguration::Mismatch);
+        }
         let Some(window_value) = windows.iter().find(|value| {
             value.get("window_id").and_then(Value::as_str) == Some(window.window_id.as_str())
         }) else {
-            return Ok(false);
+            return Ok(RexBlockConfiguration::Mismatch);
         };
-        let actual = window_value
+        if window_value.get("label").and_then(Value::as_str) != Some(window.label.as_str()) {
+            return Ok(RexBlockConfiguration::Mismatch);
+        }
+        let blocks: Vec<_> = window_value
             .get("layers")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .filter_map(|layer| layer.get("blocks").and_then(Value::as_array))
             .flatten()
-            .find(|block| block.get("block_id").and_then(Value::as_str) == Some(block_id));
-        let Some(actual) = actual else {
-            return Ok(false);
+            .collect();
+        let matching: Vec<_> = blocks
+            .iter()
+            .filter(|block| block.get("block_id").and_then(Value::as_str) == Some(block_id))
+            .collect();
+        let [actual] = matching.as_slice() else {
+            return Ok(RexBlockConfiguration::Mismatch);
         };
         if actual.get("label").and_then(Value::as_str) != Some(expected_label.as_str())
             || actual.get("flavor") != expected.get("flavor")
-            || actual.get("options") != expected.get("options")
+            || blocks
+                .iter()
+                .filter(|block| {
+                    block.get("label").and_then(Value::as_str) == Some(expected_label.as_str())
+                })
+                .count()
+                != 1
+            || actual
+                .get("host_id")
+                .is_some_and(|host| host.as_str() != Some(self.capabilities.host_id.as_str()))
+            || actual
+                .get("creator_name")
+                .is_some_and(|creator| creator.as_str() != Some("com.superlogical.terminal"))
         {
-            return Ok(false);
+            return Ok(RexBlockConfiguration::Mismatch);
         }
+        let configuration = match actual.get("options") {
+            None => RexBlockConfiguration::NotExposed,
+            Some(options) if Some(options) == expected.get("options") => {
+                RexBlockConfiguration::Matches
+            }
+            Some(_) => RexBlockConfiguration::Mismatch,
+        };
         self.verify_identity()?;
-        Ok(true)
+        Ok(configuration)
     }
 
     /// Observe the verified block-scoped `terminal.process` action. Rex does
@@ -2653,7 +2698,7 @@ mod tests {
             path_prepend: vec![PathBuf::from("/usr/bin")],
         };
         let terminal = super::terminal_block(&spec).unwrap();
-        let view = serde_json::json!({"windows":[{"window_id":"window-1","label":window_label,"layers":[{"blocks":[{
+        let view = serde_json::json!({"session_id":"session-1","windows":[{"window_id":"window-1","label":window_label,"layers":[{"blocks":[{
             "block_id":"anchor-1",
             "label":owned_block_label(run_id).unwrap(),
             "flavor":terminal["flavor"],
@@ -2685,17 +2730,19 @@ mod tests {
             initial_block_id: Some("anchor-1".into()),
             disposition: CreateDisposition::Existing,
         };
-        assert!(
+        assert_eq!(
             transport
-                .agent_block_matches_spec(&window, &spec, "anchor-1")
-                .unwrap()
+                .observe_block_configuration(&window, &spec, "anchor-1")
+                .unwrap(),
+            super::RexBlockConfiguration::Matches
         );
         let mut changed = spec;
         changed.cwd = PathBuf::from("/tmp");
-        assert!(
-            !transport
-                .agent_block_matches_spec(&window, &changed, "anchor-1")
-                .unwrap()
+        assert_eq!(
+            transport
+                .observe_block_configuration(&window, &changed, "anchor-1")
+                .unwrap(),
+            super::RexBlockConfiguration::Mismatch
         );
     }
 

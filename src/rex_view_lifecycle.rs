@@ -1,8 +1,8 @@
 //! Reconciles persisted Rex views with exact windows and owned blocks.
 
 use crate::adapters::rex::{
-    AgentBlockSpec, CreateDisposition, RexCliTransport, RexWindow, WindowBlock,
-    owned_agent_block_label, owned_supervisor_window_label, owned_ticket_window_label,
+    AgentBlockSpec, CreateDisposition, RexBlockConfiguration, RexCliTransport, RexWindow,
+    WindowBlock, owned_agent_block_label, owned_supervisor_window_label, owned_ticket_window_label,
 };
 use crate::domain::ids::ProjectId;
 use crate::launch::{
@@ -93,6 +93,10 @@ pub(crate) fn record_created_view_anchor(
     let matching_label_count = blocks.iter().filter(|block| block.label == label).count();
     if matching_block_count != 1
         || matching_label_count != 1
+        || transport
+            .observe_block_configuration(window, spec, block_id)
+            .map_err(|error| error.to_string())?
+            == RexBlockConfiguration::Mismatch
         || !transport
             .agent_block_is_present(window, &spec.run_id, block_id)
             .map_err(|error| error.to_string())?
@@ -387,8 +391,9 @@ fn find_exact_anchor_block(
     let mut exact = Vec::new();
     for block in rex_blocks.iter().filter(|block| block.label == label) {
         if transport
-            .agent_block_matches_spec(window, spec, &block.block_id)
+            .observe_block_configuration(window, spec, &block.block_id)
             .map_err(|error| error.to_string())?
+            == RexBlockConfiguration::Matches
         {
             exact.push(block.block_id.clone());
         }
@@ -445,6 +450,20 @@ fn maintain_anchor(
         )?;
         return Ok(());
     }
+    let configuration = transport
+        .observe_block_configuration(window, spec, &anchor.block_id)
+        .map_err(|error| error.to_string())?;
+    if configuration == RexBlockConfiguration::Mismatch
+        || (configuration == RexBlockConfiguration::NotExposed && !is_one_shot_status_anchor(spec))
+    {
+        store.observe_rex_view_anchor(
+            owner_generation,
+            &anchor.view_id,
+            RexBlockLifecycle::Unknown,
+            false,
+        )?;
+        return Ok(());
+    }
     let observation = match transport.observe_process(window, &anchor.run_id, &anchor.block_id) {
         Ok(observation) => observation,
         Err(_) => {
@@ -457,10 +476,7 @@ fn maintain_anchor(
             return Ok(());
         }
     };
-    let absent = observation.last_exit.is_some()
-        && observation.child.is_none()
-        && observation.foreground.is_none()
-        && observation.ancestors.as_ref().is_some_and(Vec::is_empty);
+    let absent = anchor_process_absent(spec, &observation);
     let observed_lifecycle = match (absent, observation.last_exit.as_ref()) {
         (true, Some(exit)) if exit.exit_code == 0 => RexBlockLifecycle::Completed,
         (true, Some(_)) => RexBlockLifecycle::Failed,
@@ -513,6 +529,43 @@ fn maintain_anchor(
         }
     }
     Ok(())
+}
+
+fn is_one_shot_status_anchor(spec: &AgentBlockSpec) -> bool {
+    let [
+        binary,
+        config_flag,
+        config,
+        state_flag,
+        state,
+        command,
+        json_flag,
+    ] = spec.args.as_slice()
+    else {
+        return false;
+    };
+    spec.command == std::path::Path::new("/usr/bin/env")
+        && std::path::Path::new(binary).is_absolute()
+        && config_flag == "--config"
+        && std::path::Path::new(config).is_absolute()
+        && state_flag == "--state-root"
+        && std::path::Path::new(state).is_absolute()
+        && spec.cwd == std::path::Path::new(state)
+        && command == "status"
+        && json_flag == "--json"
+}
+
+fn anchor_process_absent(
+    spec: &AgentBlockSpec,
+    observation: &crate::adapters::rex::RexProcessObservation,
+) -> bool {
+    observation.last_exit.is_some()
+        && observation.child.is_none()
+        && observation.foreground.is_none()
+        && match observation.ancestors.as_ref() {
+            Some(ancestors) => ancestors.is_empty(),
+            None => is_one_shot_status_anchor(spec),
+        }
 }
 
 pub fn has_block_capacity(
@@ -685,12 +738,21 @@ fn close_archived_window_blocks(
                 .iter()
                 .find(|block| block.block_id == anchor.block_id)
             {
+                let configuration = transport
+                    .observe_block_configuration(window, spec, &anchor.block_id)
+                    .map_err(|error| error.to_string())?;
                 if block.label != anchor.owned_label
-                    || !transport
-                        .agent_block_matches_spec(window, spec, &anchor.block_id)
-                        .map_err(|error| error.to_string())?
+                    || configuration == RexBlockConfiguration::Mismatch
+                    || (configuration == RexBlockConfiguration::NotExposed
+                        && !is_one_shot_status_anchor(spec))
                 {
                     return Err("Rex view anchor identity changed before close".into());
+                }
+                let process = transport
+                    .observe_process(window, &anchor.run_id, &anchor.block_id)
+                    .map_err(|error| error.to_string())?;
+                if !anchor_process_absent(spec, &process) {
+                    return Err("Rex view anchor process absence is no longer confirmed".into());
                 }
                 let observed = transport
                     .capture_agent_block(window, &anchor.run_id, &anchor.block_id)
@@ -705,10 +767,8 @@ fn close_archived_window_blocks(
                     .close_agent_block(window, &anchor.run_id, &anchor.block_id)
                     .map_err(|error| error.to_string())?;
                 if transport
-                    .list_window_blocks(window, &window.label)
+                    .agent_block_is_present(window, &anchor.run_id, &anchor.block_id)
                     .map_err(|error| error.to_string())?
-                    .iter()
-                    .any(|block| block.block_id == anchor.block_id)
                 {
                     return Err("Rex view anchor remains after its close request".into());
                 }
@@ -874,7 +934,7 @@ mod tests {
                     "status".into(),
                     "--json".into(),
                 ],
-                cwd: root.clone(),
+                cwd: root.join("state"),
                 path_prepend: Vec::new(),
             };
             let block_id = "status-block";
@@ -914,6 +974,7 @@ mod tests {
                 serde_json::to_vec(&process).unwrap(),
             )
             .unwrap();
+            std::fs::write(root.join("capture.txt"), "rex-projects status output\n").unwrap();
             if preexisting {
                 std::fs::write(root.join("preexisting"), "").unwrap();
             }
@@ -926,10 +987,11 @@ case "$*" in
   *"whoami --json"*) printf '%s\n' '{"endpoint":"unix:///tmp/status-anchor.sock","instance_id":"fixture-instance","host_id":"fixture-host","rex_version":"fixture"}' ;;
   *"api list --json"*) printf '%s\n' '{"methods":{"session.view":{},"session.new_window":{},"session.new_split":{},"session.focus_block":{},"session.zoom_block":{},"block.close":{}}}' ;;
   *"api call session.view"*)
-    if [ -f "$fixture_dir/preexisting" ] || [ -f "$fixture_dir/created" ]; then /bin/cat "$fixture_dir/inventory.json"; else /bin/cat "$fixture_dir/empty-inventory.json"; fi ;;
+    if [ -f "$fixture_dir/closed" ]; then /bin/cat "$fixture_dir/empty-inventory.json"; elif [ -f "$fixture_dir/preexisting" ] || [ -f "$fixture_dir/created" ]; then /bin/cat "$fixture_dir/inventory.json"; else /bin/cat "$fixture_dir/empty-inventory.json"; fi ;;
   *"api call session.new_window"*) : > "$fixture_dir/created"; printf '%s\n' '{"window_id":"status-window","block_ids":["status-block"]}' ;;
+  *"api call block.close"*) printf '%s\n' "$*" > "$fixture_dir/closed"; printf '{}\n' ;;
   *"terminal.process"*) : > "$fixture_dir/process-observed"; /bin/cat "$fixture_dir/process.json" ;;
-  *"capture"*) printf 'rex-projects status output\n' ;;
+  *"capture"*) /bin/cat "$fixture_dir/capture.txt" ;;
   *) exit 3 ;;
 esac
 "#,
@@ -1014,6 +1076,27 @@ esac
                 Some(&self.spec),
             )
             .unwrap();
+        }
+
+        fn update_inventory(&self, update: impl FnOnce(&mut serde_json::Value)) {
+            let path = self.root.join("inventory.json");
+            let mut inventory = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            update(&mut inventory);
+            std::fs::write(path, serde_json::to_vec(&inventory).unwrap()).unwrap();
+        }
+
+        fn close_archived_anchor(&mut self) -> Result<(), String> {
+            close_archived_window_blocks(
+                &mut self.terminal.store,
+                self.terminal.owner_generation,
+                &self.window,
+                &self.transport,
+                &RexViewCleanupCandidate {
+                    view: self.view.view.clone(),
+                    close_after_unix: 100,
+                },
+                Some(&self.spec),
+            )
         }
     }
 
@@ -1175,11 +1258,25 @@ esac
 
     #[cfg(unix)]
     #[test]
-    fn omitted_process_ancestry_keeps_a_proven_status_anchor_unknown() {
+    fn actual_rex_process_shape_archives_a_proven_one_shot_status_anchor() {
         let mut fixture = StatusAnchorFixture::new(
             serde_json::json!({"last_exit":{"exit_code":0},"home":"/fixture/home"}),
             false,
         );
+        let run_id = fixture.terminal.terminal.agent_run_id().clone();
+        let authority = fixture
+            .terminal
+            .store
+            .agent_launch_authority(&run_id)
+            .unwrap();
+        let reservation = fixture
+            .terminal
+            .store
+            .agent_launch_reservation_for_run(&run_id)
+            .unwrap();
+        let occupied_slots = ConfigStore::status(fixture.terminal._temp.path())
+            .unwrap()
+            .occupied_slots;
         fixture.record_created();
         assert!(
             fixture
@@ -1199,9 +1296,233 @@ esac
             .rex_view_anchor(&fixture.view.view.view_id)
             .unwrap()
             .unwrap();
+        assert_eq!(anchor.lifecycle, RexBlockLifecycle::Completed);
+        assert!(anchor.process_absent_confirmed);
+        assert!(anchor.archive_digest.is_some());
+        assert!(!fixture.root.join("closed").exists());
+
+        fixture.close_archived_anchor().unwrap();
+
+        assert_eq!(
+            fixture
+                .terminal
+                .store
+                .rex_view_anchor(&fixture.view.view.view_id)
+                .unwrap()
+                .unwrap()
+                .lifecycle,
+            RexBlockLifecycle::Closed
+        );
+        let close_request = std::fs::read_to_string(fixture.root.join("closed")).unwrap();
+        assert!(close_request.contains("\"block_id\":\"status-block\""));
+        assert!(!fixture.transport.window_exists(&fixture.window).unwrap());
+        assert_eq!(
+            fixture
+                .terminal
+                .store
+                .agent_launch_authority(&run_id)
+                .unwrap(),
+            authority
+        );
+        assert_eq!(
+            fixture
+                .terminal
+                .store
+                .agent_launch_reservation_for_run(&run_id)
+                .unwrap(),
+            reservation
+        );
+        assert_eq!(
+            ConfigStore::status(fixture.terminal._temp.path())
+                .unwrap()
+                .occupied_slots,
+            occupied_slots
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_anchor_with_live_or_incomplete_process_evidence_is_not_archived_or_closed() {
+        let process = serde_json::json!({"pid":42,"user_id":501,"name":"running"});
+        for observation in [
+            serde_json::json!({"last_exit":null}),
+            serde_json::json!({}),
+            serde_json::json!({"last_exit":{"exit_code":0},"child":process}),
+            serde_json::json!({"last_exit":{"exit_code":0},"foreground":process}),
+            serde_json::json!({"last_exit":{"exit_code":0},"ancestors":[process]}),
+        ] {
+            let mut fixture = StatusAnchorFixture::new(observation.clone(), false);
+            fixture.record_created();
+            fixture.maintain();
+            fixture.close_archived_anchor().unwrap();
+            let anchor = fixture
+                .terminal
+                .store
+                .rex_view_anchor(&fixture.view.view.view_id)
+                .unwrap()
+                .unwrap();
+            assert!(!anchor.process_absent_confirmed, "{observation}");
+            assert!(anchor.archive_digest.is_none(), "{observation}");
+            assert!(!fixture.root.join("closed").exists(), "{observation}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn omitted_rex_fields_do_not_complete_other_anchor_commands() {
+        for change in [
+            "command", "binary", "config", "state", "cwd", "extra", "status",
+        ] {
+            let mut fixture =
+                StatusAnchorFixture::new(serde_json::json!({"last_exit":{"exit_code":0}}), false);
+            match change {
+                "command" => fixture.spec.command = "/bin/sh".into(),
+                "binary" => fixture.spec.args[0] = "rex-projects".into(),
+                "config" => fixture.spec.args[2] = "config.toml".into(),
+                "state" => fixture.spec.args[4] = "state".into(),
+                "cwd" => fixture.spec.cwd = fixture.root.clone(),
+                "extra" => fixture.spec.args.push("extra".into()),
+                "status" => fixture.spec.args[5] = "runtime".into(),
+                _ => unreachable!(),
+            }
+            fixture.record_created();
+            fixture.maintain();
+            let anchor = fixture
+                .terminal
+                .store
+                .rex_view_anchor(&fixture.view.view.view_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(anchor.lifecycle, RexBlockLifecycle::Unknown, "{change}");
+            assert!(!anchor.process_absent_confirmed, "{change}");
+            assert!(anchor.archive_digest.is_none(), "{change}");
+            assert!(!fixture.root.join("closed").exists(), "{change}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_anchor_refuses_exposed_conflicting_or_malformed_options() {
+        for options in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"command":["other"]}),
+            serde_json::json!([]),
+        ] {
+            let mut fixture =
+                StatusAnchorFixture::new(serde_json::json!({"last_exit":{"exit_code":0}}), false);
+            fixture.record_created();
+            fixture.update_inventory(|inventory| {
+                inventory["windows"][0]["layers"][0]["blocks"][0]["options"] = options
+            });
+            fixture.maintain();
+            let anchor = fixture
+                .terminal
+                .store
+                .rex_view_anchor(&fixture.view.view.view_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(anchor.lifecycle, RexBlockLifecycle::Unknown);
+            assert!(!anchor.process_absent_confirmed);
+            assert!(anchor.archive_digest.is_none());
+            fixture.close_archived_anchor().unwrap();
+            assert!(!fixture.root.join("closed").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_anchor_with_duplicate_block_id_in_another_window_stays_unknown() {
+        let mut fixture =
+            StatusAnchorFixture::new(serde_json::json!({"last_exit":{"exit_code":0}}), false);
+        fixture.record_created();
+        fixture.update_inventory(|inventory| {
+            let mut duplicate = inventory["windows"][0].clone();
+            duplicate["window_id"] = "different-window".into();
+            duplicate["label"] = "unrelated".into();
+            inventory["windows"].as_array_mut().unwrap().push(duplicate);
+        });
+
+        fixture.maintain();
+
+        let anchor = fixture
+            .terminal
+            .store
+            .rex_view_anchor(&fixture.view.view.view_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(anchor.lifecycle, RexBlockLifecycle::Unknown);
         assert!(!anchor.process_absent_confirmed);
         assert!(anchor.archive_digest.is_none());
+        fixture.close_archived_anchor().unwrap();
+        assert!(!fixture.root.join("closed").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archived_status_anchor_rechecks_identity_process_and_output_before_close() {
+        for change in [
+            "label",
+            "duplicate",
+            "block",
+            "other-window",
+            "session",
+            "host",
+            "creator",
+            "options",
+            "output",
+            "process",
+        ] {
+            let mut fixture =
+                StatusAnchorFixture::new(serde_json::json!({"last_exit":{"exit_code":0}}), false);
+            fixture.record_created();
+            fixture.maintain();
+            match change {
+                "output" => {
+                    std::fs::write(fixture.root.join("capture.txt"), "changed output").unwrap()
+                }
+                "process" => std::fs::write(
+                    fixture.root.join("process.json"),
+                    r#"{"last_exit":null,"child":{"pid":42,"user_id":501,"name":"running"}}"#,
+                )
+                .unwrap(),
+                _ => fixture.update_inventory(|inventory| {
+                    if change == "session" {
+                        inventory["session_id"] = "different-session".into();
+                        return;
+                    }
+                    if change == "other-window" {
+                        let mut duplicate = inventory["windows"][0].clone();
+                        duplicate["window_id"] = "different-window".into();
+                        duplicate["label"] = "unrelated".into();
+                        inventory["windows"].as_array_mut().unwrap().push(duplicate);
+                        return;
+                    }
+                    let blocks = inventory["windows"][0]["layers"][0]["blocks"]
+                        .as_array_mut()
+                        .unwrap();
+                    match change {
+                        "label" => blocks[0]["label"] = "unrelated".into(),
+                        "duplicate" => {
+                            let mut duplicate = blocks[0].clone();
+                            duplicate["block_id"] = "different-block".into();
+                            blocks.push(duplicate);
+                        }
+                        "block" => {
+                            let mut duplicate = blocks[0].clone();
+                            duplicate["label"] = "unrelated".into();
+                            blocks.push(duplicate);
+                        }
+                        "host" => blocks[0]["host_id"] = "different-host".into(),
+                        "creator" => blocks[0]["creator_name"] = "different-creator".into(),
+                        "options" => blocks[0]["options"] = serde_json::Value::Null,
+                        _ => unreachable!(),
+                    }
+                }),
+            }
+            assert!(fixture.close_archived_anchor().is_err(), "{change}");
+            assert!(!fixture.root.join("closed").exists(), "{change}");
+        }
     }
 
     #[cfg(unix)]
