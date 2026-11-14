@@ -96,6 +96,9 @@ pub struct Serve<R: Rex> {
     launch_failures: HashMap<String, (u32, Instant)>,
     /// The first retry delay after a failed launch; it doubles each time.
     pub retry_delay: Duration,
+    /// Set after a failed launch: close done Tickets' panes without waiting
+    /// for their retention, since they may hold the PTYs a launch needs.
+    release_done_panes: bool,
 }
 
 impl<R: Rex> Serve<R> {
@@ -108,6 +111,7 @@ impl<R: Rex> Serve<R> {
             rotation: 0,
             launch_failures: HashMap::new(),
             retry_delay: Duration::from_secs(10),
+            release_done_panes: false,
         }
     }
 
@@ -120,6 +124,7 @@ impl<R: Rex> Serve<R> {
                 println!("{}: reconcile failed: {err:#}", agent.id);
             }
         }
+        self.release_done_panes = false;
         self.ensure_coordinators()?;
         self.dispatch(config)?;
         self.ensure_coordinators()
@@ -162,6 +167,7 @@ impl<R: Rex> Serve<R> {
             if let Err(err) = self.launch(&agent, &ticket, resume) {
                 let count = failures.map_or(1, |(count, _)| count + 1);
                 println!("{}: launch attempt {count} failed: {err:#}", agent.id);
+                self.release_done_panes = true;
                 if count >= MAX_LAUNCH_FAILURES {
                     self.launch_failures.remove(&ticket.id);
                     self.fail(&ticket.id, &format!("launch failed {count} times: {err:#}"))?;
@@ -196,8 +202,10 @@ impl<R: Rex> Serve<R> {
             return Ok(());
         }
         let done_long_ago = ticket.state == TicketState::Done
-            && chrono::DateTime::parse_from_rfc3339(&ticket.updated_at)
-                .is_ok_and(|at| chrono::Utc::now().signed_duration_since(at) > DONE_PANE_RETENTION);
+            && (self.release_done_panes
+                || chrono::DateTime::parse_from_rfc3339(&ticket.updated_at).is_ok_and(|at| {
+                    chrono::Utc::now().signed_duration_since(at) > DONE_PANE_RETENTION
+                }));
         if done_long_ago || matches!(ticket.state, TicketState::Abandoned | TicketState::Failed) {
             self.rex.close_block(session, block)?;
             self.append(Event::AgentExited {
@@ -696,6 +704,50 @@ mod tests {
         }
         assert_eq!(f.state(), TicketState::Failed);
         assert_eq!(f.agent().launches, 0);
+    }
+
+    #[test]
+    fn a_failed_launch_releases_done_panes() {
+        let mut f = fixture();
+        f.serve.retry_delay = Duration::ZERO;
+        f.tick();
+        f.serve
+            .store
+            .append(
+                "demo-1-coordinator",
+                Event::TicketCompleted {
+                    ticket_id: "demo-1".into(),
+                    outcome: Outcome::Delivered,
+                    summary: "ok".into(),
+                    artifacts: Vec::new(),
+                },
+            )
+            .unwrap();
+        f.serve
+            .store
+            .create_ticket(
+                "human",
+                NewTicket {
+                    project_id: "demo".into(),
+                    title: "Next".into(),
+                    ready: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        f.serve.rex.fail_new_window = true;
+        f.tick();
+        assert_eq!(
+            f.serve.rex.blocks.len(),
+            1,
+            "done pane kept until a launch fails"
+        );
+        f.serve.rex.fail_new_window = false;
+        f.tick();
+        let next = f.serve.store.agent("demo-2-coordinator").unwrap().unwrap();
+        assert_eq!(next.state, "running");
+        assert_eq!(f.agent().state, "exited", "the done pane was closed");
+        assert_eq!(f.serve.rex.blocks.len(), 1);
     }
 
     #[test]
