@@ -2044,7 +2044,7 @@ mod machine_shutdown_host_process_tests {
             executable: PathBuf::from("/bin/sh"),
             args: vec![
                 OsString::from("-c"),
-                OsString::from("printf 'invoked\\n' >> \"$MARKER\"; printf 'fixed result'"),
+                OsString::from("printf 'fixed result'; printf 'invoked\\n' >> \"$MARKER\""),
             ],
             stdin: Vec::new(),
             cwd: None,
@@ -2146,6 +2146,10 @@ mod machine_shutdown_host_process_tests {
             );
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !marker.exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let issues = loop {
             let issues = services
                 .machine_shutdown_tick(&mut store, generation, 20, 21)
@@ -4673,9 +4677,7 @@ impl RuntimeServices {
             let host_jobs = self.delivery.host_jobs();
             match host_jobs.lock() {
                 Ok(mut pool) => {
-                    if let Err(error) =
-                        pool.drain_finished_processes(store, owner_generation, now_unix)
-                    {
+                    if let Err(error) = pool.request_shutdown(store, owner_generation, now_unix) {
                         issues.push(format!("host process result collection: {error}"));
                     }
                 }

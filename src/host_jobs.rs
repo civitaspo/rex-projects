@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
@@ -162,6 +163,7 @@ pub enum HostJobProgress {
 struct ActiveJob {
     lane_id: String,
     worker: Option<JoinHandle<()>>,
+    stop: Option<Arc<AtomicBool>>,
     recovered: bool,
     _worktree_lease: Option<Arc<WorktreeLease>>,
 }
@@ -331,6 +333,7 @@ impl HostJobPool {
                     ActiveJob {
                         lane_id: intent.lane_id.clone(),
                         worker: None,
+                        stop: None,
                         recovered: true,
                         _worktree_lease: worktree_lease,
                     },
@@ -354,6 +357,7 @@ impl HostJobPool {
                             ActiveJob {
                                 lane_id: intent.lane_id.clone(),
                                 worker: None,
+                                stop: None,
                                 recovered: true,
                                 _worktree_lease: worktree_lease,
                             },
@@ -372,6 +376,7 @@ impl HostJobPool {
                             ActiveJob {
                                 lane_id: intent.lane_id.clone(),
                                 worker: None,
+                                stop: None,
                                 recovered: true,
                                 _worktree_lease: worktree_lease,
                             },
@@ -408,6 +413,7 @@ impl HostJobPool {
                             ActiveJob {
                                 lane_id: intent.lane_id.clone(),
                                 worker: None,
+                                stop: None,
                                 recovered: true,
                                 _worktree_lease: worktree_lease,
                             },
@@ -503,6 +509,7 @@ impl HostJobPool {
             .or_insert(ActiveJob {
                 lane_id: intent.lane_id.clone(),
                 worker: None,
+                stop: None,
                 recovered: true,
                 _worktree_lease: worktree_lease,
             });
@@ -540,6 +547,58 @@ impl HostJobPool {
         now_unix: i64,
     ) -> Result<(), String> {
         self.drain_events(store, owner_generation, now_unix)
+    }
+
+    pub fn request_shutdown(
+        &mut self,
+        store: &mut ConfigStore,
+        owner_generation: u64,
+        now_unix: i64,
+    ) -> Result<(), String> {
+        for active in self.active.values() {
+            if let Some(stop) = &active.stop {
+                stop.store(true, Ordering::Relaxed);
+            }
+        }
+        self.drain_events(store, owner_generation, now_unix)?;
+        let records = store.host_jobs_in_states(&[
+            HostJobState::Starting,
+            HostJobState::Running,
+            HostJobState::Unknown {
+                reason: String::new(),
+            },
+        ])?;
+        for record in records {
+            if record.process_receipt.is_some()
+                || self
+                    .active
+                    .get(&record.intent.job_id)
+                    .is_some_and(|active| {
+                        active
+                            .worker
+                            .as_ref()
+                            .is_some_and(|worker| !worker.is_finished())
+                    })
+            {
+                continue;
+            }
+            let Some(identity) = record
+                .process_identity
+                .as_ref()
+                .filter(|identity| is_exact_identity(identity))
+            else {
+                continue;
+            };
+            let current = process::inspect_process_table().map_err(|error| error.to_string())?;
+            process::signal_process_group_if_observed(
+                identity.process_group_id,
+                std::slice::from_ref(identity),
+                &current,
+                process::ProcessSignal::Terminate,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     fn slot_available(&self, store: &ConfigStore, intent: &HostJobIntent) -> Result<bool, String> {
@@ -582,19 +641,25 @@ impl HostJobPool {
         let worker_intent = intent.clone();
         let sender = self.sender.clone();
         let worker_lease = worktree_lease.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
         let worker = thread::Builder::new()
             .name(format!("rex-host-job-{}", short_id(&job_id)))
             .spawn(move || {
                 let _worktree_lease = worker_lease;
                 let started_sender = sender.clone();
                 let mut process_identity = None;
-                let result = process::run_with_started_identity(request, |identity| {
-                    process_identity = Some(identity.clone());
-                    let _ = started_sender.send(WorkerEvent::Started {
-                        job_id: started_job_id.clone(),
-                        identity,
-                    });
-                });
+                let result = process::run_with_started_identity_and_stop(
+                    request,
+                    |identity| {
+                        process_identity = Some(identity.clone());
+                        let _ = started_sender.send(WorkerEvent::Started {
+                            job_id: started_job_id.clone(),
+                            identity,
+                        });
+                    },
+                    &worker_stop,
+                );
                 match result {
                     Ok(output) => {
                         let receipt = HostProcessReceipt {
@@ -635,6 +700,7 @@ impl HostJobPool {
             ActiveJob {
                 lane_id: intent.lane_id.clone(),
                 worker: Some(worker),
+                stop: Some(stop),
                 recovered: false,
                 _worktree_lease: worktree_lease,
             },
@@ -1222,6 +1288,115 @@ mod pool_tests {
                 base_sha: "base".into(),
             })
             .unwrap()
+    }
+
+    #[test]
+    fn shutdown_stops_running_worker_and_keeps_unidentified_claim() {
+        let mut store = crate::store::host_jobs::in_memory_test_store();
+        let mut pool = HostJobPool::new(2, 2).unwrap();
+        let mut job = intent("shutdown-running", "project", "lane");
+        job.kind = HostJobKind::OperationAdapter;
+        job.max_attempts = 1;
+        job.operation_method = Some(crate::store::host_jobs::OperationMethod::Invoke);
+        let mut unknown = intent("shutdown-unknown", "project", "other-lane");
+        unknown.kind = HostJobKind::OperationAdapter;
+        unknown.max_attempts = 1;
+        unknown.operation_method = Some(crate::store::host_jobs::OperationMethod::Invoke);
+        store.enqueue_host_job(1, &unknown, 1).unwrap();
+        assert!(store.start_host_job(1, &unknown.job_id, 2).unwrap());
+        let mut command = request();
+        command.executable = PathBuf::from("/bin/sh");
+        command.args = vec![
+            "-c".into(),
+            "trap 'exit 0' TERM; while :; do :; done".into(),
+        ];
+        command.timeout = Duration::from_secs(30);
+        assert_eq!(
+            pool.submit_or_poll(&mut store, 1, &job, command, None, 3)
+                .unwrap(),
+            HostJobProgress::Running
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            pool.poll(&mut store, 1, 4).unwrap();
+            if store
+                .host_job(&job.job_id)
+                .unwrap()
+                .unwrap()
+                .process_identity
+                .is_some()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        loop {
+            pool.request_shutdown(&mut store, 1, 5).unwrap();
+            if store
+                .host_job(&job.job_id)
+                .unwrap()
+                .unwrap()
+                .process_receipt
+                .is_some()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let record = store.host_job(&job.job_id).unwrap().unwrap();
+        assert!(record.process_receipt.unwrap().cleanup_confirmed);
+        assert!(matches!(
+            store.host_job(&unknown.job_id).unwrap().unwrap().state,
+            HostJobState::Starting
+        ));
+        assert!(
+            store
+                .host_job(&unknown.job_id)
+                .unwrap()
+                .unwrap()
+                .process_receipt
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn shutdown_retains_claim_when_process_identity_cannot_be_confirmed() {
+        let mut store = crate::store::host_jobs::in_memory_test_store();
+        let mut pool = HostJobPool::new(2, 2).unwrap();
+        let mut job = intent("shutdown-mismatch", "project", "lane");
+        job.kind = HostJobKind::OperationAdapter;
+        job.operation_method = Some(crate::store::host_jobs::OperationMethod::Invoke);
+        job.max_attempts = 1;
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let identity = ProcessIdentity {
+            pid: child.id(),
+            parent_pid: std::process::id(),
+            process_group_id: child.id(),
+            start_identity: "different-birth-token".into(),
+            command: "sleep".into(),
+            quality: process::ProcessIdentityQuality::KernelBirthToken,
+        };
+        store.enqueue_host_job(1, &job, 1).unwrap();
+        assert!(store.start_host_job(1, &job.job_id, 2).unwrap());
+        assert!(
+            store
+                .mark_host_job_running(1, &job.job_id, &identity, 3)
+                .unwrap()
+        );
+        let result = pool.request_shutdown(&mut store, 1, 4);
+        let still_running = child.try_wait().unwrap().is_none();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        result.unwrap();
+        assert!(still_running);
+        let record = store.host_job(&job.job_id).unwrap().unwrap();
+        assert!(matches!(record.state, HostJobState::Running));
+        assert!(record.process_receipt.is_none());
     }
 
     #[test]

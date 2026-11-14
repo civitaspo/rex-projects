@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -178,13 +179,13 @@ impl std::error::Error for ProcessError {
 }
 
 pub fn run(request: ProcessRequest) -> Result<ProcessOutput, ProcessError> {
-    run_inner(request, |_| {}, false, false)
+    run_inner(request, |_| {}, false, false, None)
 }
 
 /// Run a child in a new session with no controlling terminal. The child's process group remains
 /// isolated under its PID, so the existing process-group cleanup still owns its descendants.
 pub fn run_in_new_session(request: ProcessRequest) -> Result<ProcessOutput, ProcessError> {
-    run_inner(request, |_| {}, false, true)
+    run_inner(request, |_| {}, false, true, None)
 }
 
 /// Run a child while reporting its kernel identity before waiting for completion.
@@ -193,7 +194,15 @@ pub fn run_with_started_identity(
     request: ProcessRequest,
     on_started: impl FnOnce(ProcessIdentity),
 ) -> Result<ProcessOutput, ProcessError> {
-    run_inner(request, on_started, true, false)
+    run_inner(request, on_started, true, false, None)
+}
+
+pub(crate) fn run_with_started_identity_and_stop(
+    request: ProcessRequest,
+    on_started: impl FnOnce(ProcessIdentity),
+    stop: &AtomicBool,
+) -> Result<ProcessOutput, ProcessError> {
+    run_inner(request, on_started, true, false, Some(stop))
 }
 
 fn run_inner(
@@ -201,6 +210,7 @@ fn run_inner(
     on_started: impl FnOnce(ProcessIdentity),
     require_started_identity: bool,
     new_session: bool,
+    stop: Option<&AtomicBool>,
 ) -> Result<ProcessOutput, ProcessError> {
     validate(&request)?;
     let mut command = Command::new(&request.executable);
@@ -317,7 +327,7 @@ fn run_inner(
                 });
             }
         }
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
             timed_out = true;
             break None;
         }
