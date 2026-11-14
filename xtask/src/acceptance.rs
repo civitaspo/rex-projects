@@ -373,12 +373,7 @@ pub fn run(request: Request<'_>) -> Result<(), String> {
     let config_path = request.fixture_root.join("config.toml");
     fs::write(
         &config_path,
-        config_text_for_stage(
-            &request,
-            &executable,
-            native_worker_stage,
-            request_merge_stage,
-        ),
+        config_text_for_stage(&request, &executable, stage.as_deref()),
     )
     .map_err(|error| format!("write fixture config: {error}"))?;
     let seeded_ticket = seed_operations_ticket(&request, &executable)?;
@@ -3906,19 +3901,17 @@ impl FixtureMessageExt for Value {
     }
 }
 
-#[cfg(test)]
-fn config_text(request: &Request<'_>, executable: &Path, native_stage: bool) -> String {
-    config_text_for_stage(request, executable, native_stage, false)
-}
-
-fn config_text_for_stage(
-    request: &Request<'_>,
-    executable: &Path,
-    native_stage: bool,
-    request_merge_stage: bool,
-) -> String {
+fn config_text_for_stage(request: &Request<'_>, executable: &Path, stage: Option<&str>) -> String {
     let db = request.fixture_root.join("tickets.sqlite");
-    let native_runtime_limits = if native_stage {
+    let request_merge_stage = stage == Some(REQUEST_MERGE_STAGE);
+    let compact_runtime_limits = if matches!(
+        stage,
+        Some(
+            COORDINATOR_PROGRESS_INSTRUCTION_STAGE
+                | NATIVE_WORKER_BLOCK_LOSS_STAGE
+                | NATIVE_WORKER_MISSED_EVENT_BLOCK_LOSS_STAGE
+        )
+    ) {
         "max_agent_runs = 1\nmax_blocks_per_tab = 2\ncompleted_blocks_to_keep = 0\n"
     } else {
         ""
@@ -3993,7 +3986,7 @@ command = [{:?}, "fixture", "operations", "--state-dir", {:?}, "--observe-status
 "#,
         request.fixture_root.join("state").display().to_string(),
         request.rex.display().to_string(),
-        native_runtime_limits,
+        compact_runtime_limits,
         executable.display().to_string(),
         db.display().to_string(),
         if request_merge_stage {
@@ -7121,7 +7114,7 @@ esac
         .unwrap();
         fs::write(
             fixture.join("config.toml"),
-            config_text(&request, &xtask_executable, false),
+            config_text_for_stage(&request, &xtask_executable, None),
         )
         .unwrap();
         let applied = product(&request, &state_root, &["config", "apply", "--bootstrap"]).unwrap();
@@ -7481,7 +7474,7 @@ esac
         let config_path = fixture.join("config.toml");
         fs::write(
             &config_path,
-            config_text(&config_request, &xtask_executable, false),
+            config_text_for_stage(&config_request, &xtask_executable, None),
         )
         .unwrap();
         let mut store = rex_projects::store::ConfigStore::open(&state_root).unwrap();
@@ -8237,7 +8230,7 @@ esac
         let config_path = fixture_root.join("config.toml");
         fs::write(
             &config_path,
-            config_text_for_stage(&request, &executable, false, true),
+            config_text_for_stage(&request, &executable, Some(REQUEST_MERGE_STAGE)),
         )
         .unwrap();
 
@@ -8316,7 +8309,9 @@ esac
             &resolve_test_references(intent.recipe.structured_result.clone()),
         )
         .unwrap();
-        assert!(config_text(&request, &executable, false).contains("executor = \"direct\""));
+        assert!(
+            config_text_for_stage(&request, &executable, None).contains("executor = \"direct\"")
+        );
     }
 
     #[test]
@@ -8522,7 +8517,7 @@ esac
         prepare_profiles(&request, &executable, &cli, ProfilePreparation::default()).unwrap();
         fs::write(
             root.join("config.toml"),
-            config_text(&request, &executable, true),
+            config_text_for_stage(&request, &executable, Some(NATIVE_WORKER_BLOCK_LOSS_STAGE)),
         )
         .unwrap();
         let state_root = root.join("state");
@@ -9628,7 +9623,7 @@ esac
         .unwrap();
         fs::write(
             root.join("config.toml"),
-            config_text(&request, &executable, false),
+            config_text_for_stage(&request, &executable, None),
         )
         .unwrap();
 
@@ -9688,7 +9683,7 @@ esac
             .unwrap();
             fs::write(
                 root.join("config.toml"),
-                config_text(&request, &executable, false),
+                config_text_for_stage(&request, &executable, None),
             )
             .unwrap();
             let applied = rex_projects::config::load(&root.join("config.toml")).unwrap();
@@ -10143,16 +10138,21 @@ esac
         )
         .unwrap();
         let config = root.join("config.toml");
-        fs::write(&config, config_text(&request, &executable, false)).unwrap();
+        fs::write(&config, config_text_for_stage(&request, &executable, None)).unwrap();
         rex_projects::config::load(&config).unwrap();
     }
 
     #[test]
-    fn generated_native_config_selects_native_worker_capacity_and_low_retention_without_changing_defaults()
-     {
-        for (native_stage, expected_max_agent_runs, expected_max_blocks, expected_completed_keep) in
-            [(false, 8, 8, 1), (true, 1, 2, 0)]
-        {
+    fn generated_stage_config_limits_progress_instruction_and_native_worker_resource_retention() {
+        for (stage, expected_max_agent_runs, expected_max_blocks, expected_completed_keep) in [
+            (None, 8, 8, 1),
+            (Some(COORDINATOR_INBOX_STAGE), 8, 8, 1),
+            (Some(COORDINATOR_PROGRESS_INSTRUCTION_STAGE), 1, 2, 0),
+            (Some(WORKER_RECOVERY_INBOX_STAGE), 8, 8, 1),
+            (Some(REQUEST_MERGE_STAGE), 8, 8, 1),
+            (Some(NATIVE_WORKER_BLOCK_LOSS_STAGE), 1, 2, 0),
+            (Some(NATIVE_WORKER_MISSED_EVENT_BLOCK_LOSS_STAGE), 1, 2, 0),
+        ] {
             let temporary = tempfile::tempdir().unwrap();
             let root = temporary.path().join("acceptance");
             fs::create_dir(&root).unwrap();
@@ -10175,22 +10175,22 @@ esac
             let config_path = root.join("config.toml");
             fs::write(
                 &config_path,
-                config_text(&request, &executable, native_stage),
+                config_text_for_stage(&request, &executable, stage),
             )
             .unwrap();
 
             let loaded = rex_projects::config::load(&config_path).unwrap();
             assert_eq!(
                 loaded.config.runtime.max_agent_runs, expected_max_agent_runs,
-                "native_stage={native_stage}"
+                "stage={stage:?}"
             );
             assert_eq!(
                 loaded.config.runtime.max_blocks_per_tab, expected_max_blocks,
-                "native_stage={native_stage}"
+                "stage={stage:?}"
             );
             assert_eq!(
                 loaded.config.runtime.completed_blocks_to_keep, expected_completed_keep,
-                "native_stage={native_stage}"
+                "stage={stage:?}"
             );
         }
     }
