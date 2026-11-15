@@ -10,6 +10,9 @@ description = "Run cooperating coding Agents on many Projects at once inside Rex
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 clap = { version = "4", features = ["derive", "env"] }
+jaq-core = "3.1.2"
+jaq-json = "2.0.3"
+jaq-std = "3.0.4"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

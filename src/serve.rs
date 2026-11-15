@@ -14,6 +14,7 @@ use crate::paths::Paths;
 use crate::provider;
 use crate::rex::{Rex, RexCli};
 use crate::store::Store;
+use crate::tracker::TrackerSync;
 use crate::worktree;
 
 /// How many times a Coordinator is resumed after its block disappears.
@@ -307,16 +308,39 @@ pub fn run(paths: &Paths, interval: Duration, once: bool) -> Result<()> {
     let store = Store::open(&paths.db_file())?;
     let exe = std::env::current_exe().context("failed to locate rex-projects")?;
     let mut serve = Serve::new(paths.clone(), store, RexCli::new(), exe);
+    if once {
+        let config = Config::load(&paths.config_file())?;
+        serve.tick(&config)?;
+        return sync_trackers(&paths, &mut TrackerSync::default());
+    }
+    // Tracker CLIs can take seconds each, so write-backs run on their own
+    // thread and database connection instead of delaying reconciliation.
+    let tracker_paths = paths.clone();
+    std::thread::spawn(move || {
+        let mut sync = TrackerSync::default();
+        loop {
+            if let Err(err) = sync_trackers(&tracker_paths, &mut sync) {
+                eprintln!("tracker sync failed: {err:#}");
+            }
+            std::thread::sleep(interval.max(Duration::from_secs(5)));
+        }
+    });
     loop {
         let result = Config::load(&paths.config_file()).and_then(|config| serve.tick(&config));
-        if once {
-            return result;
-        }
         if let Err(err) = result {
             eprintln!("tick failed: {err:#}");
         }
         std::thread::sleep(interval);
     }
+}
+
+fn sync_trackers(paths: &Paths, sync: &mut TrackerSync) -> Result<()> {
+    let config = Config::load(&paths.config_file())?;
+    if config.trackers.is_empty() {
+        return Ok(());
+    }
+    let mut store = Store::open(&paths.db_file())?;
+    sync.tick(&mut store, &config, chrono::Utc::now())
 }
 
 #[cfg(test)]

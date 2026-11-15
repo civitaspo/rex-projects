@@ -38,6 +38,9 @@ pub enum Command {
     /// Create and manage Tickets.
     #[command(subcommand)]
     Ticket(TicketCommand),
+    /// Query external trackers and their write-back jobs.
+    #[command(subcommand)]
+    Tracker(TrackerCommand),
     /// Print the event log as JSON lines.
     Events(EventsArgs),
     /// Maintain the state database.
@@ -119,6 +122,20 @@ pub enum TicketCommand {
         #[arg(long)]
         text: Option<String>,
     },
+    /// Create a Ticket from an item in an external tracker.
+    Import {
+        /// The item's reference in the tracker.
+        reference: String,
+        #[arg(long)]
+        project: String,
+        /// Defaults to the Project's tracker.
+        #[arg(long)]
+        tracker: Option<String>,
+        #[arg(long)]
+        ready: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Stop a Ticket and mark it abandoned.
     Cancel {
         id: String,
@@ -153,6 +170,27 @@ pub struct NewTicketArgs {
     pub playbook: Option<String>,
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TrackerCommand {
+    /// List candidate items from a Project's tracker.
+    List {
+        #[arg(long)]
+        project: String,
+        #[arg(long, default_value = "")]
+        query: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show pending and failed write-back jobs.
+    Jobs {
+        /// Include finished and superseded jobs.
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -218,6 +256,7 @@ pub fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Ticket(command) => ticket(&paths, command),
+        Command::Tracker(command) => tracker_command(&paths, command),
         Command::Events(args) => events(&paths, args),
         Command::Mcp => {
             let agent_id = std::env::var("REXP_AGENT_ID")
@@ -339,6 +378,29 @@ fn ticket(paths: &Paths, command: TicketCommand) -> Result<()> {
             )?;
             println!("{id} is running");
         }
+        TicketCommand::Import {
+            reference,
+            project,
+            tracker,
+            ready,
+            json,
+        } => {
+            let config = Config::load(&paths.config_file())?;
+            let ticket = crate::tracker::import(
+                &mut store,
+                &config,
+                &actor(),
+                &project,
+                tracker.as_deref(),
+                &reference,
+                ready,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&ticket)?);
+            } else {
+                println!("{}", ticket.id);
+            }
+        }
         TicketCommand::Cancel { id, reason } => {
             store.append(
                 &actor(),
@@ -353,6 +415,53 @@ fn ticket(paths: &Paths, command: TicketCommand) -> Result<()> {
             let config = Config::load(&paths.config_file())?;
             crate::worktree::cleanup_ticket(paths, &config, &store, &id)?;
             println!("removed the worktree of {id}");
+        }
+    }
+    Ok(())
+}
+
+fn tracker_command(paths: &Paths, command: TrackerCommand) -> Result<()> {
+    match command {
+        TrackerCommand::List {
+            project,
+            query,
+            json,
+        } => {
+            let config = Config::load(&paths.config_file())?;
+            let items = crate::tracker::list(&config, &project, &query)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&items)?);
+            } else {
+                for item in &items {
+                    println!(
+                        "{}\t{}\t{}",
+                        item.reference,
+                        item.status.as_str(),
+                        item.title
+                    );
+                }
+            }
+        }
+        TrackerCommand::Jobs { all, json } => {
+            let store = Store::open(&paths.db_file())?;
+            let jobs = crate::tracker::jobs(&store, all)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&jobs)?);
+            } else {
+                for job in &jobs {
+                    println!(
+                        "{}\t{}\t{}\t{} {}\t{}\tattempts={}\t{}",
+                        job.id,
+                        job.ticket_id,
+                        job.state,
+                        job.tracker,
+                        job.reference,
+                        job.action,
+                        job.attempts,
+                        job.last_error.as_deref().unwrap_or("-")
+                    );
+                }
+            }
         }
     }
     Ok(())

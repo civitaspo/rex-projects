@@ -167,6 +167,7 @@ impl Config {
         for name in self.providers.keys() {
             self.provider(name)?;
         }
+        crate::tracker::Trackers::from_config(self)?;
         Ok(())
     }
 

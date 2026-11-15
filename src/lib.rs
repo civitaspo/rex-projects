@@ -11,5 +11,6 @@ pub mod provider;
 pub mod rex;
 pub mod serve;
 pub mod store;
+pub mod tracker;
 pub mod ui;
 pub mod worktree;
