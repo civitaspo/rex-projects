@@ -7,4 +7,8 @@ pub mod domain;
 pub mod hook;
 pub mod mcp;
 pub mod paths;
+pub mod provider;
+pub mod rex;
+pub mod serve;
 pub mod store;
+pub mod worktree;
