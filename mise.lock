@@ -241,3 +241,12 @@ checksum = "sha256:4ef64599440398999f184321d5237df131721434901ecaaf3da6aa018bdd1
 url = "https://github.com/github/gh-actions-lock/releases/download/v0.4.1/darwin-amd64"
 url_api = "https://api.github.com/repos/github/gh-actions-lock/releases/assets/702813196"
 provenance = "github-attestations"
+
+[[tools.rust]]
+version = "1.99.1"
+backend = "core:rust"
+specifiers = ["1.99.1"]
+
+[tools.rust.options]
+components = "clippy,rustfmt"
+profile = "minimal"
