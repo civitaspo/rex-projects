@@ -1,0 +1,4 @@
+# Keep the PR description as written: squash merges use it as the commit
+# message, and its trailers must stay at the end (AGENTS.md).
+reviews:
+  high_level_summary_in_walkthrough: true
