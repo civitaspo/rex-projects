@@ -111,22 +111,44 @@ pub fn remove(
             );
         }
     }
-    if branch_exists(repo, branch) {
-        let base = base.unwrap_or("HEAD");
-        let unpushed = git(repo, &["rev-list", branch, "--not", "--remotes", base])?;
-        if !unpushed.is_empty() {
-            bail!(
-                "branch {branch} has {} commit(s) that are not on any remote; push them first",
-                unpushed.lines().count()
-            );
+    let base = base.unwrap_or("HEAD");
+    // Check what the worktree actually has checked out, which may be another
+    // branch than `branch` (one named before a rename) or a detached HEAD.
+    let mut branches = vec![branch.to_owned()];
+    if dir.exists() {
+        let head = git(dir, &["rev-parse", "HEAD"])?;
+        refuse_unpushed(repo, &head, &format!("the HEAD of {}", dir.display()), base)?;
+        if let Ok(current) = git(dir, &["symbolic-ref", "--short", "-q", "HEAD"])
+            && !current.is_empty()
+            && current != branch
+        {
+            branches.push(current);
+        }
+    }
+    for b in &branches {
+        if branch_exists(repo, b) {
+            refuse_unpushed(repo, b, &format!("branch {b}"), base)?;
         }
     }
     if dir.exists() {
         let dir = dir.to_str().context("worktree path is not UTF-8")?;
         git(repo, &["worktree", "remove", dir])?;
     }
-    if branch_exists(repo, branch) {
-        git(repo, &["branch", "-D", branch])?;
+    for b in &branches {
+        if branch_exists(repo, b) {
+            git(repo, &["branch", "-D", b])?;
+        }
+    }
+    Ok(())
+}
+
+fn refuse_unpushed(repo: &Path, rev: &str, what: &str, base: &str) -> Result<()> {
+    let unpushed = git(repo, &["rev-list", rev, "--not", "--remotes", base])?;
+    if !unpushed.is_empty() {
+        bail!(
+            "{what} has {} commit(s) that are not on any remote; push them first",
+            unpushed.lines().count()
+        );
     }
     Ok(())
 }
@@ -183,6 +205,25 @@ pub(crate) mod tests {
             git(repo, args).unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn checks_the_branch_the_worktree_is_on() {
+        let repo = temp_repo();
+        let state = tempfile::tempdir().unwrap();
+        let dir = state.path().join("demo/demo-1");
+        // A worktree created under the old branch name, before the rename.
+        ensure(repo.path(), &dir, "rxp/demo-1", None).unwrap();
+        git(&dir, &["commit", "-q", "--allow-empty", "-m", "work"]).unwrap();
+
+        let err = remove(repo.path(), &dir, &branch("demo-1"), None, false).unwrap_err();
+        assert!(err.to_string().contains("not on any remote"), "{err}");
+        assert!(dir.exists());
+
+        git(&dir, &["update-ref", "refs/remotes/origin/x", "HEAD"]).unwrap();
+        remove(repo.path(), &dir, &branch("demo-1"), None, false).unwrap();
+        assert!(!dir.exists());
+        assert!(!branch_exists(repo.path(), "rxp/demo-1"));
     }
 
     #[test]
