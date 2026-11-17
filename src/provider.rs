@@ -256,8 +256,14 @@ pub fn exec(paths: &Paths, agent_id: &str) -> Result<()> {
         ("REX_PROJECTS_TICKET_ID", ticket.id.clone()),
         ("REX_PROJECTS_PROJECT_ID", agent.project_id.clone()),
         ("REX_PROJECTS_ROLE", agent.role.clone()),
-        ("REX_PROJECTS_STATE_DIR", paths.state_dir.display().to_string()),
-        ("REX_PROJECTS_CONFIG_DIR", paths.config_dir.display().to_string()),
+        (
+            "REX_PROJECTS_STATE_DIR",
+            paths.state_dir.display().to_string(),
+        ),
+        (
+            "REX_PROJECTS_CONFIG_DIR",
+            paths.config_dir.display().to_string(),
+        ),
     ]
     .map(|(k, v)| (k.to_owned(), v))
     .into();
@@ -404,7 +410,10 @@ mod tests {
 
     fn argv(kind: ProviderKind, start: Start<'_>) -> Vec<String> {
         let env = vec![
-            ("REX_PROJECTS_AGENT_ID".to_owned(), "demo-1-coordinator".to_owned()),
+            (
+                "REX_PROJECTS_AGENT_ID".to_owned(),
+                "demo-1-coordinator".to_owned(),
+            ),
             ("REX_PROJECTS_AGENT_LAUNCH".to_owned(), "2".to_owned()),
         ];
         Harness {
@@ -466,7 +475,10 @@ mod tests {
             server["default_tools_approval_mode"].as_str(),
             Some("approve")
         );
-        assert_eq!(server["env"]["REX_PROJECTS_AGENT_LAUNCH"].as_str(), Some("2"));
+        assert_eq!(
+            server["env"]["REX_PROJECTS_AGENT_LAUNCH"].as_str(),
+            Some("2")
+        );
 
         let resume = argv(ProviderKind::Codex, Start::Resume { session_id: "s9" });
         assert_eq!(resume[..5], ["harness", "--extra", "resume", "-m", "m1"]);

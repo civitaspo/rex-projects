@@ -613,7 +613,10 @@ mod tests {
         f.serve.rex.sessions.insert("add-a-feature".into(), id);
 
         f.tick();
-        assert_eq!(f.serve.rex.sessions.get("rex-projects:demo"), Some(&session));
+        assert_eq!(
+            f.serve.rex.sessions.get("rex-projects:demo"),
+            Some(&session)
+        );
         assert!(!f.serve.rex.sessions.contains_key("add-a-feature"));
 
         f.serve.rex.sessions.remove("rex-projects:demo");

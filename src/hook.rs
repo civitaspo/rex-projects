@@ -36,7 +36,10 @@ pub fn main(config_dir: Option<PathBuf>, state_dir: Option<PathBuf>, provider: &
     let launch = std::env::var("REX_PROJECTS_AGENT_LAUNCH").ok();
     let result = read.context("failed to read hook input").and_then(|_| {
         let launch = launch
-            .map(|l| l.parse::<i64>().context("invalid REX_PROJECTS_AGENT_LAUNCH"))
+            .map(|l| {
+                l.parse::<i64>()
+                    .context("invalid REX_PROJECTS_AGENT_LAUNCH")
+            })
             .transpose()?;
         let paths = Paths::resolve(config_dir, state_dir)?;
         handle(&paths, &agent_id, launch, provider, event, &input)

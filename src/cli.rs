@@ -276,7 +276,10 @@ pub fn run(cli: Cli) -> Result<()> {
                 .context("REX_PROJECTS_AGENT_ID must be set to serve MCP")?;
             let launch = std::env::var("REX_PROJECTS_AGENT_LAUNCH")
                 .ok()
-                .map(|l| l.parse::<i64>().context("invalid REX_PROJECTS_AGENT_LAUNCH"))
+                .map(|l| {
+                    l.parse::<i64>()
+                        .context("invalid REX_PROJECTS_AGENT_LAUNCH")
+                })
                 .transpose()?;
             crate::mcp::Server::new(paths, agent_id, launch)
                 .serve(std::io::stdin().lock(), std::io::stdout().lock())
