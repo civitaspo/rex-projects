@@ -4,6 +4,7 @@
 pub mod cli;
 pub mod config;
 pub mod domain;
+pub mod history;
 pub mod hook;
 pub mod mcp;
 pub mod paths;
