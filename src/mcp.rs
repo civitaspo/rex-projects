@@ -156,6 +156,7 @@ impl Server {
             blocked_by.push(json!({"id": blocker, "state": state}));
         }
         Ok(json!({
+            "notice": close_notice(&ticket),
             "project": {"id": ticket.project_id, "goal": goal},
             "agent": {"id": agent.id, "role": agent.role},
             "ticket": {
@@ -275,12 +276,11 @@ fn parse_args<T: serde::de::DeserializeOwned>(args: Value) -> Result<T> {
     serde_json::from_value(args).context("invalid arguments")
 }
 
-fn status(store: &Store, ticket_id: &str) -> Result<Value> {
-    let t = store
-        .ticket(ticket_id)?
-        .with_context(|| format!("ticket {ticket_id} does not exist"))?;
+/// Asks the Coordinator to check with a human about external closes that no
+/// human has answered yet.
+fn close_notice(t: &Ticket) -> Option<String> {
     let closed: Vec<String> = t
-        .closed_refs()
+        .unacknowledged_closes()
         .map(|r| {
             format!(
                 "{} {} is {}",
@@ -290,14 +290,20 @@ fn status(store: &Store, ticket_id: &str) -> Result<Value> {
             )
         })
         .collect();
-    let notice = (!closed.is_empty()).then(|| {
+    (!closed.is_empty()).then(|| {
         format!(
             "Someone closed this Ticket's external item outside rex-projects ({}). Call `ask` to confirm whether to continue.",
             closed.join(", ")
         )
-    });
+    })
+}
+
+fn status(store: &Store, ticket_id: &str) -> Result<Value> {
+    let t = store
+        .ticket(ticket_id)?
+        .with_context(|| format!("ticket {ticket_id} does not exist"))?;
     Ok(json!({
-        "notice": notice,
+        "notice": close_notice(&t),
         "id": t.id,
         "state": t.state,
         "stage": t.stage,
@@ -409,6 +415,7 @@ pub(crate) mod tests {
                         reference: "A-1".into(),
                         url: None,
                         closed_externally: None,
+                        close_acknowledged: false,
                     }],
                     ..Default::default()
                 },
@@ -607,6 +614,28 @@ pub(crate) mod tests {
         assert!(
             text.contains("\"closed_externally\": \"canceled\""),
             "{text}"
+        );
+        assert!(text.contains("acme A-1 is canceled"), "{text}");
+
+        // Once a human answers, the close stays recorded but stops asking.
+        let (_, text) = call(&server, "ask", json!({"question": "Continue?"}));
+        assert!(text.contains("acme A-1 is canceled"), "{text}");
+        Store::open(&server.paths.db_file())
+            .unwrap()
+            .append(
+                "human",
+                Event::TicketAnswered {
+                    ticket_id: "demo-1".into(),
+                    answer: Some("Yes, continue".into()),
+                },
+            )
+            .unwrap();
+        let (_, text) = call(&server, "report", json!({"stage": "implement"}));
+        assert!(!text.contains("acme A-1 is canceled"), "{text}");
+        assert!(ticket(&server).unacknowledged_closes().next().is_none());
+        assert_eq!(
+            ticket(&server).external_refs[0].closed_externally.as_deref(),
+            Some("canceled")
         );
     }
 

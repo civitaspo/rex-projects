@@ -476,6 +476,7 @@ pub fn import(
                 reference: item.reference,
                 url: item.url,
                 closed_externally: None,
+                close_acknowledged: false,
             }],
             ready,
             ..Default::default()
@@ -911,7 +912,10 @@ fn poll(store: &mut Store, config: &Config, trackers: &Trackers) -> Result<()> {
                  ON CONFLICT DO UPDATE SET external_status = excluded.external_status",
                 params![ticket.id, r.tracker, r.reference, status],
             )?;
-            if matches!(item.status, ExternalStatus::Done | ExternalStatus::Canceled) {
+            // Record closes, and reopens of items recorded as closed.
+            if crate::domain::is_closed_status(status)
+                || previous.as_deref().is_some_and(crate::domain::is_closed_status)
+            {
                 store.append(
                     "tracker",
                     Event::ExternalChanged {
@@ -1016,6 +1020,7 @@ transition.done = [{ argv = ["/bin/sh", "SH", "close", "{{ref}}", "{{summary}}"]
                 reference: (*reference).into(),
                 url: None,
                 closed_externally: None,
+                close_acknowledged: false,
             })
             .collect();
         let new = NewTicket {
@@ -1350,8 +1355,16 @@ transition.done = [{ argv = ["/bin/sh", "SH", "close", "{{ref}}", "{{summary}}"]
         // The Ticket keeps running but shows who closed what.
         let ticket = store.ticket("demo-1").unwrap().unwrap();
         assert_eq!(ticket.state, crate::domain::TicketState::Running);
-        let closed: Vec<_> = ticket.closed_refs().collect();
+        let closed: Vec<_> = ticket.unacknowledged_closes().collect();
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0].closed_externally.as_deref(), Some("done"));
+
+        // Reopening the item clears the close.
+        fake.touch("status", "Open");
+        sync.tick(&mut store, &config, t(183)).unwrap();
+        assert_eq!(changes(&store), 2);
+        let ticket = store.ticket("demo-1").unwrap().unwrap();
+        assert_eq!(ticket.external_refs[0].closed_externally, None);
+        assert!(ticket.unacknowledged_closes().next().is_none());
     }
 }
