@@ -365,7 +365,7 @@ fn ticket(paths: &Paths, command: TicketCommand) -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&ticket)?);
             } else {
-                print_ticket(&ticket);
+                print_ticket(&mut std::io::stdout().lock(), &ticket)?;
             }
         }
         TicketCommand::Ready { id } => {
@@ -479,8 +479,8 @@ fn tracker_command(paths: &Paths, command: TrackerCommand) -> Result<()> {
     Ok(())
 }
 
-fn print_ticket(t: &Ticket) {
-    println!("{} [{}] {}", t.id, t.state, t.title);
+fn print_ticket(out: &mut impl Write, t: &Ticket) -> std::io::Result<()> {
+    writeln!(out, "{} [{}] {}", t.id, t.state, t.title)?;
     let optional = [
         ("stage", t.stage.as_deref()),
         ("summary", t.summary.as_deref()),
@@ -491,18 +491,35 @@ fn print_ticket(t: &Ticket) {
     ];
     for (label, value) in optional {
         if let Some(value) = value {
-            println!("{label}: {value}");
+            writeln!(out, "{label}: {value}")?;
         }
     }
+    if let Some(progress) = t.progress {
+        writeln!(out, "progress: {progress}%")?;
+    }
+    if let Some(outcome) = t.outcome {
+        writeln!(out, "outcome: {outcome}")?;
+    }
     if !t.blocked_by.is_empty() {
-        println!("blocked by: {}", t.blocked_by.join(", "));
+        writeln!(out, "blocked by: {}", t.blocked_by.join(", "))?;
+    }
+    for r in &t.external_refs {
+        write!(out, "external: {} {}", r.tracker, r.reference)?;
+        if let Some(url) = &r.url {
+            write!(out, " ({url})")?;
+        }
+        if let Some(status) = &r.closed_externally {
+            write!(out, ", closed externally as {status}")?;
+        }
+        writeln!(out)?;
     }
     for artifact in &t.artifacts {
-        println!("artifact: {artifact}");
+        writeln!(out, "artifact: {artifact}")?;
     }
     if !t.body.is_empty() {
-        println!("\n{}", t.body);
+        writeln!(out, "\n{}", t.body)?;
     }
+    Ok(())
 }
 
 fn events(paths: &Paths, args: EventsArgs) -> Result<()> {
@@ -674,5 +691,51 @@ mod tests {
             store.ticket("demo-1").unwrap().unwrap().state,
             TicketState::Running
         );
+    }
+
+    fn shown(ticket: &Ticket) -> String {
+        let mut out = Vec::new();
+        print_ticket(&mut out, ticket).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn show_prints_progress_outcome_and_external_refs() {
+        let (store, _, _) = waiting_ticket();
+        let mut ticket = store.ticket("demo-1").unwrap().unwrap();
+        let plain = shown(&ticket);
+        assert!(!plain.contains("progress:"), "{plain}");
+        assert!(!plain.contains("outcome:"), "{plain}");
+        assert!(!plain.contains("external:"), "{plain}");
+
+        ticket.progress = Some(40);
+        ticket.outcome = Some(crate::domain::Outcome::Delivered);
+        ticket.external_refs = vec![
+            crate::domain::ExternalRef {
+                tracker: "acme".into(),
+                reference: "A-1".into(),
+                url: Some("https://acme.example/A-1".into()),
+                closed_externally: None,
+            },
+            crate::domain::ExternalRef {
+                tracker: "github".into(),
+                reference: "7".into(),
+                url: None,
+                closed_externally: Some("done".into()),
+            },
+        ];
+        let text = shown(&ticket);
+        let lines: Vec<&str> = text.lines().collect();
+        for expected in [
+            "progress: 40%",
+            "outcome: delivered",
+            "external: acme A-1 (https://acme.example/A-1)",
+            "external: github 7, closed externally as done",
+        ] {
+            assert!(
+                lines.contains(&expected),
+                "missing {expected:?} in:\n{text}"
+            );
+        }
     }
 }
