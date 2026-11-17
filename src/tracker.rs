@@ -475,6 +475,7 @@ pub fn import(
                 tracker: name.to_owned(),
                 reference: item.reference,
                 url: item.url,
+                closed_externally: None,
             }],
             ready,
             ..Default::default()
@@ -1014,6 +1015,7 @@ transition.done = [{ argv = ["/bin/sh", "SH", "close", "{{ref}}", "{{summary}}"]
                 tracker: (*tracker).into(),
                 reference: (*reference).into(),
                 url: None,
+                closed_externally: None,
             })
             .collect();
         let new = NewTicket {
@@ -1345,5 +1347,11 @@ transition.done = [{ argv = ["/bin/sh", "SH", "close", "{{ref}}", "{{summary}}"]
         };
         assert_eq!(event, expected);
         assert_eq!(fake.calls("get A-1").len(), 3);
+        // The Ticket keeps running but shows who closed what.
+        let ticket = store.ticket("demo-1").unwrap().unwrap();
+        assert_eq!(ticket.state, crate::domain::TicketState::Running);
+        let closed: Vec<_> = ticket.closed_refs().collect();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].closed_externally.as_deref(), Some("done"));
     }
 }

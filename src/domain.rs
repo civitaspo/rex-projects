@@ -89,6 +89,18 @@ pub struct ExternalRef {
     pub reference: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Set when someone closed the item outside rex-projects, for example `done`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_externally: Option<String>,
+}
+
+impl Ticket {
+    /// The refs whose items were closed outside rex-projects.
+    pub fn closed_refs(&self) -> impl Iterator<Item = &ExternalRef> {
+        self.external_refs
+            .iter()
+            .filter(|r| r.closed_externally.is_some())
+    }
 }
 
 /// Every change to rex-projects state is one of these events (ADR-0008).

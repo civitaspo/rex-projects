@@ -521,8 +521,28 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event) -> Result<()> {
                 params![ticket_id, reason, serde_json::to_value(outcome)?.as_str()],
             )?;
         }
-        Event::ExternalChanged { ticket_id, .. } => {
+        Event::ExternalChanged {
+            ticket_id,
+            tracker,
+            reference,
+            status,
+        } => {
             ticket_state(tx, ticket_id)?;
+            let refs: String = tx.query_row(
+                "SELECT external_refs FROM tickets WHERE id = ?1",
+                params![ticket_id],
+                |row| row.get(0),
+            )?;
+            let mut refs: Vec<ExternalRef> = serde_json::from_str(&refs)?;
+            for r in &mut refs {
+                if &r.tracker == tracker && &r.reference == reference {
+                    r.closed_externally = Some(status.clone());
+                }
+            }
+            tx.execute(
+                "UPDATE tickets SET external_refs = ?2, updated_at = ?3 WHERE id = ?1",
+                params![ticket_id, serde_json::to_string(&refs)?, at],
+            )?;
         }
         Event::AgentCreated {
             agent_id,

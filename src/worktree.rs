@@ -69,13 +69,44 @@ pub fn ensure(repo: &Path, dir: &Path, branch: &str, base: Option<&str>) -> Resu
 }
 
 /// Removes the worktree and its branch, refusing when that would lose work:
-/// uncommitted changes, or commits that are neither on a remote nor on `base`.
-pub fn remove(repo: &Path, dir: &Path, branch: &str, base: Option<&str>) -> Result<()> {
+/// uncommitted changes, commits that are neither on a remote nor on `base`,
+/// or ignored files such as `.env`, unless `discard_ignored` is set.
+pub fn remove(
+    repo: &Path,
+    dir: &Path,
+    branch: &str,
+    base: Option<&str>,
+    discard_ignored: bool,
+) -> Result<()> {
     if dir.exists() {
         let status = git(dir, &["status", "--porcelain"])?;
         if !status.is_empty() {
             bail!(
                 "{} has uncommitted changes; commit or discard them first",
+                dir.display()
+            );
+        }
+        let ignored = git(dir, &["status", "--porcelain", "--ignored"])?;
+        let ignored: Vec<&str> = ignored
+            .lines()
+            .filter_map(|l| l.strip_prefix("!! "))
+            .collect();
+        if !ignored.is_empty() && !discard_ignored {
+            let shown = ignored
+                .iter()
+                .take(10)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let more = ignored.len().saturating_sub(10);
+            let more = if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            };
+            bail!(
+                "{} has ignored files that cleanup would delete: {shown}{more}; \
+                 move anything you need out of it, then rerun with --discard-ignored",
                 dir.display()
             );
         }
@@ -101,7 +132,13 @@ pub fn remove(repo: &Path, dir: &Path, branch: &str, base: Option<&str>) -> Resu
 }
 
 /// Removes the worktree of an ended Ticket whose Agents have all exited.
-pub fn cleanup_ticket(paths: &Paths, config: &Config, store: &Store, id: &str) -> Result<()> {
+pub fn cleanup_ticket(
+    paths: &Paths,
+    config: &Config,
+    store: &Store,
+    id: &str,
+    discard_ignored: bool,
+) -> Result<()> {
     let ticket = store
         .ticket(id)?
         .with_context(|| format!("ticket {id} does not exist"))?;
@@ -124,6 +161,7 @@ pub fn cleanup_ticket(paths: &Paths, config: &Config, store: &Store, id: &str) -
         &paths.worktree_dir(&project.id, id),
         &branch(id),
         project.base_branch.as_deref(),
+        discard_ignored,
     )
 }
 
@@ -165,14 +203,23 @@ pub(crate) mod tests {
         assert!(dir.join(".git").exists());
 
         std::fs::write(dir.join("file"), "x").unwrap();
-        assert!(remove(repo.path(), &dir, &branch, None).is_err());
+        assert!(remove(repo.path(), &dir, &branch, None, false).is_err());
         git(&dir, &["add", "file"]).unwrap();
         git(&dir, &["commit", "-q", "-m", "work"]).unwrap();
-        let err = remove(repo.path(), &dir, &branch, None).unwrap_err();
+        let err = remove(repo.path(), &dir, &branch, None, false).unwrap_err();
         assert!(err.to_string().contains("not on any remote"), "{err}");
 
         git(&dir, &["reset", "-q", "--hard", "main"]).unwrap();
-        remove(repo.path(), &dir, &branch, None).unwrap();
+        std::fs::write(dir.join(".gitignore"), ".env\n").unwrap();
+        git(&dir, &["add", ".gitignore"]).unwrap();
+        git(&dir, &["commit", "-q", "-m", "ignore"]).unwrap();
+        git(&dir, &["update-ref", "refs/remotes/origin/x", "HEAD"]).unwrap();
+        std::fs::write(dir.join(".env"), "SECRET=1").unwrap();
+        let err = remove(repo.path(), &dir, &branch, None, false).unwrap_err();
+        assert!(err.to_string().contains("ignored files"), "{err}");
+        assert!(err.to_string().contains(".env"), "{err}");
+        assert!(dir.join(".env").exists());
+        remove(repo.path(), &dir, &branch, None, true).unwrap();
         assert!(!dir.exists());
         assert!(!branch_exists(repo.path(), &branch));
     }

@@ -64,6 +64,7 @@ impl TicketRow {
 /// Whether a human should look at the Ticket now.
 pub fn needs_you(ticket: &Ticket, coordinator: Option<&Agent>, now: DateTime<Utc>) -> bool {
     ticket.state == TicketState::Waiting
+        || (ticket.state.is_active() && ticket.closed_refs().next().is_some())
         || coordinator.is_some_and(|a| {
             a.state != "exited"
                 && (a.activity.as_deref() == Some("blocked") || is_silent(ticket, a, now))
@@ -120,8 +121,15 @@ pub fn build_rows(
                 None => "-".to_owned(),
             };
             let silent = coordinator.is_some_and(|a| is_silent(t, a, now));
+            let closed = t.closed_refs().next().filter(|_| t.state.is_active());
             let text = match (&t.question, &t.summary) {
                 (Some(q), _) if t.state == TicketState::Waiting => format!("? {q}"),
+                _ if let Some(r) = closed => format!(
+                    "{} {} was closed as {} outside rex-projects; cancel the Ticket or tell the Coordinator to continue",
+                    r.tracker,
+                    r.reference,
+                    r.closed_externally.as_deref().unwrap_or_default()
+                ),
                 _ if silent => "No status from the Coordinator; check its pane".to_owned(),
                 (_, Some(s)) => s.clone(),
                 _ => t.title.clone(),
@@ -536,6 +544,23 @@ mod tests {
             rows[0].text,
             "No status from the Coordinator; check its pane"
         );
+    }
+
+    #[test]
+    fn an_item_closed_externally_needs_you() {
+        let mut t = ticket("a", 1, TicketState::Running);
+        t.external_refs = vec![crate::domain::ExternalRef {
+            tracker: "acme".to_owned(),
+            reference: "A-1".to_owned(),
+            url: None,
+            closed_externally: Some("done".to_owned()),
+        }];
+        let rows = build_rows(std::slice::from_ref(&t), &HashMap::new(), now(), false);
+        assert!(rows[0].needs_you);
+        assert!(rows[0].text.starts_with("acme A-1 was closed as done"));
+
+        t.state = TicketState::Done;
+        assert!(!build_rows(&[t], &HashMap::new(), now(), true)[0].needs_you);
     }
 
     #[test]

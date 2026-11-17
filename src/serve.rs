@@ -2,7 +2,7 @@
 //! blocks reconciled with the state database.
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -318,7 +318,19 @@ impl<R: Rex> Serve<R> {
 
     fn dispatch(&mut self, config: &Config) -> Result<()> {
         let tickets = self.store.tickets(None)?;
-        let live = self.store.agents(true)?.len();
+        // A done Ticket's pane stays open for a while so a human can read it,
+        // but it no longer takes a launch slot.
+        let done: HashSet<&str> = tickets
+            .iter()
+            .filter(|t| t.state == TicketState::Done)
+            .map(|t| t.id.as_str())
+            .collect();
+        let live = self
+            .store
+            .agents(true)?
+            .iter()
+            .filter(|a| !done.contains(a.ticket_id.as_str()))
+            .count();
         let (picked, next) = plan(config, &tickets, live, self.rotation);
         self.rotation = next;
         for ticket in tickets.iter().filter(|t| picked.contains(&t.id)) {
@@ -690,6 +702,43 @@ mod tests {
             f.serve.rex.blocks.is_empty(),
             "no relaunch for a done Ticket"
         );
+    }
+
+    #[test]
+    fn a_done_tickets_pane_does_not_take_a_launch_slot() {
+        let mut f = fixture();
+        f.config.limits.max_agents = 1;
+        f.serve
+            .store
+            .create_ticket(
+                "human",
+                NewTicket {
+                    project_id: "demo".into(),
+                    title: "Next".into(),
+                    ready: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        f.tick();
+        assert_eq!(f.serve.rex.blocks.len(), 1);
+        let state = |f: &Fixture, id| f.serve.store.ticket(id).unwrap().unwrap().state;
+        assert_eq!(state(&f, "demo-2"), TicketState::Ready);
+        f.serve
+            .store
+            .append(
+                "demo-1-coordinator",
+                Event::TicketCompleted {
+                    ticket_id: "demo-1".into(),
+                    outcome: Outcome::Delivered,
+                    summary: "ok".into(),
+                    artifacts: Vec::new(),
+                },
+            )
+            .unwrap();
+        f.tick();
+        assert_eq!(state(&f, "demo-2"), TicketState::Running);
+        assert_eq!(f.serve.rex.blocks.len(), 2, "demo-1's pane stays open");
     }
 
     #[test]

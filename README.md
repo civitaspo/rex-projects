@@ -40,6 +40,16 @@ rex-projects lets Codex call its own MCP tools without asking, so `-a never` doe
 
 Claude Code asks whether to trust a new folder, and that prompt stops a Coordinator until you answer it. In our runs, a Ticket worktree was trusted once its Project repository had been trusted, so open `claude` once in each Project repository if you have not already. A Coordinator that reports no status for a minute, as when it waits on this prompt, appears under "Needs you" in the dashboard. Codex asks the same question and says that trusting a worktree applies to its repository root.
 
+When a Coordinator asks a question, its Ticket waits under "Needs you". Answer in the Coordinator's pane, or from any terminal:
+
+```sh
+rex-projects ticket answer demo-1 --text "Use the v2 API"
+```
+
+`--text` types the answer into the Coordinator's pane and presses Return, and only does so while the Coordinator is idle. If you already replied in the pane and the Ticket still shows waiting, which can happen with a harness that has no prompt hook, run `ticket answer demo-1` without `--text`.
+
+`ticket cleanup <id>` removes an ended Ticket's worktree and branch. It refuses while the worktree holds uncommitted changes, commits that are on no remote, or ignored files such as `.env` or build output. Move anything you need out of the worktree, then pass `--discard-ignored` to delete the ignored files with it.
+
 ## Rex plugin
 
 Put `rex-projects` on the `PATH` of your login shell, then load the plugin from `~/.config/rex/init.lua`:
@@ -87,6 +97,8 @@ rex-projects tracker jobs
 ```
 
 `serve` writes back in order per external ref, retrying failures with backoff: dispatching a Ticket sets `in_progress` (or comments that work started), Stage changes post a progress comment at most every 10 minutes on trackers without `in_progress`, delivery sets `done` with the summary and artifact URLs, and abandoned or failed Tickets set `canceled` (or get a comment). `tracker jobs` shows pending and failed write-backs.
+
+`serve` also re-reads the external items of active Tickets. When someone closes one outside rex-projects, the Ticket keeps running, but it moves under "Needs you" in the dashboard, `ticket_get` marks the ref with `closed_externally`, and the Coordinator's next tool result carries a notice asking it to confirm whether to continue. Cancel the Ticket or tell the Coordinator to go on.
 
 ## Development
 
