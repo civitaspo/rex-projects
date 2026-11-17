@@ -105,17 +105,27 @@ pub struct ExternalRef {
     pub reference: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    /// Set when someone closed the item outside rex-projects, for example `done`.
+    /// Set while the item is closed outside rex-projects, for example `done`.
+    /// Cleared when the item is reopened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed_externally: Option<String>,
+    /// Whether a human has answered the Ticket since the item was closed, so
+    /// the close no longer needs anyone's attention.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub close_acknowledged: bool,
+}
+
+/// Whether an external status means the item is closed.
+pub fn is_closed_status(status: &str) -> bool {
+    matches!(status, "done" | "canceled")
 }
 
 impl Ticket {
-    /// The refs whose items were closed outside rex-projects.
-    pub fn closed_refs(&self) -> impl Iterator<Item = &ExternalRef> {
+    /// The refs closed outside rex-projects that no human has answered yet.
+    pub fn unacknowledged_closes(&self) -> impl Iterator<Item = &ExternalRef> {
         self.external_refs
             .iter()
-            .filter(|r| r.closed_externally.is_some())
+            .filter(|r| r.closed_externally.is_some() && !r.close_acknowledged)
     }
 }
 

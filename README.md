@@ -19,7 +19,7 @@ rex-projects ticket list
 rex-projects events --follow
 ```
 
-Run `rex-projects ui` for the Ticket dashboard. It lists Tickets by Project with the ones that need you first. Press Enter to jump to a Ticket's Coordinator, `r` to ready a backlog Ticket, `a` to show old finished Tickets, and `q` to quit.
+Run `rex-projects ui` for the Ticket dashboard. It lists Tickets by Project with the ones that need you first, and shows the selected Ticket's history below the list: Coordinator launches and exits, reports with their stage and progress, questions and answers, and how the Ticket ended. `ticket show <id>` prints the same history in full. Press Enter to jump to a Ticket's Coordinator, `r` to ready a backlog Ticket, `a` to show old finished Tickets, and `q` to quit.
 
 ## Running Tickets
 
@@ -100,7 +100,7 @@ rex-projects tracker jobs
 
 `serve` writes back in order per external ref, retrying failures with backoff: dispatching a Ticket sets `in_progress` (or comments that work started), Stage changes post a progress comment at most every 10 minutes on trackers without `in_progress`, delivery sets `done` with the summary and artifact URLs, and abandoned or failed Tickets set `canceled` (or get a comment). `tracker jobs` shows pending and failed write-backs.
 
-`serve` also re-reads the external items of active Tickets. When someone closes one outside rex-projects, the Ticket keeps running, but it moves under "Needs you" in the dashboard, `ticket_get` marks the ref with `closed_externally`, and the Coordinator's next tool result carries a notice asking it to confirm whether to continue. Cancel the Ticket or tell the Coordinator to go on.
+`serve` also re-reads the external items of active Tickets. When someone closes one outside rex-projects, the Ticket keeps running, but it moves under "Needs you" in the dashboard, `ticket_get` marks the ref with `closed_externally`, and the Coordinator's next tool result carries a notice asking it to confirm whether to continue. Cancel the Ticket, or tell the Coordinator to go on: once you answer it, the Ticket leaves "Needs you" and the notice stops, while `closed_externally` stays as a record. Reopening the item clears `closed_externally`.
 
 ## Development
 
