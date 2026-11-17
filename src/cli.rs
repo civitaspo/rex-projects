@@ -235,10 +235,12 @@ pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Config(ConfigCommand::Check) => {
             let config = Config::load(&paths.config_file())?;
+            // `Config::load` already builds the trackers the way `serve` does.
             println!(
-                "{}: {} project(s)",
+                "{}: {} project(s), {} tracker(s)",
                 paths.config_file().display(),
-                config.projects.len()
+                config.projects.len(),
+                config.trackers.len()
             );
             Ok(())
         }
