@@ -5,7 +5,9 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 
-use crate::domain::{Agent, Event, ExternalRef, Outcome, Ticket, TicketState, ticket_id};
+use crate::domain::{
+    Agent, Event, ExternalRef, Outcome, Ticket, TicketState, is_closed_status, ticket_id,
+};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS events (
@@ -403,6 +405,30 @@ fn merge_artifacts(tx: &Transaction<'_>, id: &str, artifacts: &[String]) -> Resu
 }
 
 /// Applies one event to the projections, rejecting invalid transitions.
+/// Rewrites a Ticket's external refs with `change`.
+fn update_refs(
+    tx: &Transaction<'_>,
+    ticket_id: &str,
+    at: &str,
+    change: impl Fn(&mut ExternalRef),
+) -> Result<()> {
+    let refs: String = tx.query_row(
+        "SELECT external_refs FROM tickets WHERE id = ?1",
+        params![ticket_id],
+        |row| row.get(0),
+    )?;
+    let mut refs: Vec<ExternalRef> = serde_json::from_str(&refs)?;
+    if refs.is_empty() {
+        return Ok(());
+    }
+    refs.iter_mut().for_each(change);
+    tx.execute(
+        "UPDATE tickets SET external_refs = ?2, updated_at = ?3 WHERE id = ?1",
+        params![ticket_id, serde_json::to_string(&refs)?, at],
+    )?;
+    Ok(())
+}
+
 fn project(tx: &Transaction<'_>, at: &str, event: &Event) -> Result<()> {
     use TicketState::*;
     match event {
@@ -499,6 +525,12 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event) -> Result<()> {
                 "UPDATE tickets SET question = NULL WHERE id = ?1",
                 params![ticket_id],
             )?;
+            // The human has seen any external close by now.
+            update_refs(tx, ticket_id, at, |r| {
+                if r.closed_externally.is_some() {
+                    r.close_acknowledged = true;
+                }
+            })?;
         }
         Event::TicketCompleted {
             ticket_id,
@@ -543,21 +575,12 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event) -> Result<()> {
             status,
         } => {
             ticket_state(tx, ticket_id)?;
-            let refs: String = tx.query_row(
-                "SELECT external_refs FROM tickets WHERE id = ?1",
-                params![ticket_id],
-                |row| row.get(0),
-            )?;
-            let mut refs: Vec<ExternalRef> = serde_json::from_str(&refs)?;
-            for r in &mut refs {
+            update_refs(tx, ticket_id, at, |r| {
                 if &r.tracker == tracker && &r.reference == reference {
-                    r.closed_externally = Some(status.clone());
+                    r.closed_externally = is_closed_status(status).then(|| status.clone());
+                    r.close_acknowledged = false;
                 }
-            }
-            tx.execute(
-                "UPDATE tickets SET external_refs = ?2, updated_at = ?3 WHERE id = ?1",
-                params![ticket_id, serde_json::to_string(&refs)?, at],
-            )?;
+            })?;
         }
         Event::AgentCreated {
             agent_id,

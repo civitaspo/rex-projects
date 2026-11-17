@@ -726,12 +726,14 @@ mod tests {
                 reference: "A-1".into(),
                 url: Some("https://acme.example/A-1".into()),
                 closed_externally: None,
+                close_acknowledged: false,
             },
             crate::domain::ExternalRef {
                 tracker: "github".into(),
                 reference: "7".into(),
                 url: None,
                 closed_externally: Some("done".into()),
+                close_acknowledged: false,
             },
         ];
         let text = shown(&ticket);
