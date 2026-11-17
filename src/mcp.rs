@@ -26,7 +26,7 @@ const WAIT_INSTRUCTION: &str = "Your question is recorded and the Ticket is wait
 
 type RpcError = (i64, String);
 
-/// Serves one Agent, identified by `REXP_AGENT_ID`. The store is reopened on
+/// Serves one Agent, identified by `REX_PROJECTS_AGENT_ID`. The store is reopened on
 /// every call so that changes made by other processes are seen.
 pub struct Server {
     paths: Paths,

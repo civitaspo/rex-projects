@@ -11,7 +11,7 @@ use crate::store::Store;
 
 /// The branch a Ticket's worktree is on.
 pub fn branch(ticket_id: &str) -> String {
-    format!("rxp/{ticket_id}")
+    format!("rex-projects/{ticket_id}")
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String> {

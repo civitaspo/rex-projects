@@ -4,7 +4,7 @@ A Rex plugin that runs cooperating coding Agents on many Projects at once. A Rus
 
 ## Usage
 
-Configuration lives in `${XDG_CONFIG_HOME:-~/.config}/rex-projects/config.toml`, and state lives in `${XDG_STATE_HOME:-~/.local/state}/rex-projects/`. Override them with `--config-dir` / `REXP_CONFIG_DIR` and `--state-dir` / `REXP_STATE_DIR`.
+Configuration lives in `${XDG_CONFIG_HOME:-~/.config}/rex-projects/config.toml`, and state lives in `${XDG_STATE_HOME:-~/.local/state}/rex-projects/`. Override them with `--config-dir` / `REX_PROJECTS_CONFIG_DIR` and `--state-dir` / `REX_PROJECTS_STATE_DIR`.
 
 ```toml
 [[projects]]
@@ -23,7 +23,9 @@ Run `rex-projects ui` for the Ticket dashboard. It lists Tickets by Project with
 
 ## Running Tickets
 
-`rex-projects serve` dispatches ready Tickets. Each one gets a git worktree under `${XDG_STATE_HOME:-~/.local/state}/rex-projects/worktrees/` and a Coordinator Agent in a Rex tab of the session `rxp:<project>`. Start it from the plugin's controller action, or run it in any Rex terminal.
+`rex-projects serve` dispatches ready Tickets. Each one gets a git worktree under `${XDG_STATE_HOME:-~/.local/state}/rex-projects/worktrees/` and a Coordinator Agent in a Rex tab of the session `rex-projects:<project>`, which `serve` creates when needed. Start it from the plugin's controller action, or run it in any Rex terminal.
+
+A done Ticket's pane stays open for 10 minutes so you can read it, and an abandoned or failed Ticket's pane closes right away. When the last pane in a Project's session closes, `serve` closes the session too, unless you opened a tab of your own there. The session where you run `serve` is yours to close.
 
 Agents run unattended, so give the provider the permission mode you want, for example:
 
@@ -62,7 +64,7 @@ require("rex_projects").setup({
 })
 ```
 
-Adjust the path to your clone. Jumping from the dashboard to a Ticket in another session asks the Rex app to switch sessions, which needs Remote Control turned on in Rex Settings under Rex Server. Without it, the dashboard still zooms the Coordinator's pane in its session and says that the app did not switch. The plugin adds two actions: `rex_projects_dashboard` opens the dashboard as a floating layer, and `rex_projects_serve` shows the control session `rxp`, creating it with `rex-projects serve` when it is missing. Keys are bound only when given.
+Adjust the path to your clone. Jumping from the dashboard to a Ticket in another session asks the Rex app to switch sessions, which needs Remote Control turned on in Rex Settings under Rex Server. Without it, the dashboard still zooms the Coordinator's pane in its session and says that the app did not switch. The plugin adds two actions: `rex_projects_dashboard` opens the dashboard as a floating layer, and `rex_projects_serve` shows the control session `rex-projects`, creating it with `rex-projects serve` when it is missing. Keys are bound only when given.
 
 ## External trackers
 

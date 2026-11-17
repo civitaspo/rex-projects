@@ -185,6 +185,17 @@ impl<R: Rex> Serve<R> {
         self.store.append(ACTOR, event).map(drop)
     }
 
+    /// Destroys a Project session once its last block has closed, so ended
+    /// work leaves no empty sessions behind. A session still holding any block,
+    /// including one a human opened there, is kept.
+    fn release_empty_session(&mut self, session: &str) -> Result<()> {
+        if self.rex.block_ids(session)?.is_empty() {
+            self.rex.destroy_session(session)?;
+            println!("{session}: closed the empty Project session");
+        }
+        Ok(())
+    }
+
     fn reconcile(&mut self, config: &Config, agent: &Agent) -> Result<()> {
         let (Some(session), Some(block)) = (&agent.rex_session_id, &agent.rex_block_id) else {
             return Ok(());
@@ -199,6 +210,9 @@ impl<R: Rex> Serve<R> {
                 reason: "block closed".into(),
             })?;
             println!("{}: block closed", agent.id);
+            if ticket.state.is_terminal() {
+                self.release_empty_session(session)?;
+            }
             return Ok(());
         }
         let done_long_ago = ticket.state == TicketState::Done
@@ -216,6 +230,7 @@ impl<R: Rex> Serve<R> {
                 "{}: closed because {} is {}",
                 agent.id, ticket.id, ticket.state
             );
+            self.release_empty_session(session)?;
             return Ok(());
         }
         if let Some(status) = self.rex.program_status(session, block)?
@@ -252,7 +267,7 @@ impl<R: Rex> Serve<R> {
         })
     }
 
-    /// Sets each live Project session's label back to `rxp:<project>`, in
+    /// Sets each live Project session's label back to `rex-projects:<project>`, in
     /// case an Agent renamed it.
     fn keep_session_labels(&mut self) -> Result<()> {
         let mut seen = std::collections::BTreeSet::new();
@@ -382,7 +397,7 @@ impl<R: Rex> Serve<R> {
 }
 
 fn session_label(project_id: &str) -> String {
-    format!("rxp:{project_id}")
+    format!("rex-projects:{project_id}")
 }
 
 pub fn coordinator_id(ticket_id: &str) -> String {
@@ -594,14 +609,14 @@ mod tests {
         let mut f = fixture();
         f.tick();
         let session = f.agent().rex_session_id.unwrap();
-        let id = f.serve.rex.sessions.remove("rxp:demo").unwrap();
+        let id = f.serve.rex.sessions.remove("rex-projects:demo").unwrap();
         f.serve.rex.sessions.insert("add-a-feature".into(), id);
 
         f.tick();
-        assert_eq!(f.serve.rex.sessions.get("rxp:demo"), Some(&session));
+        assert_eq!(f.serve.rex.sessions.get("rex-projects:demo"), Some(&session));
         assert!(!f.serve.rex.sessions.contains_key("add-a-feature"));
 
-        f.serve.rex.sessions.remove("rxp:demo");
+        f.serve.rex.sessions.remove("rex-projects:demo");
         f.serve
             .rex
             .sessions
@@ -627,7 +642,7 @@ mod tests {
         assert_eq!(block.command[0], "/bin/rex-projects");
         assert_eq!(block.command[5..], ["agent", "exec", "demo-1-coordinator"]);
         assert_eq!(block.cwd, Path::new(&agent.cwd));
-        assert_eq!(f.serve.rex.sessions["rxp:demo"], block.session_id);
+        assert_eq!(f.serve.rex.sessions["rex-projects:demo"], block.session_id);
 
         let block_id = agent.rex_block_id.clone().unwrap();
         f.serve.rex.blocks.get_mut(&block_id).unwrap().status = Some(Status {
@@ -674,6 +689,10 @@ mod tests {
         f.tick();
         assert!(f.serve.rex.blocks.is_empty());
         assert_eq!(f.agent().state, "exited");
+        assert!(
+            f.serve.rex.sessions.is_empty(),
+            "the empty Project session is closed"
+        );
 
         let mut f = fixture();
         f.tick();
@@ -702,6 +721,32 @@ mod tests {
             f.serve.rex.blocks.is_empty(),
             "no relaunch for a done Ticket"
         );
+        assert!(f.serve.rex.sessions.is_empty());
+    }
+
+    #[test]
+    fn keeps_a_project_session_that_still_has_a_human_tab() {
+        let mut f = fixture();
+        f.tick();
+        let session = f.agent().rex_session_id.unwrap();
+        f.serve
+            .rex
+            .new_window(&session, "notes", &[], Path::new("/"))
+            .unwrap();
+        f.serve
+            .store
+            .append(
+                "human",
+                Event::TicketCancelled {
+                    ticket_id: "demo-1".into(),
+                    reason: "no".into(),
+                },
+            )
+            .unwrap();
+        f.tick();
+        assert_eq!(f.agent().state, "exited");
+        assert_eq!(f.serve.rex.blocks.len(), 1);
+        assert_eq!(f.serve.rex.sessions.len(), 1);
     }
 
     #[test]

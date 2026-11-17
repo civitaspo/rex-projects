@@ -24,9 +24,9 @@ transition.done = [{ argv = ["/bin/sh", "SH", "close", "{{ref}}"] }]
 fn run(dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_rex-projects"))
         .args(args)
-        .env("REXP_CONFIG_DIR", dir.join("config"))
-        .env("REXP_STATE_DIR", dir.join("state"))
-        .env_remove("REXP_AGENT_ID")
+        .env("REX_PROJECTS_CONFIG_DIR", dir.join("config"))
+        .env("REX_PROJECTS_STATE_DIR", dir.join("state"))
+        .env_remove("REX_PROJECTS_AGENT_ID")
         .output()
         .expect("failed to run rex-projects")
 }

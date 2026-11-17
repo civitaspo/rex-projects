@@ -8,7 +8,7 @@ Messages to an Agent go into its inbox in the state database, and the Agent read
 
 1. When a turn ends with unread messages, the Stop hook returns `decision: block` with the messages, so the turn continues.
 2. When a human submits a prompt, the UserPromptSubmit hook adds unread messages as context.
-3. When the Agent is `idle` and has unread messages, `serve` types one fixed line, the wake token (for example `/rxp-inbox`), into its terminal.
+3. When the Agent is `idle` and has unread messages, `serve` types one fixed line, the wake token (for example `/rex-projects-inbox`), into its terminal.
 
 `serve` never types a message body. The only body typed into a terminal is a human's own answer, sent with `rex-projects ticket answer --text` while the Coordinator is idle, which is the same as the human typing it into the pane. It types the wake token only when all of these hold, rechecking them immediately before typing:
 

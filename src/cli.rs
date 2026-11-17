@@ -18,10 +18,10 @@ use crate::store::{NewTicket, Store};
 )]
 pub struct Cli {
     /// Directory holding config.toml, Playbooks, and Roles.
-    #[arg(long, global = true, env = "REXP_CONFIG_DIR")]
+    #[arg(long, global = true, env = "REX_PROJECTS_CONFIG_DIR")]
     pub config_dir: Option<PathBuf>,
     /// Directory holding the state database and worktrees.
-    #[arg(long, global = true, env = "REXP_STATE_DIR")]
+    #[arg(long, global = true, env = "REX_PROJECTS_STATE_DIR")]
     pub state_dir: Option<PathBuf>,
     #[command(subcommand)]
     pub command: Command,
@@ -46,7 +46,7 @@ pub enum Command {
     /// Maintain the state database.
     #[command(subcommand)]
     Db(DbCommand),
-    /// Serve the Agent-facing MCP server on stdio. Requires REXP_AGENT_ID.
+    /// Serve the Agent-facing MCP server on stdio. Requires REX_PROJECTS_AGENT_ID.
     Mcp,
     /// Handle a harness hook. Reads the hook input from stdin.
     Hook {
@@ -220,7 +220,7 @@ pub enum DbCommand {
 
 /// Who an operation is attributed to: the calling Agent, or a human.
 pub fn actor() -> String {
-    std::env::var("REXP_AGENT_ID")
+    std::env::var("REX_PROJECTS_AGENT_ID")
         .ok()
         .filter(|id| !id.is_empty())
         .unwrap_or_else(|| "human".to_owned())
@@ -270,13 +270,13 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Tracker(command) => tracker_command(&paths, command),
         Command::Events(args) => events(&paths, args),
         Command::Mcp => {
-            let agent_id = std::env::var("REXP_AGENT_ID")
+            let agent_id = std::env::var("REX_PROJECTS_AGENT_ID")
                 .ok()
                 .filter(|id| !id.is_empty())
-                .context("REXP_AGENT_ID must be set to serve MCP")?;
-            let launch = std::env::var("REXP_AGENT_LAUNCH")
+                .context("REX_PROJECTS_AGENT_ID must be set to serve MCP")?;
+            let launch = std::env::var("REX_PROJECTS_AGENT_LAUNCH")
                 .ok()
-                .map(|l| l.parse::<i64>().context("invalid REXP_AGENT_LAUNCH"))
+                .map(|l| l.parse::<i64>().context("invalid REX_PROJECTS_AGENT_LAUNCH"))
                 .transpose()?;
             crate::mcp::Server::new(paths, agent_id, launch)
                 .serve(std::io::stdin().lock(), std::io::stdout().lock())
@@ -619,7 +619,7 @@ mod tests {
             )
             .unwrap();
         let mut rex = FakeRex::default();
-        let session = rex.ensure_session("rxp:demo", None).unwrap();
+        let session = rex.ensure_session("rex-projects:demo", None).unwrap();
         let window = rex
             .new_window(&session, "demo-1", &[], std::path::Path::new("/"))
             .unwrap();

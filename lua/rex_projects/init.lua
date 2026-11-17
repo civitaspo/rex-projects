@@ -50,12 +50,12 @@ end
 
 -- Registers the `rex_projects_dashboard` and `rex_projects_serve` actions.
 -- Options: `bin` (default "rex-projects"), `session` (the control session's
--- label, default "rxp"), and `keys.dashboard` / `keys.serve` to bind keys.
+-- label, default "rex-projects"), and `keys.dashboard` / `keys.serve` to bind keys.
 function M.setup(opts)
   opts = opts or {}
   local o = {
     bin = opts.bin or "rex-projects",
-    session = opts.session or "rxp",
+    session = opts.session or "rex-projects",
   }
   local keys = opts.keys or {}
 
