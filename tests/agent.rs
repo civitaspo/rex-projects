@@ -149,7 +149,11 @@ fn mcp_session_reports_asks_and_completes() {
     assert_eq!(ticket.state, TicketState::Done);
     assert_eq!(ticket.outcome, Some(Outcome::Delivered));
     assert_eq!(ticket.stage.as_deref(), Some("implement"));
-    assert_eq!(ticket.progress, Some(100), "delivery completes the progress");
+    assert_eq!(
+        ticket.progress,
+        Some(100),
+        "delivery completes the progress"
+    );
     assert_eq!(ticket.summary.as_deref(), Some("Shipped"));
     assert_eq!(ticket.artifacts, ["https://example.com/pr/1"]);
     let events = store(&env.state).events_since(0, 100).unwrap();
