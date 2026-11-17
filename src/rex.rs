@@ -42,6 +42,8 @@ pub trait Rex {
     /// Returns the root `program_status` record, if the program reported one.
     fn program_status(&mut self, session_id: &str, block_id: &str) -> Result<Option<Status>>;
     fn close_block(&mut self, session_id: &str, block_id: &str) -> Result<()>;
+    /// Destroys a session and every block left in it.
+    fn destroy_session(&mut self, session_id: &str) -> Result<()>;
     /// Types `text` into the block's program and presses Return.
     fn submit(&mut self, session_id: &str, block_id: &str, text: &str) -> Result<()>;
 }
@@ -201,6 +203,11 @@ impl Rex for RexCli {
         Ok(())
     }
 
+    fn destroy_session(&mut self, session_id: &str) -> Result<()> {
+        self.call("session.destroy", json!({ "session_id": session_id }))?;
+        Ok(())
+    }
+
     fn submit(&mut self, session_id: &str, block_id: &str, text: &str) -> Result<()> {
         // The text goes through stdin so that a leading `-` is not a flag.
         self.run(&["send", "-s", session_id, "-b", block_id], text)?;
@@ -311,6 +318,12 @@ pub mod fake {
 
         fn close_block(&mut self, _session_id: &str, block_id: &str) -> Result<()> {
             self.blocks.remove(block_id);
+            Ok(())
+        }
+
+        fn destroy_session(&mut self, session_id: &str) -> Result<()> {
+            self.sessions.retain(|_, id| id != session_id);
+            self.blocks.retain(|_, b| b.session_id != session_id);
             Ok(())
         }
 

@@ -77,15 +77,15 @@ impl Env {
         let mut command = Command::new(env!("CARGO_BIN_EXE_rex-projects"));
         command
             .args(args)
-            .env("REXP_CONFIG_DIR", &self.config)
-            .env("REXP_STATE_DIR", &self.state)
-            .env_remove("REXP_AGENT_ID")
-            .env_remove("REXP_AGENT_LAUNCH")
+            .env("REX_PROJECTS_CONFIG_DIR", &self.config)
+            .env("REX_PROJECTS_STATE_DIR", &self.state)
+            .env_remove("REX_PROJECTS_AGENT_ID")
+            .env_remove("REX_PROJECTS_AGENT_LAUNCH")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(agent) = agent {
-            command.env("REXP_AGENT_ID", agent);
+            command.env("REX_PROJECTS_AGENT_ID", agent);
         }
         let mut child = command.spawn().expect("failed to run rex-projects");
         child

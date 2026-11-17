@@ -4,7 +4,7 @@ status: accepted
 
 # Interactive Agents in Rex panes
 
-Every Agent runs as an interactive Claude Code or Codex TUI in its own Rex block. A human can talk to any Agent directly. rex-projects passes identity through environment variables (`REXP_AGENT_ID`, `REXP_TICKET_ID`, and so on), and the MCP server and hooks use them to identify the caller. They never rely on a hook configuration shared across a workspace.
+Every Agent runs as an interactive Claude Code or Codex TUI in its own Rex block. A human can talk to any Agent directly. rex-projects passes identity through environment variables (`REX_PROJECTS_AGENT_ID`, `REX_PROJECTS_TICKET_ID`, and so on), and the MCP server and hooks use them to identify the caller. They never rely on a hook configuration shared across a workspace.
 
 rex-projects observes Agents through three structured channels and never scrapes the screen:
 
@@ -16,7 +16,7 @@ The resumable session ID does not depend on hooks. rex-projects chooses Claude C
 
 When an Agent's block disappears, rex-projects resumes a Coordinator with the harness's resume command in the Ticket's tab, recreating the tab if it closed, a bounded number of times. For a helper Agent, it only notifies the Coordinator. It does not try to prove that the process has exited before releasing capacity. It records the process IDs it saw and shows anomalies to the human.
 
-To fence a process that outlives its block, every launch of an Agent has a generation number, passed to the harness as `REXP_AGENT_LAUNCH`. The MCP server and hooks reject writes whose generation is not the Agent's latest, so an old process cannot change the Ticket after a new one resumes.
+To fence a process that outlives its block, every launch of an Agent has a generation number, passed to the harness as `REX_PROJECTS_AGENT_LAUNCH`. The MCP server and hooks reject writes whose generation is not the Agent's latest, so an old process cannot change the Ticket after a new one resumes.
 
 ## Considered Options
 

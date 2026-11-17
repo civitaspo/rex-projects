@@ -4,9 +4,9 @@ use std::process::{Command, Output};
 fn run(config_dir: &Path, state_dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_rex-projects"))
         .args(args)
-        .env("REXP_CONFIG_DIR", config_dir)
-        .env("REXP_STATE_DIR", state_dir)
-        .env_remove("REXP_AGENT_ID")
+        .env("REX_PROJECTS_CONFIG_DIR", config_dir)
+        .env("REX_PROJECTS_STATE_DIR", state_dir)
+        .env_remove("REX_PROJECTS_AGENT_ID")
         .output()
         .expect("failed to run rex-projects")
 }

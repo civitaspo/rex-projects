@@ -18,10 +18,10 @@ use crate::store::{NewTicket, Store};
 )]
 pub struct Cli {
     /// Directory holding config.toml, Playbooks, and Roles.
-    #[arg(long, global = true, env = "REXP_CONFIG_DIR")]
+    #[arg(long, global = true, env = "REX_PROJECTS_CONFIG_DIR")]
     pub config_dir: Option<PathBuf>,
     /// Directory holding the state database and worktrees.
-    #[arg(long, global = true, env = "REXP_STATE_DIR")]
+    #[arg(long, global = true, env = "REX_PROJECTS_STATE_DIR")]
     pub state_dir: Option<PathBuf>,
     #[command(subcommand)]
     pub command: Command,
@@ -46,7 +46,7 @@ pub enum Command {
     /// Maintain the state database.
     #[command(subcommand)]
     Db(DbCommand),
-    /// Serve the Agent-facing MCP server on stdio. Requires REXP_AGENT_ID.
+    /// Serve the Agent-facing MCP server on stdio. Requires REX_PROJECTS_AGENT_ID.
     Mcp,
     /// Handle a harness hook. Reads the hook input from stdin.
     Hook {
@@ -220,7 +220,7 @@ pub enum DbCommand {
 
 /// Who an operation is attributed to: the calling Agent, or a human.
 pub fn actor() -> String {
-    std::env::var("REXP_AGENT_ID")
+    std::env::var("REX_PROJECTS_AGENT_ID")
         .ok()
         .filter(|id| !id.is_empty())
         .unwrap_or_else(|| "human".to_owned())
@@ -231,6 +231,7 @@ pub fn run(cli: Cli) -> Result<()> {
         crate::hook::main(cli.config_dir, cli.state_dir, provider, event);
         return Ok(());
     }
+    reject_old_env(std::env::vars_os().map(|(name, _)| name))?;
     let paths = Paths::resolve(cli.config_dir, cli.state_dir)?;
     match cli.command {
         Command::Config(ConfigCommand::Check) => {
@@ -270,13 +271,16 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Tracker(command) => tracker_command(&paths, command),
         Command::Events(args) => events(&paths, args),
         Command::Mcp => {
-            let agent_id = std::env::var("REXP_AGENT_ID")
+            let agent_id = std::env::var("REX_PROJECTS_AGENT_ID")
                 .ok()
                 .filter(|id| !id.is_empty())
-                .context("REXP_AGENT_ID must be set to serve MCP")?;
-            let launch = std::env::var("REXP_AGENT_LAUNCH")
+                .context("REX_PROJECTS_AGENT_ID must be set to serve MCP")?;
+            let launch = std::env::var("REX_PROJECTS_AGENT_LAUNCH")
                 .ok()
-                .map(|l| l.parse::<i64>().context("invalid REXP_AGENT_LAUNCH"))
+                .map(|l| {
+                    l.parse::<i64>()
+                        .context("invalid REX_PROJECTS_AGENT_LAUNCH")
+                })
                 .transpose()?;
             crate::mcp::Server::new(paths, agent_id, launch)
                 .serve(std::io::stdin().lock(), std::io::stdout().lock())
@@ -554,6 +558,30 @@ fn events(paths: &Paths, args: EventsArgs) -> Result<()> {
     }
 }
 
+/// Fails when environment variables use the old `REXP_` prefix, which is
+/// ignored now. Ignoring `REXP_STATE_DIR` silently would open a different
+/// state database, and an Agent started with `REXP_AGENT_ID` would lose its
+/// identity.
+fn reject_old_env(names: impl Iterator<Item = std::ffi::OsString>) -> Result<()> {
+    let mut old: Vec<String> = names
+        .filter_map(|name| name.into_string().ok())
+        .filter(|name| name.starts_with("REXP_"))
+        .collect();
+    if old.is_empty() {
+        return Ok(());
+    }
+    old.sort();
+    let renamed: Vec<String> = old
+        .iter()
+        .map(|name| format!("{name} -> REX_PROJECTS_{}", &name["REXP_".len()..]))
+        .collect();
+    bail!(
+        "the REXP_ environment variables were renamed: {}. Set the new names \
+         and unset the old ones; restart Agents that were started before the rename",
+        renamed.join(", ")
+    );
+}
+
 /// Answers a waiting Ticket. A text answer is submitted in the Coordinator's
 /// pane first, so the Ticket only leaves `waiting` once the Coordinator has it.
 fn answer(
@@ -627,7 +655,7 @@ mod tests {
             )
             .unwrap();
         let mut rex = FakeRex::default();
-        let session = rex.ensure_session("rxp:demo", None).unwrap();
+        let session = rex.ensure_session("rex-projects:demo", None).unwrap();
         let window = rex
             .new_window(&session, "demo-1", &[], std::path::Path::new("/"))
             .unwrap();
@@ -690,6 +718,23 @@ mod tests {
 
         let err = answer(&mut store, &mut rex, "human", "demo-1", None).unwrap_err();
         assert!(err.to_string().contains("not waiting"), "{err}");
+    }
+
+    #[test]
+    fn rejects_the_old_environment_variable_prefix() {
+        let names = |list: &[&str]| {
+            list.iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+                .into_iter()
+        };
+        reject_old_env(names(&["PATH", "REX_PROJECTS_STATE_DIR"])).unwrap();
+        let err = reject_old_env(names(&["REXP_STATE_DIR", "PATH"])).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("REXP_STATE_DIR -> REX_PROJECTS_STATE_DIR"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -27,16 +27,19 @@ pub fn main(config_dir: Option<PathBuf>, state_dir: Option<PathBuf>, provider: &
     // Drain stdin so the harness never sees a broken pipe.
     let mut input = Vec::new();
     let read = std::io::stdin().read_to_end(&mut input);
-    let Some(agent_id) = std::env::var("REXP_AGENT_ID")
+    let Some(agent_id) = std::env::var("REX_PROJECTS_AGENT_ID")
         .ok()
         .filter(|id| !id.is_empty())
     else {
         return;
     };
-    let launch = std::env::var("REXP_AGENT_LAUNCH").ok();
+    let launch = std::env::var("REX_PROJECTS_AGENT_LAUNCH").ok();
     let result = read.context("failed to read hook input").and_then(|_| {
         let launch = launch
-            .map(|l| l.parse::<i64>().context("invalid REXP_AGENT_LAUNCH"))
+            .map(|l| {
+                l.parse::<i64>()
+                    .context("invalid REX_PROJECTS_AGENT_LAUNCH")
+            })
             .transpose()?;
         let paths = Paths::resolve(config_dir, state_dir)?;
         handle(&paths, &agent_id, launch, provider, event, &input)
