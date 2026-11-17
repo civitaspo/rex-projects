@@ -17,6 +17,7 @@ use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::domain::{Agent, Event as StoreEvent, Ticket, TicketState};
+use crate::history::{self, Entry};
 use crate::paths::Paths;
 use crate::store::Store;
 
@@ -25,6 +26,8 @@ const REFRESH: Duration = Duration::from_secs(1);
 /// Terminal Tickets older than this are hidden unless `a` shows all.
 const TERMINAL_RETENTION: chrono::Duration = chrono::Duration::days(1);
 const SILENCE: chrono::Duration = chrono::Duration::seconds(60);
+/// The dashboard shows the history pane only when its body is this tall.
+const MIN_HEIGHT_FOR_HISTORY: u16 = 14;
 
 /// Where a Ticket's Coordinator runs in Rex.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -205,6 +208,8 @@ struct App {
     selected: usize,
     show_all: bool,
     status: Option<String>,
+    /// The history of the selected Ticket.
+    history: Vec<Entry>,
 }
 
 impl App {
@@ -242,6 +247,16 @@ impl App {
             Ok(rows) => self.set_rows(rows),
             Err(err) => self.status = Some(format!("refresh failed: {err:#}")),
         }
+        self.history = match self.selected_row() {
+            Some(row) => match store.ticket_events(&row.ticket_id) {
+                Ok(events) => history::entries(&events),
+                Err(err) => {
+                    self.status = Some(format!("history failed: {err:#}"));
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
     }
 }
 
@@ -367,6 +382,63 @@ fn truncate(text: &str, width: usize) -> String {
     out
 }
 
+/// How many rows one history entry may take in the dashboard. `ticket show`
+/// prints entries in full.
+const HISTORY_ENTRY_ROWS: usize = 2;
+
+/// The newest history entries that fit in `height` rows of `width` columns,
+/// oldest first. Each entry is wrapped by column and cut to
+/// [`HISTORY_ENTRY_ROWS`] rows, ending in `…` when cut.
+fn history_lines(entries: &[Entry], width: usize, height: usize) -> Vec<Line<'static>> {
+    let mut blocks = Vec::new();
+    let mut used = 0;
+    for entry in entries.iter().rev() {
+        let prefix = format!("{}  ", entry.at);
+        let rows = wrap_columns(
+            &format!("{prefix}{}", entry.text),
+            width.max(prefix.len() + 1),
+            HISTORY_ENTRY_ROWS,
+        );
+        if used + rows.len() > height {
+            break;
+        }
+        used += rows.len();
+        let mut lines: Vec<Line> = rows.into_iter().map(Line::from).collect();
+        if let Some(first) = lines.first_mut() {
+            let rest = first.to_string().split_off(prefix.len());
+            *first = Line::from(vec![
+                Span::styled(prefix, Style::new().fg(Color::DarkGray)),
+                Span::raw(rest),
+            ]);
+        }
+        blocks.push(lines);
+    }
+    blocks.into_iter().rev().flatten().collect()
+}
+
+/// Splits `text` into rows of at most `width` display columns, at most
+/// `max_rows` of them, marking a cut with `…`.
+fn wrap_columns(text: &str, width: usize, max_rows: usize) -> Vec<String> {
+    let mut rows = vec![String::new()];
+    let mut columns = 0;
+    for ch in text.chars().map(|c| if c == '\n' { ' ' } else { c }) {
+        let w = Span::raw(ch.to_string()).width();
+        if columns + w > width {
+            if rows.len() == max_rows {
+                let last = rows.last_mut().expect("rows is never empty");
+                last.pop();
+                last.push('…');
+                return rows;
+            }
+            rows.push(String::new());
+            columns = 0;
+        }
+        rows.last_mut().expect("rows is never empty").push(ch);
+        columns += w;
+    }
+    rows
+}
+
 fn draw(frame: &mut Frame, app: &App) {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(1),
@@ -420,9 +492,30 @@ fn draw(frame: &mut Frame, app: &App) {
             "No tickets. Create one with `rex-projects ticket new`.",
         ));
     }
+    // The selected Ticket's history takes the lower part when there is room.
+    let (body, history_area) = if body.height >= MIN_HEIGHT_FOR_HISTORY {
+        let [list, history] =
+            Layout::vertical([Constraint::Min(5), Constraint::Percentage(40)]).areas(body);
+        (list, Some(history))
+    } else {
+        (body, None)
+    };
     let list = List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default().with_selected(selected_item);
     frame.render_stateful_widget(list, body, &mut state);
+    if let (Some(area), Some(row)) = (history_area, app.selected_row()) {
+        let heading = Line::from(Span::styled(
+            format!("History of {}", row.ticket_id),
+            Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ));
+        let lines = history_lines(
+            &app.history,
+            area.width as usize,
+            area.height.saturating_sub(1) as usize,
+        );
+        let text: Vec<Line> = std::iter::once(heading).chain(lines).collect();
+        frame.render_widget(Paragraph::new(text), area);
+    }
 
     let keys = "j/k move  enter jump  r ready  a all  q quit";
     let footer_text = match &app.status {
@@ -544,6 +637,32 @@ mod tests {
             rows[0].text,
             "No status from the Coordinator; check its pane"
         );
+    }
+
+    #[test]
+    fn history_keeps_the_newest_entries_that_fit() {
+        let entry = |text: &str| Entry {
+            at: "11-17 23:10".to_owned(),
+            text: text.to_owned(),
+        };
+        let entries = [entry("old"), entry("middle"), entry(&"x".repeat(60))];
+        // "11-17 23:10  " is 13 columns; the long entry is cut to 2 rows of 20.
+        let lines = history_lines(&entries, 20, 3);
+        let texts: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        assert_eq!(
+            texts,
+            [
+                "11-17 23:10  middle",
+                format!("11-17 23:10  {}", "x".repeat(7)).as_str(),
+                format!("{}…", "x".repeat(19)).as_str(),
+            ]
+        );
+    }
+
+    #[test]
+    fn wraps_wide_characters_by_column() {
+        assert_eq!(wrap_columns("あいうえ", 4, 3), ["あい", "うえ"]);
+        assert_eq!(wrap_columns("あいうえお", 4, 2), ["あい", "う…"]);
     }
 
     #[test]

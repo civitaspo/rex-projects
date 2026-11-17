@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS events (
   kind TEXT NOT NULL,
   payload TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS events_by_ticket ON events (ticket_id, seq);
 CREATE TABLE IF NOT EXISTS tickets (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL,
@@ -212,11 +213,25 @@ impl Store {
 
     /// Returns events after `after_seq`, oldest first, at most `limit`.
     pub fn events_since(&self, after_seq: i64, limit: i64) -> Result<Vec<StoredEvent>> {
-        let mut stmt = self.conn.prepare(
+        self.query_events(
             "SELECT seq, at, actor, project_id, ticket_id, agent_id, payload
              FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![after_seq, limit], |row| {
+            params![after_seq, limit],
+        )
+    }
+
+    /// Every event about one Ticket or its Agents, oldest first.
+    pub fn ticket_events(&self, ticket_id: &str) -> Result<Vec<StoredEvent>> {
+        self.query_events(
+            "SELECT seq, at, actor, project_id, ticket_id, agent_id, payload
+             FROM events WHERE ticket_id = ?1 ORDER BY seq",
+            params![ticket_id],
+        )
+    }
+
+    fn query_events(&self, sql: &str, args: impl rusqlite::Params) -> Result<Vec<StoredEvent>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(args, |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,

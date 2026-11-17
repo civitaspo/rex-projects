@@ -367,7 +367,15 @@ fn ticket(paths: &Paths, command: TicketCommand) -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&ticket)?);
             } else {
-                print_ticket(&mut std::io::stdout().lock(), &ticket)?;
+                let mut out = std::io::stdout().lock();
+                print_ticket(&mut out, &ticket)?;
+                let history = crate::history::entries(&store.ticket_events(&id)?);
+                if !history.is_empty() {
+                    writeln!(out, "\nHistory:")?;
+                    for entry in history {
+                        writeln!(out, "  {}  {}", entry.at, entry.text)?;
+                    }
+                }
             }
         }
         TicketCommand::Ready { id } => {
