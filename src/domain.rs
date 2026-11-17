@@ -81,6 +81,22 @@ pub enum Outcome {
     Failed,
 }
 
+impl Outcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::Abandoned => "abandoned",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl fmt::Display for Outcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A link from a Ticket to an item in an external tracker.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalRef {
