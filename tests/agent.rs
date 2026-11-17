@@ -202,7 +202,7 @@ fn hook_errors_never_fail_the_harness() {
 }
 
 #[test]
-fn ticket_answer_resumes_a_waiting_ticket() {
+fn ticket_answer_needs_a_pane_for_text() {
     let env = Env::dispatched();
     store(&env.state)
         .append(
@@ -213,7 +213,14 @@ fn ticket_answer_resumes_a_waiting_ticket() {
             },
         )
         .unwrap();
+    // A text answer needs a Coordinator pane to type into; this one never launched.
     let output = env.run(&["ticket", "answer", "demo-1", "--text", "v2"], None, "");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no running Coordinator"));
+    assert_eq!(env.ticket().state, TicketState::Waiting);
+
+    // Without text, the human already replied in the pane.
+    let output = env.run(&["ticket", "answer", "demo-1"], None, "");
     assert!(
         output.status.success(),
         "{}",

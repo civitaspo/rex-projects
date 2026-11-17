@@ -279,7 +279,25 @@ fn status(store: &Store, ticket_id: &str) -> Result<Value> {
     let t = store
         .ticket(ticket_id)?
         .with_context(|| format!("ticket {ticket_id} does not exist"))?;
+    let closed: Vec<String> = t
+        .closed_refs()
+        .map(|r| {
+            format!(
+                "{} {} is {}",
+                r.tracker,
+                r.reference,
+                r.closed_externally.as_deref().unwrap_or_default()
+            )
+        })
+        .collect();
+    let notice = (!closed.is_empty()).then(|| {
+        format!(
+            "Someone closed this Ticket's external item outside rex-projects ({}). Call `ask` to confirm whether to continue.",
+            closed.join(", ")
+        )
+    });
     Ok(json!({
+        "notice": notice,
         "id": t.id,
         "state": t.state,
         "stage": t.stage,
@@ -386,6 +404,12 @@ pub(crate) mod tests {
                     title: "Add a feature".into(),
                     body: "The Brief".into(),
                     ready: true,
+                    external_refs: vec![crate::domain::ExternalRef {
+                        tracker: "acme".into(),
+                        reference: "A-1".into(),
+                        url: None,
+                        closed_externally: None,
+                    }],
                     ..Default::default()
                 },
             )
@@ -557,6 +581,33 @@ pub(crate) mod tests {
         let (is_error, text) = call(&server, "report", json!({"summary": "more"}));
         assert!(is_error);
         assert!(text.contains("while it is done"), "{text}");
+    }
+
+    #[test]
+    fn tells_the_coordinator_about_external_closes() {
+        let (_dir, server) = setup("demo-1-coordinator");
+        let (_, text) = call(&server, "report", json!({"stage": "plan"}));
+        assert!(!text.contains("closed this Ticket"), "{text}");
+        Store::open(&server.paths.db_file())
+            .unwrap()
+            .append(
+                "tracker",
+                Event::ExternalChanged {
+                    ticket_id: "demo-1".into(),
+                    tracker: "acme".into(),
+                    reference: "A-1".into(),
+                    status: "canceled".into(),
+                },
+            )
+            .unwrap();
+        let (is_error, text) = call(&server, "report", json!({"stage": "implement"}));
+        assert!(!is_error, "{text}");
+        assert!(text.contains("acme A-1 is canceled"), "{text}");
+        let (_, text) = call(&server, "ticket_get", json!({}));
+        assert!(
+            text.contains("\"closed_externally\": \"canceled\""),
+            "{text}"
+        );
     }
 
     #[test]

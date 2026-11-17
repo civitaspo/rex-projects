@@ -116,7 +116,11 @@ pub enum TicketCommand {
     },
     /// Mark a backlog Ticket ready to run.
     Ready { id: String },
-    /// Mark a waiting Ticket answered so its Coordinator continues.
+    /// Answer a waiting Ticket's question.
+    ///
+    /// With `--text`, the answer is typed into the Coordinator's pane and
+    /// submitted. Without it, the Ticket is only marked answered, for when you
+    /// already replied in the pane and the harness has no hook to record it.
     Answer {
         id: String,
         #[arg(long)]
@@ -143,7 +147,12 @@ pub enum TicketCommand {
         reason: String,
     },
     /// Remove the worktree and branch of an ended Ticket.
-    Cleanup { id: String },
+    Cleanup {
+        id: String,
+        /// Also delete ignored files, such as `.env` or build output.
+        #[arg(long)]
+        discard_ignored: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -369,12 +378,12 @@ fn ticket(paths: &Paths, command: TicketCommand) -> Result<()> {
             println!("{id} is ready");
         }
         TicketCommand::Answer { id, text } => {
-            store.append(
+            answer(
+                &mut store,
+                &mut crate::rex::RexCli::new(),
                 &actor(),
-                Event::TicketAnswered {
-                    ticket_id: id.clone(),
-                    answer: text,
-                },
+                &id,
+                text,
             )?;
             println!("{id} is running");
         }
@@ -411,9 +420,12 @@ fn ticket(paths: &Paths, command: TicketCommand) -> Result<()> {
             )?;
             println!("{id} is abandoned");
         }
-        TicketCommand::Cleanup { id } => {
+        TicketCommand::Cleanup {
+            id,
+            discard_ignored,
+        } => {
             let config = Config::load(&paths.config_file())?;
-            crate::worktree::cleanup_ticket(paths, &config, &store, &id)?;
+            crate::worktree::cleanup_ticket(paths, &config, &store, &id, discard_ignored)?;
             println!("removed the worktree of {id}");
         }
     }
@@ -512,5 +524,155 @@ fn events(paths: &Paths, args: EventsArgs) -> Result<()> {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Answers a waiting Ticket. A text answer is submitted in the Coordinator's
+/// pane first, so the Ticket only leaves `waiting` once the Coordinator has it.
+fn answer(
+    store: &mut Store,
+    rex: &mut impl crate::rex::Rex,
+    actor: &str,
+    id: &str,
+    text: Option<String>,
+) -> Result<()> {
+    let waiting = |store: &Store| -> Result<bool> {
+        let ticket = store
+            .ticket(id)?
+            .with_context(|| format!("ticket {id} does not exist"))?;
+        Ok(ticket.state == TicketState::Waiting)
+    };
+    if !waiting(store)? {
+        bail!("ticket {id} is not waiting for an answer");
+    }
+    if let Some(text) = &text {
+        let coordinator = store
+            .agents_for_ticket(id)?
+            .into_iter()
+            .find(|a| a.role == "coordinator" && a.state != "exited");
+        let (Some(session), Some(block)) = (
+            coordinator.as_ref().and_then(|a| a.rex_session_id.clone()),
+            coordinator.as_ref().and_then(|a| a.rex_block_id.clone()),
+        ) else {
+            bail!("ticket {id} has no running Coordinator to answer; start `serve` first");
+        };
+        // `idle` and `done` both mean the harness is waiting for input.
+        let status = rex.program_status(&session, &block)?.map(|s| s.state);
+        if !matches!(status.as_deref(), Some("idle" | "done")) {
+            bail!(
+                "the Coordinator of {id} is {}, not idle; answer in its pane instead",
+                status.as_deref().unwrap_or("not reporting a status")
+            );
+        }
+        rex.submit(&session, &block, text)?;
+    }
+    // The harness's prompt hook may already have recorded the answer.
+    let answered = store.append(
+        actor,
+        Event::TicketAnswered {
+            ticket_id: id.to_owned(),
+            answer: text,
+        },
+    );
+    match answered {
+        Err(_) if !waiting(store)? => Ok(()),
+        other => other.map(drop),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rex::fake::{Block, FakeRex};
+    use crate::rex::{Rex, Status};
+
+    fn waiting_ticket() -> (Store, FakeRex, String) {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .create_ticket(
+                "human",
+                NewTicket {
+                    project_id: "demo".into(),
+                    title: "T".into(),
+                    ready: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut rex = FakeRex::default();
+        let session = rex.ensure_session("rxp:demo", None).unwrap();
+        let window = rex
+            .new_window(&session, "demo-1", &[], std::path::Path::new("/"))
+            .unwrap();
+        for event in [
+            Event::AgentCreated {
+                agent_id: "demo-1-coordinator".into(),
+                ticket_id: "demo-1".into(),
+                project_id: "demo".into(),
+                role: "coordinator".into(),
+                provider: "claude".into(),
+                cwd: "/".into(),
+            },
+            Event::TicketDispatched {
+                ticket_id: "demo-1".into(),
+                agent_id: "demo-1-coordinator".into(),
+            },
+            Event::AgentLaunched {
+                agent_id: "demo-1-coordinator".into(),
+                rex_session_id: session,
+                rex_window_id: window.window_id,
+                rex_block_id: window.block_id.clone(),
+                resume: false,
+            },
+            Event::TicketAsked {
+                ticket_id: "demo-1".into(),
+                question: "Which API?".into(),
+            },
+        ] {
+            store.append("serve", event).unwrap();
+        }
+        (store, rex, window.block_id)
+    }
+
+    fn block<'a>(rex: &'a mut FakeRex, id: &str) -> &'a mut Block {
+        rex.blocks.get_mut(id).unwrap()
+    }
+
+    #[test]
+    fn submits_a_text_answer_to_an_idle_coordinator() {
+        let (mut store, mut rex, block_id) = waiting_ticket();
+        let text = Some("Use v2".to_owned());
+
+        let err = answer(&mut store, &mut rex, "human", "demo-1", text.clone()).unwrap_err();
+        assert!(err.to_string().contains("not idle"), "{err}");
+        assert_eq!(
+            store.ticket("demo-1").unwrap().unwrap().state,
+            TicketState::Waiting
+        );
+
+        block(&mut rex, &block_id).status = Some(Status {
+            state: "idle".into(),
+            message: None,
+        });
+        answer(&mut store, &mut rex, "human", "demo-1", text).unwrap();
+        assert_eq!(block(&mut rex, &block_id).input, ["Use v2"]);
+        assert_eq!(
+            store.ticket("demo-1").unwrap().unwrap().state,
+            TicketState::Running
+        );
+
+        let err = answer(&mut store, &mut rex, "human", "demo-1", None).unwrap_err();
+        assert!(err.to_string().contains("not waiting"), "{err}");
+    }
+
+    #[test]
+    fn marks_a_ticket_answered_in_the_pane() {
+        let (mut store, mut rex, block_id) = waiting_ticket();
+        answer(&mut store, &mut rex, "human", "demo-1", None).unwrap();
+        assert!(block(&mut rex, &block_id).input.is_empty());
+        assert_eq!(
+            store.ticket("demo-1").unwrap().unwrap().state,
+            TicketState::Running
+        );
     }
 }

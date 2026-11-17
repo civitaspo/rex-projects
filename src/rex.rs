@@ -1,7 +1,8 @@
 //! The Rex operations rex-projects needs, through the `rex` CLI.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -41,6 +42,8 @@ pub trait Rex {
     /// Returns the root `program_status` record, if the program reported one.
     fn program_status(&mut self, session_id: &str, block_id: &str) -> Result<Option<Status>>;
     fn close_block(&mut self, session_id: &str, block_id: &str) -> Result<()>;
+    /// Types `text` into the block's program and presses Return.
+    fn submit(&mut self, session_id: &str, block_id: &str, text: &str) -> Result<()>;
 }
 
 /// Calls the Rex server through `rex api call`.
@@ -71,6 +74,30 @@ impl RexCli {
         }
         serde_json::from_slice(&output.stdout)
             .with_context(|| format!("rex api call {method} returned invalid JSON"))
+    }
+
+    fn run(&self, args: &[&str], stdin: &str) -> Result<()> {
+        let mut child = Command::new(&self.bin)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("failed to run {}", self.bin.display()))?;
+        child
+            .stdin
+            .take()
+            .context("rex has no stdin")?
+            .write_all(stdin.as_bytes())?;
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            bail!(
+                "rex {} failed: {}",
+                args[0],
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
     }
 }
 
@@ -173,6 +200,12 @@ impl Rex for RexCli {
         )?;
         Ok(())
     }
+
+    fn submit(&mut self, session_id: &str, block_id: &str, text: &str) -> Result<()> {
+        // The text goes through stdin so that a leading `-` is not a flag.
+        self.run(&["send", "-s", session_id, "-b", block_id], text)?;
+        self.run(&["send-key", "-s", session_id, "-b", block_id, "enter"], "")
+    }
 }
 
 /// Shortens `text` to at most `max` characters.
@@ -194,6 +227,8 @@ pub mod fake {
         pub command: Vec<String>,
         pub cwd: PathBuf,
         pub status: Option<Status>,
+        /// Lines submitted with [`Rex::submit`].
+        pub input: Vec<String>,
     }
 
     #[derive(Default)]
@@ -252,6 +287,7 @@ pub mod fake {
                     command: command.to_vec(),
                     cwd: cwd.to_path_buf(),
                     status: None,
+                    input: Vec::new(),
                 },
             );
             Ok(Window {
@@ -275,6 +311,15 @@ pub mod fake {
 
         fn close_block(&mut self, _session_id: &str, block_id: &str) -> Result<()> {
             self.blocks.remove(block_id);
+            Ok(())
+        }
+
+        fn submit(&mut self, _session_id: &str, block_id: &str, text: &str) -> Result<()> {
+            self.blocks
+                .get_mut(block_id)
+                .context("no such block")?
+                .input
+                .push(text.to_owned());
             Ok(())
         }
     }
