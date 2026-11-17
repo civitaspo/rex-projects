@@ -32,7 +32,9 @@ fn creates_lists_and_cancels_tickets() {
     )
     .unwrap();
 
-    assert!(stdout(&run(&config, &state, &["config", "check"])).contains("1 project(s)"));
+    assert!(
+        stdout(&run(&config, &state, &["config", "check"])).contains("1 project(s), 0 tracker(s)")
+    );
     assert_eq!(
         stdout(&run(&config, &state, &["project", "list"])).trim(),
         "demo\t/tmp/demo"
@@ -104,4 +106,41 @@ fn creates_lists_and_cancels_tickets() {
             "ticket_cancelled"
         ]
     );
+}
+
+#[test]
+fn config_check_validates_trackers() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&config).unwrap();
+    let write = |done: &str| {
+        std::fs::write(
+            config.join("config.toml"),
+            format!(
+                r#"[[projects]]
+id = "demo"
+repo = "/tmp/demo"
+tracker = {{ name = "acme" }}
+
+[trackers.acme]
+get = {{ argv = ["acme", "show", "{{{{ref}}}}"], map = '{{ref: .key, title: .title}}' }}
+comment = {{ argv = ["acme", "comment", "{{{{ref}}}}", "{{{{body}}}}"] }}
+transition.done = [{{ argv = ["acme", "close", "{done}"] }}]
+"#
+            ),
+        )
+        .unwrap();
+    };
+
+    write("{{ref}}");
+    assert!(
+        stdout(&run(&config, &state, &["config", "check"])).contains("1 project(s), 1 tracker(s)")
+    );
+
+    write("{{nope}}");
+    let invalid = run(&config, &state, &["config", "check"]);
+    assert!(!invalid.status.success());
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(stderr.contains("{{nope}}"), "unexpected error: {stderr}");
 }
