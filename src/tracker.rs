@@ -914,7 +914,9 @@ fn poll(store: &mut Store, config: &Config, trackers: &Trackers) -> Result<()> {
             )?;
             // Record closes, and reopens of items recorded as closed.
             if crate::domain::is_closed_status(status)
-                || previous.as_deref().is_some_and(crate::domain::is_closed_status)
+                || previous
+                    .as_deref()
+                    .is_some_and(crate::domain::is_closed_status)
             {
                 store.append(
                     "tracker",

@@ -634,7 +634,9 @@ pub(crate) mod tests {
         assert!(!text.contains("acme A-1 is canceled"), "{text}");
         assert!(ticket(&server).unacknowledged_closes().next().is_none());
         assert_eq!(
-            ticket(&server).external_refs[0].closed_externally.as_deref(),
+            ticket(&server).external_refs[0]
+                .closed_externally
+                .as_deref(),
             Some("canceled")
         );
     }
