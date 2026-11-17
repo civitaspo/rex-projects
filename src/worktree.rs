@@ -9,6 +9,10 @@ use crate::config::Config;
 use crate::paths::Paths;
 use crate::store::Store;
 
+/// Lists untracked and ignored files even when the repository sets
+/// `status.showUntrackedFiles=no`, which hides both.
+const UNTRACKED: &str = "--untracked-files=normal";
+
 /// The branch a Ticket's worktree is on.
 pub fn branch(ticket_id: &str) -> String {
     format!("rex-projects/{ticket_id}")
@@ -79,14 +83,14 @@ pub fn remove(
     discard_ignored: bool,
 ) -> Result<()> {
     if dir.exists() {
-        let status = git(dir, &["status", "--porcelain"])?;
+        let status = git(dir, &["status", "--porcelain", UNTRACKED])?;
         if !status.is_empty() {
             bail!(
                 "{} has uncommitted changes; commit or discard them first",
                 dir.display()
             );
         }
-        let ignored = git(dir, &["status", "--porcelain", "--ignored"])?;
+        let ignored = git(dir, &["status", "--porcelain", "--ignored", UNTRACKED])?;
         let ignored: Vec<&str> = ignored
             .lines()
             .filter_map(|l| l.strip_prefix("!! "))
@@ -205,6 +209,29 @@ pub(crate) mod tests {
             git(repo, args).unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn finds_ignored_files_when_untracked_files_are_hidden() {
+        let repo = temp_repo();
+        git(repo.path(), &["config", "status.showUntrackedFiles", "no"]).unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let dir = state.path().join("demo/demo-1");
+        ensure(repo.path(), &dir, &branch("demo-1"), None).unwrap();
+        std::fs::write(dir.join(".gitignore"), ".env\n").unwrap();
+        git(&dir, &["add", ".gitignore"]).unwrap();
+        git(&dir, &["commit", "-q", "-m", "ignore"]).unwrap();
+        git(&dir, &["update-ref", "refs/remotes/origin/x", "HEAD"]).unwrap();
+        std::fs::write(dir.join(".env"), "SECRET=1").unwrap();
+
+        let err = remove(repo.path(), &dir, &branch("demo-1"), None, false).unwrap_err();
+        assert!(err.to_string().contains(".env"), "{err}");
+
+        // An untracked file is not hidden either.
+        std::fs::write(dir.join("notes.md"), "x").unwrap();
+        let err = remove(repo.path(), &dir, &branch("demo-1"), None, true).unwrap_err();
+        assert!(err.to_string().contains("uncommitted"), "{err}");
+        assert!(dir.join(".env").exists());
     }
 
     #[test]

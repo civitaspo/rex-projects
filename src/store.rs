@@ -517,9 +517,23 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event) -> Result<()> {
                 params![ticket_id, question],
             )?;
         }
-        Event::TicketAnswered { ticket_id, .. } => {
+        Event::TicketAnswered {
+            ticket_id,
+            question,
+            ..
+        } => {
             let state = ticket_state(tx, ticket_id)?;
             require(ticket_id, state, &[Waiting], "answer")?;
+            if let Some(question) = question {
+                let open: Option<String> = tx.query_row(
+                    "SELECT question FROM tickets WHERE id = ?1",
+                    params![ticket_id],
+                    |row| row.get(0),
+                )?;
+                if open.as_deref() != Some(question.as_str()) {
+                    bail!("the answer to ticket {ticket_id} is for an earlier question");
+                }
+            }
             set_ticket_state(tx, ticket_id, Running, at)?;
             tx.execute(
                 "UPDATE tickets SET question = NULL WHERE id = ?1",
@@ -546,8 +560,11 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event) -> Result<()> {
                 Outcome::Failed => Failed,
             };
             set_ticket_state(tx, ticket_id, next, at)?;
+            // An ended Ticket has no next step, and a delivered one is complete.
             tx.execute(
-                "UPDATE tickets SET summary = ?2, outcome = ?3, question = NULL WHERE id = ?1",
+                "UPDATE tickets SET summary = ?2, outcome = ?3, question = NULL, next = NULL,
+                   progress = CASE WHEN ?3 = 'delivered' THEN 100 ELSE progress END
+                 WHERE id = ?1",
                 params![ticket_id, summary, serde_json::to_value(outcome)?.as_str()],
             )?;
             merge_artifacts(tx, ticket_id, artifacts)?;
@@ -564,7 +581,8 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event) -> Result<()> {
             }
             set_ticket_state(tx, ticket_id, next, at)?;
             tx.execute(
-                "UPDATE tickets SET summary = ?2, outcome = ?3, question = NULL WHERE id = ?1",
+                "UPDATE tickets SET summary = ?2, outcome = ?3, question = NULL, next = NULL
+                 WHERE id = ?1",
                 params![ticket_id, reason, serde_json::to_value(outcome)?.as_str()],
             )?;
         }
@@ -820,12 +838,28 @@ mod tests {
         assert_eq!(waiting.state, TicketState::Waiting);
         assert_eq!(waiting.question.as_deref(), Some("Which API?"));
 
+        // An answer to an earlier question does not close this one.
+        let stale = store.append(
+            "human",
+            Event::TicketAnswered {
+                ticket_id: id.clone(),
+                answer: Some("v1".into()),
+                question: Some("Which version?".into()),
+            },
+        );
+        assert!(stale.unwrap_err().to_string().contains("earlier question"));
+        assert_eq!(
+            store.ticket(&id).unwrap().unwrap().state,
+            TicketState::Waiting
+        );
+
         store
             .append(
                 "human",
                 Event::TicketAnswered {
                     ticket_id: id.clone(),
-                    answer: None,
+                    answer: Some("v2".into()),
+                    question: Some("Which API?".into()),
                 },
             )
             .unwrap();
@@ -846,6 +880,8 @@ mod tests {
         assert_eq!(done.artifacts, vec!["https://example.com/pr/1"]);
         assert_eq!(done.outcome, Some(Outcome::Delivered));
         assert_eq!(done.coordinator_id.as_deref(), Some(agent_id.as_str()));
+        assert_eq!(done.next, None, "an ended Ticket has no next step");
+        assert_eq!(done.progress, Some(100));
     }
 
     #[test]

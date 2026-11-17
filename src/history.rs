@@ -191,6 +191,7 @@ mod tests {
                 Event::TicketAnswered {
                     ticket_id: "demo-1".into(),
                     answer: Some("v2".into()),
+                    question: None,
                 },
             ),
             stored(

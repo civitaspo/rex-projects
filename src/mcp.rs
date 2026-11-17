@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::config::Config;
-use crate::domain::{Agent, Event, Outcome, Ticket};
+use crate::domain::{Agent, Event, Outcome, Ticket, TicketState};
 use crate::paths::Paths;
 use crate::store::Store;
 
@@ -279,6 +279,10 @@ fn parse_args<T: serde::de::DeserializeOwned>(args: Value) -> Result<T> {
 /// Asks the Coordinator to check with a human about external closes that no
 /// human has answered yet.
 fn close_notice(t: &Ticket) -> Option<String> {
+    // `ask` only works while the Ticket is running or waiting.
+    if !matches!(t.state, TicketState::Running | TicketState::Waiting) {
+        return None;
+    }
     let closed: Vec<String> = t
         .unacknowledged_closes()
         .map(|r| {
@@ -627,6 +631,7 @@ pub(crate) mod tests {
                 Event::TicketAnswered {
                     ticket_id: "demo-1".into(),
                     answer: Some("Yes, continue".into()),
+                    question: None,
                 },
             )
             .unwrap();
@@ -639,6 +644,30 @@ pub(crate) mod tests {
                 .as_deref(),
             Some("canceled")
         );
+    }
+
+    #[test]
+    fn does_not_ask_an_ended_ticket_to_ask() {
+        let (_dir, server) = setup("demo-1-coordinator");
+        Store::open(&server.paths.db_file())
+            .unwrap()
+            .append(
+                "tracker",
+                Event::ExternalChanged {
+                    ticket_id: "demo-1".into(),
+                    tracker: "acme".into(),
+                    reference: "A-1".into(),
+                    status: "done".into(),
+                },
+            )
+            .unwrap();
+        let (is_error, text) = call(
+            &server,
+            "complete",
+            json!({"outcome": "delivered", "summary": "Done"}),
+        );
+        assert!(!is_error, "{text}");
+        assert!(!text.contains("Call `ask`"), "{text}");
     }
 
     #[test]
