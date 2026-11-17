@@ -19,7 +19,7 @@ rex-projects ticket list
 rex-projects events --follow
 ```
 
-Run `rex-projects ui` for the Ticket dashboard. It lists Tickets by Project with the ones that need you first. Press Enter to jump to a Ticket's Coordinator, `r` to ready a backlog Ticket, `a` to show old finished Tickets, and `q` to quit.
+Run `rex-projects ui` for the Ticket dashboard. It lists Tickets by Project with the ones that need you first, and shows the selected Ticket's history below the list: Coordinator launches and exits, reports with their stage and progress, questions and answers, and how the Ticket ended. `ticket show <id>` prints the same history in full. Press Enter to jump to a Ticket's Coordinator, `r` to ready a backlog Ticket, `a` to show old finished Tickets, and `q` to quit.
 
 ## Running Tickets
 
