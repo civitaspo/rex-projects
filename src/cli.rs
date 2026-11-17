@@ -591,15 +591,17 @@ fn answer(
     id: &str,
     text: Option<String>,
 ) -> Result<()> {
-    let waiting = |store: &Store| -> Result<bool> {
+    let open_question = |store: &Store| -> Result<Option<String>> {
         let ticket = store
             .ticket(id)?
             .with_context(|| format!("ticket {id} does not exist"))?;
-        Ok(ticket.state == TicketState::Waiting)
+        Ok(ticket
+            .question
+            .filter(|_| ticket.state == TicketState::Waiting))
     };
-    if !waiting(store)? {
+    let Some(question) = open_question(store)? else {
         bail!("ticket {id} is not waiting for an answer");
-    }
+    };
     if let Some(text) = &text {
         let coordinator = store
             .agents_for_ticket(id)?
@@ -621,17 +623,26 @@ fn answer(
         }
         rex.submit(&session, &block, text)?;
     }
-    // The harness's prompt hook may already have recorded the answer.
+    let sent = text.is_some();
     let answered = store.append(
         actor,
         Event::TicketAnswered {
             ticket_id: id.to_owned(),
             answer: text,
+            question: Some(question.clone()),
         },
     );
     match answered {
-        Err(_) if !waiting(store)? => Ok(()),
-        other => other.map(drop),
+        Ok(_) => Ok(()),
+        // The harness's prompt hook recorded the answer first, and the
+        // Coordinator may have asked something new since.
+        Err(_) if open_question(store)?.as_ref() != Some(&question) => Ok(()),
+        Err(err) if sent => Err(err.context(format!(
+            "the answer was sent to the Coordinator, but recording it failed; \
+             run `rex-projects ticket answer {id}` without --text to record it \
+             without sending it again"
+        ))),
+        Err(err) => Err(err),
     }
 }
 

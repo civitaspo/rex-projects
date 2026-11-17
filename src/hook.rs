@@ -101,6 +101,7 @@ pub fn handle(
             Event::TicketAnswered {
                 ticket_id: ticket.id,
                 answer: payload.prompt.map(|p| truncate(&p)),
+                question: ticket.question,
             },
         )?;
     }
@@ -194,6 +195,7 @@ mod tests {
             Event::TicketAnswered {
                 ticket_id: "demo-1".into(),
                 answer: Some("Use v2".into()),
+                question: Some("Which API?".into()),
             }
         );
     }

@@ -168,6 +168,11 @@ pub enum Event {
     TicketAnswered {
         ticket_id: String,
         answer: Option<String>,
+        /// The question this answers. When set, the answer applies only while
+        /// it is still the open question, so a late answer cannot close a
+        /// newer one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        question: Option<String>,
     },
     TicketCompleted {
         ticket_id: String,
