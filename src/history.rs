@@ -100,7 +100,14 @@ fn describe(actor: &str, event: &Event) -> Option<String> {
             reference,
             status,
             ..
-        } => format!("{tracker} {reference} was closed outside rex-projects as {status}"),
+        } => {
+            let verb = if crate::domain::is_closed_status(status) {
+                "closed"
+            } else {
+                "reopened"
+            };
+            format!("{tracker} {reference} was {verb} outside rex-projects as {status}")
+        }
         Event::AgentCreated { .. }
         | Event::AgentSessionBound { .. }
         | Event::AgentActivity { .. } => return None,
@@ -122,6 +129,32 @@ mod tests {
             agent_id: None,
             event,
         }
+    }
+
+    #[test]
+    fn describes_closes_and_reopens() {
+        let change = |status: &str| {
+            stored(
+                "tracker",
+                Event::ExternalChanged {
+                    ticket_id: "demo-1".into(),
+                    tracker: "acme".into(),
+                    reference: "A-1".into(),
+                    status: status.into(),
+                },
+            )
+        };
+        let texts: Vec<String> = entries(&[change("done"), change("open")])
+            .into_iter()
+            .map(|e| e.text)
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "acme A-1 was closed outside rex-projects as done",
+                "acme A-1 was reopened outside rex-projects as open",
+            ]
+        );
     }
 
     #[test]
