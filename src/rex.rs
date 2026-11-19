@@ -208,12 +208,19 @@ impl Rex for RexCli {
 
     fn block_ids(&mut self, session_id: &str) -> Result<Vec<String>> {
         match self.call("session.list_blocks", json!({ "session_id": session_id })) {
-            Ok(result) => Ok(result["blocks"]
+            // A reply without a block list is an error, not an empty session:
+            // treating it as empty would relaunch Agents that still run.
+            Ok(result) => result["blocks"]
                 .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|b| b["block_id"].as_str().map(str::to_owned))
-                .collect()),
+                .with_context(|| format!("rex session.list_blocks returned no blocks: {result}"))?
+                .iter()
+                .map(|b| {
+                    b["block_id"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .with_context(|| format!("rex block has no block_id: {b}"))
+                })
+                .collect(),
             Err(err) if format!("{err:#}").contains("session_not_found") => Ok(Vec::new()),
             Err(err) => Err(err),
         }
@@ -227,9 +234,12 @@ impl Rex for RexCli {
         let root = result["records"]
             .as_array()
             .and_then(|records| records.iter().find(|r| r.get("id").is_none()));
-        Ok(root.map(|r| Status {
-            state: r["state"].as_str().unwrap_or("idle").to_owned(),
-            message: r["msg"].as_str().map(str::to_owned),
+        // A record without a state is unknown, never idle.
+        Ok(root.and_then(|r| {
+            Some(Status {
+                state: r["state"].as_str()?.to_owned(),
+                message: r["msg"].as_str().map(str::to_owned),
+            })
         }))
     }
 
@@ -282,8 +292,11 @@ fn cursor_position(vt: &str) -> Option<(usize, usize)> {
 /// `rows` lines are the screen, is empty: one prompt mark before the cursor,
 /// and nothing but dim text after it, on its row and on the box's further
 /// rows. Claude Code and Codex draw an empty box's placeholder dim and typed
-/// text in normal style, so a draft anywhere in the box counts as input. The
-/// box ends at a blank row or a rule (`────`), as both draw it.
+/// text in normal style, so a draft anywhere in the box counts as input.
+///
+/// Claude ends the box with a rule (`────`), Codex with a blank row. A blank
+/// row followed by plain text, in the default color, could also be a blank
+/// line inside a draft, so that counts as input: when in doubt, not empty.
 fn input_line_is_empty(vt: &str, rows: usize, (row, col): (usize, usize)) -> bool {
     let lines: Vec<&str> = vt.strip_suffix('\n').unwrap_or(vt).split('\n').collect();
     let top = lines.len().saturating_sub(rows);
@@ -296,42 +309,64 @@ fn input_line_is_empty(vt: &str, rows: usize, (row, col): (usize, usize)) -> boo
     let (before, after) = row_cells.split_at(split);
     let marks: Vec<char> = before
         .iter()
-        .map(|(c, _)| *c)
+        .map(|cell| cell.c)
         .filter(|c| !c.is_whitespace())
         .collect();
     let one_mark = matches!(marks.as_slice(), [mark] if !mark.is_alphanumeric());
-    let typed = |cells: &[(char, bool)]| cells.iter().any(|(c, dim)| !c.is_whitespace() && !dim);
+    let typed = |cells: &[Cell]| {
+        cells
+            .iter()
+            .any(|cell| !cell.c.is_whitespace() && !cell.dim)
+    };
     if !one_mark || typed(after) {
         return false;
     }
     // The box's further rows, such as the rest of a multi-line draft.
-    for line in &lines[start + 1..] {
-        let cells = cells(line);
+    let rest: Vec<Vec<Cell>> = lines[start + 1..].iter().map(|l| cells(l)).collect();
+    for (i, cells) in rest.iter().enumerate() {
         let visible: Vec<char> = cells
             .iter()
-            .map(|(c, _)| *c)
+            .map(|cell| cell.c)
             .filter(|c| !c.is_whitespace())
             .collect();
-        // A blank row has no visible cells, so it ends the box too.
-        let rule = visible
-            .iter()
-            .all(|c| ('\u{2500}'..='\u{257f}').contains(c));
-        if rule {
-            break;
+        if visible.is_empty() {
+            let plain_text_follows = rest.get(i + 1).is_some_and(|next| {
+                next.iter()
+                    .any(|cell| cell.c.is_alphanumeric() && !cell.dim && !cell.colored)
+            });
+            return !plain_text_follows;
         }
-        if typed(&cells) {
+        if visible
+            .iter()
+            .all(|c| ('\u{2500}'..='\u{257f}').contains(c))
+        {
+            return true;
+        }
+        if typed(cells) {
             return false;
         }
     }
     true
 }
 
-/// The cells of one row of a `vt` dump, each a character and whether it is
-/// drawn dim (SGR 2). Cursor-forward moves become spaces; other escape
-/// sequences are skipped.
-fn cells(line: &str) -> Vec<(char, bool)> {
+/// One cell of a `vt` row: its character, whether it is drawn dim (SGR 2),
+/// and whether it has a foreground color other than the default.
+#[derive(Clone, Copy)]
+struct Cell {
+    c: char,
+    dim: bool,
+    colored: bool,
+}
+
+/// The cells of one row of a `vt` dump. Cursor-forward moves become spaces;
+/// other escape sequences are skipped.
+fn cells(line: &str) -> Vec<Cell> {
     let mut cells = Vec::new();
-    let mut dim = false;
+    let mut style = Cell {
+        c: ' ',
+        dim: false,
+        colored: false,
+    };
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
@@ -347,10 +382,10 @@ fn cells(line: &str) -> Vec<(char, bool)> {
                         params.push(c);
                     }
                     match last {
-                        Some('m') => dim = sgr_dim(&params, dim),
+                        Some('m') => sgr(&params, &mut style),
                         Some('C') => {
                             let n = params.parse().unwrap_or(1);
-                            cells.extend(std::iter::repeat_n((' ', dim), n));
+                            cells.extend(std::iter::repeat_n(Cell { c: ' ', ..style }, n));
                         }
                         _ => {}
                     }
@@ -366,29 +401,42 @@ fn cells(line: &str) -> Vec<(char, bool)> {
                 _ => {}
             },
             c if c.is_control() => {}
-            c => cells.push((c, dim)),
+            c => cells.push(Cell { c, ..style }),
         }
     }
     cells
 }
 
-/// Applies an SGR parameter list to the dim attribute.
-fn sgr_dim(params: &str, mut dim: bool) -> bool {
+/// Applies an SGR parameter list to the dim and foreground attributes.
+fn sgr(params: &str, style: &mut Cell) {
     let mut params = params.split(';');
     while let Some(p) = params.next() {
         match p {
-            "" | "0" | "22" => dim = false,
-            "2" => dim = true,
+            "" | "0" => {
+                style.dim = false;
+                style.colored = false;
+            }
+            "2" => style.dim = true,
+            "22" => style.dim = false,
+            "39" => style.colored = false,
             // Extended colors carry their own numbers, which are not styles.
-            "38" | "48" | "58" => match params.next() {
-                Some("2") => drop(params.nth(2)),
-                Some("5") => drop(params.next()),
-                _ => {}
-            },
-            _ => {}
+            "38" | "48" | "58" => {
+                style.colored |= p == "38";
+                match params.next() {
+                    Some("2") => drop(params.nth(2)),
+                    Some("5") => drop(params.next()),
+                    _ => {}
+                }
+            }
+            p => {
+                if let Ok(n) = p.parse::<u8>()
+                    && matches!(n, 30..=37 | 90..=97)
+                {
+                    style.colored = true;
+                }
+            }
         }
     }
-    dim
 }
 
 /// Shortens `text` to at most `max` characters.
@@ -452,6 +500,17 @@ mod tests {
         assert!(
             input_line_is_empty(codex_empty, 3, (1, 3)),
             "{codex_empty:?}"
+        );
+        // A blank line inside a draft, with the cursor on the first row.
+        let gap = "\u{276f}\u{a0}\r\r\n\r\r\n  after a blank line\r\r\n\x1b[38;2;136;136;136m\u{2500}\u{2500}\x1b[0m\x1b[1;3H\n";
+        assert!(!input_line_is_empty(gap, 4, (1, 3)), "{gap:?}");
+        let codex_gap = "\x1b[1m\u{203a}\x1b[1C\x1b[0m\r\r\n \r\r\n \x1b[1Clater\r\r\n \r\r\n \x1b[1C\x1b[38;2;246;226;183mGPT\x1b[0m \u{b7} \x1b[38;2;171;223;167m~/src\x1b[0m\x1b[1;3H\n";
+        assert!(!input_line_is_empty(codex_gap, 5, (1, 3)), "{codex_gap:?}");
+        // Codex's own blank row before its colored status row ends the box.
+        let codex_status = "\x1b[1m\u{203a}\x1b[1C\x1b[0m\x1b[2mAsk Codex\x1b[0m\r\r\n \r\r\n \x1b[1C\x1b[38;2;246;226;183mGPT-6.2\x1b[0m \u{b7} \x1b[38;2;171;223;167m~/src\x1b[0m\x1b[1;3H\n";
+        assert!(
+            input_line_is_empty(codex_status, 3, (1, 3)),
+            "{codex_status:?}"
         );
         // A 24-bit color whose numbers include 2 is not dim.
         let gray = "\u{203a} \x1b[38;2;2;2;2mtyped\x1b[0m\r";

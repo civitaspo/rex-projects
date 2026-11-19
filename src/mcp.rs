@@ -347,16 +347,21 @@ impl Server {
             .unwrap_or(project.agent_spec(&args.role).provider);
         config.provider(&provider)?;
         let max = config.limits.max_agents as usize;
-        let n = store
-            .agents_for_ticket(&ticket.id)?
-            .iter()
-            .filter(|a| a.role == args.role)
-            .count()
-            + 1;
-        let id = format!("{}-{}-{n}", ticket.id, args.role);
-        let admitted = store.append_within_slots(
-            &agent.id,
-            &[
+        // Number the helper, check the slot limit, and record it in one
+        // transaction, so parallel spawns neither collide nor overrun.
+        let id = store.with_tx(|tx| {
+            let n: i64 = tx.query_row(
+                "SELECT COUNT(*) + 1 FROM agents WHERE ticket_id = ?1 AND role = ?2",
+                rusqlite::params![ticket.id, args.role],
+                |row| row.get(0),
+            )?;
+            let id = format!("{}-{}-{n}", ticket.id, args.role);
+            if crate::store::slots_in_use_in(tx)? >= max {
+                bail!(
+                    "all {max} Agent slots are in use; wait for a helper to finish, or do the work yourself"
+                );
+            }
+            for event in [
                 Event::AgentCreated {
                     agent_id: id.clone(),
                     ticket_id: ticket.id.clone(),
@@ -369,16 +374,13 @@ impl Server {
                     ticket_id: ticket.id.clone(),
                     from: agent.id.clone(),
                     to: id.clone(),
-                    body: args.task,
+                    body: args.task.clone(),
                 },
-            ],
-            max,
-        )?;
-        if !admitted {
-            bail!(
-                "all {max} Agent slots are in use; wait for a helper to finish, or do the work yourself"
-            );
-        }
+            ] {
+                crate::store::append_in(tx, &agent.id, &event)?;
+            }
+            Ok(id)
+        })?;
         Ok(json!({
             "agent_id": id,
             "role": args.role,
@@ -1130,6 +1132,63 @@ pub(crate) mod tests {
         assert!(body.contains("artifact: src/cli.rs"), "{body}");
         assert!(call(&worker, "done", json!({"summary": "again"})).0);
         assert!(call(&coordinator, "done", json!({"summary": "x"})).0);
+    }
+
+    #[test]
+    fn a_stopped_helper_neither_sends_nor_receives() {
+        let (_dir, coordinator) = setup("demo-1-coordinator");
+        let helper = Server::new(coordinator.paths.clone(), "demo-1-helper".into(), None);
+        assert!(
+            !call(
+                &coordinator,
+                "agent_stop",
+                json!({"agent_id": "demo-1-helper"})
+            )
+            .0
+        );
+        // Its late report does not reach the Coordinator.
+        let (is_error, text) = call(
+            &helper,
+            "send",
+            json!({"to": "coordinator", "body": "stale"}),
+        );
+        assert!(is_error);
+        assert!(text.contains("can no longer send"), "{text}");
+        assert!(call(&helper, "done", json!({"summary": "stale"})).0);
+        // Nothing would read a message to it.
+        let (is_error, text) = call(
+            &coordinator,
+            "send",
+            json!({"to": "demo-1-helper", "body": "one more thing"}),
+        );
+        assert!(is_error);
+        assert!(text.contains("spawn a new helper"), "{text}");
+        let store = Store::open(&coordinator.paths.db_file()).unwrap();
+        assert!(store.unread("demo-1-coordinator").unwrap().is_empty());
+        assert!(store.unread("demo-1-helper").unwrap().is_empty());
+
+        // An exited Coordinator still gets messages, read once relaunched.
+        let mut store = store;
+        store
+            .append(
+                "serve",
+                Event::AgentExited {
+                    agent_id: "demo-1-coordinator".into(),
+                    reason: "block closed".into(),
+                },
+            )
+            .unwrap();
+        store
+            .append(
+                "rex-projects",
+                Event::MessageSent {
+                    ticket_id: "demo-1".into(),
+                    from: "rex-projects".into(),
+                    to: "demo-1-coordinator".into(),
+                    body: "while you were away".into(),
+                },
+            )
+            .unwrap();
     }
 
     #[test]

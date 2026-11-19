@@ -95,6 +95,15 @@ pub fn handle(
         return Ok(None);
     }
     if event == "stop" {
+        // A Coordinator that asked a human waits for the answer; its messages
+        // come with the answer's prompt instead.
+        if agent.role == "coordinator"
+            && store
+                .ticket(&agent.ticket_id)?
+                .is_some_and(|t| t.state == TicketState::Waiting)
+        {
+            return Ok(None);
+        }
         // Unread messages continue the turn instead of ending it.
         let (messages, remaining) = crate::inbox::take(&mut store, agent_id)?;
         return Ok(crate::inbox::render(&messages, remaining)
@@ -273,6 +282,22 @@ mod tests {
         assert!(reason.contains("Review done: 2 findings."), "{reason}");
         assert!(reason.contains("demo-1-helper"), "{reason}");
         assert_eq!(stop(None).unwrap(), None);
+    }
+
+    #[test]
+    fn a_waiting_coordinator_gets_messages_with_the_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = dispatched(dir.path());
+        ask(&paths);
+        send(&paths, "demo-1-coordinator", "Worker done.");
+        let input = br#"{"session_id":"s1","hook_event_name":"Stop","stop_hook_active":false}"#;
+        // The turn that asked ends; the message waits for the human.
+        let stop = handle(&paths, "demo-1-coordinator", None, "claude", "stop", input).unwrap();
+        assert_eq!(stop, None);
+        assert_eq!(state(&paths), TicketState::Waiting);
+        let output = prompt(&paths, "demo-1-coordinator", None).unwrap().unwrap();
+        assert!(output.contains("Worker done."), "{output}");
+        assert_eq!(state(&paths), TicketState::Running);
     }
 
     #[test]

@@ -161,7 +161,7 @@ impl Store {
         max: usize,
     ) -> Result<bool> {
         self.with_tx(|tx| {
-            if slots_in_use(tx)? >= max {
+            if slots_in_use_in(tx)? >= max {
                 return Ok(false);
             }
             for event in events {
@@ -183,7 +183,7 @@ impl Store {
 
     /// How many Agent slots under `limits.max_agents` are in use.
     pub fn slots_in_use(&self) -> Result<usize> {
-        slots_in_use(&self.conn)
+        slots_in_use_in(&self.conn)
     }
 
     /// Creates a Ticket, allocating the next number in its Project.
@@ -322,32 +322,16 @@ impl Store {
     /// The underlying connection, for modules that keep their own tables.
     /// The messages `agent_id` has not read yet, oldest first.
     pub fn unread(&self, agent_id: &str) -> Result<Vec<Message>> {
-        self.query_messages(
-            "WHERE recipient = ?1 AND read_at IS NULL ORDER BY id",
-            params![agent_id],
-        )
+        unread_in(&self.conn, agent_id)
     }
 
     /// Every message about a Ticket, oldest first.
     pub fn ticket_messages(&self, ticket_id: &str) -> Result<Vec<Message>> {
-        self.query_messages("WHERE ticket_id = ?1 ORDER BY id", params![ticket_id])
-    }
-
-    fn query_messages(&self, filter: &str, args: impl rusqlite::Params) -> Result<Vec<Message>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT id, ticket_id, sender, recipient, body, sent_at FROM messages {filter}"
-        ))?;
-        let rows = stmt.query_map(args, |row| {
-            Ok(Message {
-                id: row.get(0)?,
-                ticket_id: row.get(1)?,
-                from: row.get(2)?,
-                to: row.get(3)?,
-                body: row.get(4)?,
-                sent_at: row.get(5)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        query_messages(
+            &self.conn,
+            "WHERE ticket_id = ?1 ORDER BY id",
+            params![ticket_id],
+        )
     }
 
     pub fn conn(&self) -> &Connection {
@@ -418,10 +402,40 @@ pub(crate) fn append_in(tx: &Transaction<'_>, actor: &str, event: &Event) -> Res
     Ok(tx.last_insert_rowid())
 }
 
+/// The messages `agent_id` has not read yet, oldest first.
+pub(crate) fn unread_in(conn: &Connection, agent_id: &str) -> Result<Vec<Message>> {
+    query_messages(
+        conn,
+        "WHERE recipient = ?1 AND read_at IS NULL ORDER BY id",
+        params![agent_id],
+    )
+}
+
+fn query_messages(
+    conn: &Connection,
+    filter: &str,
+    args: impl rusqlite::Params,
+) -> Result<Vec<Message>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, ticket_id, sender, recipient, body, sent_at FROM messages {filter}"
+    ))?;
+    let rows = stmt.query_map(args, |row| {
+        Ok(Message {
+            id: row.get(0)?,
+            ticket_id: row.get(1)?,
+            from: row.get(2)?,
+            to: row.get(3)?,
+            body: row.get(4)?,
+            sent_at: row.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 /// Agent slots in use: every Agent that has not exited, except on a done
 /// Ticket, whose pane stays only for the human to read, plus a slot reserved
 /// for each active Ticket whose Coordinator has exited and will be relaunched.
-fn slots_in_use(conn: &Connection) -> Result<usize> {
+pub(crate) fn slots_in_use_in(conn: &Connection) -> Result<usize> {
     let count: i64 = conn.query_row(
         "SELECT
            (SELECT COUNT(*) FROM agents a JOIN tickets t ON t.id = a.ticket_id
@@ -709,19 +723,39 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event) -> Result<()> {
             to,
             body,
         } => {
-            let recipient_ticket: Option<String> = tx
-                .query_row(
-                    "SELECT ticket_id FROM agents WHERE id = ?1",
-                    params![to],
-                    |row| row.get(0),
+            let agent = |id: &str| {
+                tx.query_row(
+                    "SELECT ticket_id, role, state FROM agents WHERE id = ?1",
+                    params![id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
                 )
-                .optional()?;
-            match recipient_ticket {
+                .optional()
+            };
+            match agent(to)? {
                 None => bail!("agent {to} does not exist"),
-                Some(t) if t != *ticket_id => {
+                Some((t, _, _)) if t != *ticket_id => {
                     bail!("agent {to} works on ticket {t}, not {ticket_id}")
                 }
+                // A helper is never resumed, so nothing would read it. An
+                // exited Coordinator reads it once relaunched.
+                Some((_, role, state))
+                    if role != "coordinator" && matches!(state.as_str(), "finished" | "exited") =>
+                {
+                    bail!("agent {to} has {state}; spawn a new helper instead")
+                }
                 Some(_) => {}
+            }
+            // A helper that finished or was stopped can no longer report.
+            if let Some((_, _, state)) = agent(from)?
+                && matches!(state.as_str(), "finished" | "exited")
+            {
+                bail!("agent {from} has {state} and can no longer send messages; stop working");
             }
             if body.trim().is_empty() {
                 bail!("a message must not be empty");
