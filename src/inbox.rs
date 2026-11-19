@@ -6,6 +6,11 @@ use anyhow::Result;
 use crate::domain::{Event, Message};
 use crate::store::Store;
 
+/// The one line `serve` types into an idle Agent's terminal when it has
+/// unread messages (ADR-0003). It never carries a message body; the prompt
+/// hook attaches the messages.
+pub const WAKE_TOKEN: &str = "rex-projects: you have new messages. Read them and continue; if none are shown, call inbox_read.";
+
 /// The longest message body accepted, in characters.
 pub const MAX_BODY_CHARS: usize = 20_000;
 /// Roughly how much message text one read or hook hands over, in characters.

@@ -21,6 +21,11 @@ use crate::worktree;
 pub const MAX_RELAUNCHES: i64 = 3;
 /// How many failed attempts to open a Coordinator's block fail its Ticket.
 pub const MAX_LAUNCH_FAILURES: u32 = 5;
+/// How long an Agent must stay idle with unread messages before `serve` types
+/// the wake token, so a human who is mid-reply can finish (ADR-0003).
+const WAKE_AFTER_IDLE: chrono::Duration = chrono::Duration::seconds(30);
+/// How long to wait before typing the wake token into the same Agent again.
+const WAKE_RETRY: Duration = Duration::from_secs(120);
 /// How long the pane of a done Ticket stays open for the human to read.
 const DONE_PANE_RETENTION: chrono::Duration = chrono::Duration::minutes(10);
 const ACTOR: &str = "serve";
@@ -99,6 +104,8 @@ pub struct Serve<R: Rex> {
     /// Set after a failed launch: close done Tickets' panes without waiting
     /// for their retention, since they may hold the PTYs a launch needs.
     release_done_panes: bool,
+    /// When `serve` last typed the wake token into each Agent.
+    woken: HashMap<String, Instant>,
 }
 
 impl<R: Rex> Serve<R> {
@@ -112,6 +119,7 @@ impl<R: Rex> Serve<R> {
             launch_failures: HashMap::new(),
             retry_delay: Duration::from_secs(10),
             release_done_panes: false,
+            woken: HashMap::new(),
         }
     }
 
@@ -128,7 +136,57 @@ impl<R: Rex> Serve<R> {
         self.ensure_coordinators()?;
         self.dispatch(config)?;
         self.ensure_coordinators()?;
-        self.launch_helpers()
+        self.launch_helpers()?;
+        self.wake_idle_agents()
+    }
+
+    /// Types the wake token into Agents that sit idle with unread messages,
+    /// rechecking right before typing that the Agent is still idle and its
+    /// input line is empty (ADR-0003).
+    fn wake_idle_agents(&mut self) -> Result<()> {
+        let now = chrono::Utc::now();
+        for agent in self.store.agents(true)? {
+            let (Some(session), Some(block)) = (&agent.rex_session_id, &agent.rex_block_id) else {
+                continue;
+            };
+            let idle = |activity: Option<&str>| matches!(activity, Some("idle" | "done"));
+            if agent.state != "running"
+                || !idle(agent.activity.as_deref())
+                || self.store.unread(&agent.id)?.is_empty()
+                || self
+                    .woken
+                    .get(&agent.id)
+                    .is_some_and(|at| at.elapsed() < WAKE_RETRY)
+            {
+                continue;
+            }
+            // `updated_at` moves with each activity change, so it tells how
+            // long the Agent has been idle.
+            let idle_since = chrono::DateTime::parse_from_rfc3339(&agent.updated_at)?;
+            if now.signed_duration_since(idle_since) < WAKE_AFTER_IDLE {
+                continue;
+            }
+            // A Coordinator waiting on a human gets its messages with the answer.
+            if agent.role == "coordinator"
+                && self
+                    .store
+                    .ticket(&agent.ticket_id)?
+                    .is_some_and(|t| t.state == TicketState::Waiting)
+            {
+                continue;
+            }
+            let still_idle = self
+                .rex
+                .program_status(session, block)?
+                .is_some_and(|s| idle(Some(&s.state)));
+            if !still_idle || !self.rex.input_is_empty(session, block)? {
+                continue;
+            }
+            self.rex.submit(session, block, crate::inbox::WAKE_TOKEN)?;
+            self.woken.insert(agent.id.clone(), Instant::now());
+            println!("{}: woke it for unread messages", agent.id);
+        }
+        Ok(())
     }
 
     /// Starts the helpers Coordinators spawned, in the Coordinator's tab: the
@@ -837,6 +895,95 @@ mod tests {
             unread[0].body
         );
         assert_eq!(f.state(), TicketState::Running);
+    }
+
+    #[test]
+    fn wakes_an_idle_agent_with_unread_messages() {
+        let mut f = fixture();
+        f.tick();
+        let block = f.agent().rex_block_id.unwrap();
+        let typed = |f: &Fixture| f.serve.rex.blocks[&block].input.clone();
+        let set_status = |f: &mut Fixture, state: &str| {
+            f.serve.rex.blocks.get_mut(&block).unwrap().status = Some(crate::rex::Status {
+                state: state.into(),
+                message: None,
+            });
+        };
+        let idle_for = |f: &Fixture, secs: i64| {
+            let at = (chrono::Utc::now() - chrono::Duration::seconds(secs)).to_rfc3339();
+            f.serve
+                .store
+                .conn()
+                .execute(
+                    "UPDATE agents SET updated_at = ?1 WHERE id = 'demo-1-coordinator'",
+                    rusqlite::params![at],
+                )
+                .unwrap();
+        };
+        set_status(&mut f, "idle");
+        f.tick();
+        idle_for(&f, 60);
+        // Idle with nothing unread: nothing to do.
+        f.tick();
+        assert!(typed(&f).is_empty());
+
+        f.serve
+            .store
+            .append(
+                "human",
+                Event::MessageSent {
+                    ticket_id: "demo-1".into(),
+                    from: "human".into(),
+                    to: "demo-1-coordinator".into(),
+                    body: "Also update the README.".into(),
+                },
+            )
+            .unwrap();
+        // Not while a human is typing, nor right after the Agent went idle.
+        f.serve.rex.blocks.get_mut(&block).unwrap().typing = true;
+        f.tick();
+        f.serve.rex.blocks.get_mut(&block).unwrap().typing = false;
+        idle_for(&f, 10);
+        f.tick();
+        assert!(typed(&f).is_empty());
+
+        idle_for(&f, 60);
+        f.tick();
+        assert_eq!(typed(&f), [crate::inbox::WAKE_TOKEN]);
+        // Once, then not again until the retry delay passes.
+        f.tick();
+        assert_eq!(typed(&f).len(), 1);
+    }
+
+    #[test]
+    fn does_not_wake_a_blocked_agent() {
+        let mut f = fixture();
+        f.tick();
+        let block = f.agent().rex_block_id.unwrap();
+        f.serve.rex.blocks.get_mut(&block).unwrap().status = Some(crate::rex::Status {
+            state: "blocked".into(),
+            message: Some("Allow edit?".into()),
+        });
+        f.tick();
+        f.serve
+            .store
+            .append(
+                "human",
+                Event::MessageSent {
+                    ticket_id: "demo-1".into(),
+                    from: "human".into(),
+                    to: "demo-1-coordinator".into(),
+                    body: "hi".into(),
+                },
+            )
+            .unwrap();
+        f.serve
+            .store
+            .conn()
+            .execute("UPDATE agents SET updated_at = '2000-01-01T00:00:00Z'", [])
+            .unwrap();
+        f.tick();
+        assert!(f.serve.rex.blocks[&block].input.is_empty());
     }
 
     #[test]

@@ -54,6 +54,9 @@ pub trait Rex {
     fn close_block(&mut self, session_id: &str, block_id: &str) -> Result<()>;
     /// Destroys a session and every block left in it.
     fn destroy_session(&mut self, session_id: &str) -> Result<()>;
+    /// Whether the input line under the terminal's cursor holds no typed text:
+    /// nothing but a prompt mark, such as `❯` or `›`, before the cursor.
+    fn input_is_empty(&mut self, session_id: &str, block_id: &str) -> Result<bool>;
     /// Types `text` into the block's program and presses Return.
     fn submit(&mut self, session_id: &str, block_id: &str, text: &str) -> Result<()>;
 }
@@ -243,6 +246,27 @@ impl Rex for RexCli {
         Ok(())
     }
 
+    fn input_is_empty(&mut self, session_id: &str, block_id: &str) -> Result<bool> {
+        let call = |method: &str, args: Value| {
+            self.call(
+                &format!("com.superlogical.terminal.{method}"),
+                json!({ "session_id": session_id, "block_id": block_id, "args": args }),
+            )
+        };
+        let rows = call("size", json!({}))?["rows"]
+            .as_u64()
+            .context("terminal size has no rows")? as usize;
+        let vt = call("format", json!({ "format": "vt", "extra_cursor": true }))?;
+        let text = call("format", json!({ "format": "text" }))?;
+        let cursor = cursor_position(vt["content"].as_str().unwrap_or_default())
+            .context("terminal screen has no cursor position")?;
+        Ok(input_line_is_empty(
+            text["content"].as_str().unwrap_or_default(),
+            rows,
+            cursor,
+        ))
+    }
+
     fn submit(&mut self, session_id: &str, block_id: &str, text: &str) -> Result<()> {
         // The text goes through stdin so that a leading `-` is not a flag.
         self.run(&["send", "-s", session_id, "-b", block_id], text)?;
@@ -250,9 +274,69 @@ impl Rex for RexCli {
     }
 }
 
+/// The 1-based (row, column) of the last cursor position sequence,
+/// `ESC [ row ; col H`, in a `vt` screen dump.
+fn cursor_position(vt: &str) -> Option<(usize, usize)> {
+    let start = vt.rfind("\x1b[")? + 2;
+    let end = start + vt[start..].find('H')?;
+    let (row, col) = vt[start..end].split_once(';')?;
+    Some((row.parse().ok()?, col.parse().ok()?))
+}
+
+/// Whether the cursor's row of the screen, the last `rows` lines of `text`,
+/// shows only a prompt mark before the cursor. A TUI's empty input box may
+/// show placeholder text after the cursor, which does not count.
+fn input_line_is_empty(text: &str, rows: usize, (row, col): (usize, usize)) -> bool {
+    let lines: Vec<&str> = text.lines().collect();
+    let top = lines.len().saturating_sub(rows);
+    let Some(line) = lines.get(top + row.saturating_sub(1)) else {
+        return false;
+    };
+    let before: String = line.chars().take(col.saturating_sub(1)).collect();
+    let mut marks = before.split_whitespace();
+    matches!(
+        (marks.next(), marks.next()),
+        (Some(mark), None) if mark.chars().count() == 1 && !mark.chars().all(char::is_alphanumeric)
+    )
+}
+
 /// Shortens `text` to at most `max` characters.
 pub fn truncate(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_the_cursor() {
+        assert_eq!(cursor_position("x\x1b[0m\x1b[22;3H\n"), Some((22, 3)));
+        assert_eq!(cursor_position("no cursor"), None);
+    }
+
+    #[test]
+    fn tells_an_empty_input_line_from_typed_text() {
+        // Captured from Claude Code and Codex in a 24-row terminal.
+        let mut screen: Vec<String> = (0..21).map(|i| format!("scrollback {i}")).collect();
+        screen.extend((0..20).map(|_| String::new()));
+        screen.push("────".into());
+        screen.push("❯ Try \"fix lint errors\"".into());
+        screen.push("  ⏵⏵ auto mode on".into());
+        let text = screen.join("\n");
+        // The visible screen is the last 24 lines; the prompt is on row 23.
+        assert!(input_line_is_empty(&text, 24, (23, 3)));
+        assert!(!input_line_is_empty(&text, 24, (23, 6)));
+        assert!(!input_line_is_empty(&text, 24, (22, 3)));
+        assert!(!input_line_is_empty(&text, 24, (40, 3)));
+        assert!(input_line_is_empty(
+            "› Ask Codex to do anything",
+            24,
+            (1, 3)
+        ));
+        assert!(!input_line_is_empty("› abc", 24, (1, 6)));
+        assert!(!input_line_is_empty("ab", 24, (1, 3)));
+    }
 }
 
 /// An in-memory Rex for tests.
@@ -273,6 +357,8 @@ pub mod fake {
         pub input: Vec<String>,
         /// The block this one was split from, and whether beside it.
         pub split_from: Option<(String, bool)>,
+        /// Whether a human has typed into the input line.
+        pub typing: bool,
     }
 
     #[derive(Default)]
@@ -333,6 +419,7 @@ pub mod fake {
                     status: None,
                     input: Vec::new(),
                     split_from: None,
+                    typing: false,
                 },
             );
             Ok(Window {
@@ -365,6 +452,7 @@ pub mod fake {
                     status: None,
                     input: Vec::new(),
                     split_from: Some((anchor_block.to_owned(), beside)),
+                    typing: false,
                 },
             );
             Ok(block_id)
@@ -392,6 +480,10 @@ pub mod fake {
             self.sessions.retain(|_, id| id != session_id);
             self.blocks.retain(|_, b| b.session_id != session_id);
             Ok(())
+        }
+
+        fn input_is_empty(&mut self, _session_id: &str, block_id: &str) -> Result<bool> {
+            Ok(!self.blocks.get(block_id).context("no such block")?.typing)
         }
 
         fn submit(&mut self, _session_id: &str, block_id: &str, text: &str) -> Result<()> {

@@ -104,7 +104,9 @@ pub fn handle(
     let ticket = store
         .ticket(&agent.ticket_id)?
         .with_context(|| format!("ticket {} does not exist", agent.ticket_id))?;
-    if agent.role == "coordinator" && ticket.state == TicketState::Waiting {
+    // The wake token typed by `serve` is not a human's answer.
+    let woken = payload.prompt.as_deref().map(str::trim) == Some(crate::inbox::WAKE_TOKEN);
+    if agent.role == "coordinator" && ticket.state == TicketState::Waiting && !woken {
         store.append(
             "human",
             Event::TicketAnswered {
@@ -289,6 +291,29 @@ mod tests {
                 .unwrap()
                 .contains("CI is green.")
         );
+    }
+
+    #[test]
+    fn the_wake_token_is_not_an_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = dispatched(dir.path());
+        ask(&paths);
+        let input = serde_json::json!({
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": crate::inbox::WAKE_TOKEN,
+        })
+        .to_string();
+        handle(
+            &paths,
+            "demo-1-coordinator",
+            None,
+            "claude",
+            "user-prompt-submit",
+            input.as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(state(&paths), TicketState::Waiting);
     }
 
     #[test]
