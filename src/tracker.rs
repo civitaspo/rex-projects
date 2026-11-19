@@ -906,7 +906,10 @@ fn poll(store: &mut Store, config: &Config, trackers: &Trackers) -> Result<()> {
             if previous.as_deref() == Some(status) {
                 continue;
             }
-            store.conn().execute(
+            // Save the status and its event together, so a crash or a failed
+            // append between them cannot hide the change from the next poll.
+            let tx = store.conn().unchecked_transaction()?;
+            tx.execute(
                 "INSERT INTO tracker_refs (ticket_id, tracker, ref, external_status)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT DO UPDATE SET external_status = excluded.external_status",
@@ -918,9 +921,10 @@ fn poll(store: &mut Store, config: &Config, trackers: &Trackers) -> Result<()> {
                     .as_deref()
                     .is_some_and(crate::domain::is_closed_status)
             {
-                store.append(
+                crate::store::append_in(
+                    &tx,
                     "tracker",
-                    Event::ExternalChanged {
+                    &Event::ExternalChanged {
                         ticket_id: ticket.id.clone(),
                         tracker: r.tracker.clone(),
                         reference: r.reference.clone(),
@@ -928,6 +932,7 @@ fn poll(store: &mut Store, config: &Config, trackers: &Trackers) -> Result<()> {
                     },
                 )?;
             }
+            tx.commit()?;
         }
     }
     Ok(())
@@ -1368,5 +1373,32 @@ transition.done = [{ argv = ["/bin/sh", "SH", "close", "{{ref}}", "{{summary}}"]
         let ticket = store.ticket("demo-1").unwrap().unwrap();
         assert_eq!(ticket.external_refs[0].closed_externally, None);
         assert!(ticket.unacknowledged_closes().next().is_none());
+    }
+
+    #[test]
+    fn retries_a_close_whose_event_failed_to_save() {
+        let fake = Fake::new();
+        let config = fake.config();
+        let mut store = Store::open_in_memory().unwrap();
+        let mut sync = TrackerSync::default();
+        running(&mut store, &[("acme", "A-1")]);
+        sync.tick(&mut store, &config, t(0)).unwrap();
+        fake.touch("status", "Done");
+        store
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_change BEFORE INSERT ON events
+                 WHEN NEW.kind = 'external_changed'
+                 BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+            .unwrap();
+        assert!(sync.tick(&mut store, &config, t(61)).is_err());
+        store
+            .conn()
+            .execute_batch("DROP TRIGGER fail_change")
+            .unwrap();
+        sync.tick(&mut store, &config, t(122)).unwrap();
+        let ticket = store.ticket("demo-1").unwrap().unwrap();
+        assert_eq!(ticket.unacknowledged_closes().count(), 1);
     }
 }
