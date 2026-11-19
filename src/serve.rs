@@ -162,8 +162,9 @@ impl<R: Rex> Serve<R> {
             }
             // `updated_at` moves with each activity change, so it tells how
             // long the Agent has been idle.
-            let idle_since = chrono::DateTime::parse_from_rfc3339(&agent.updated_at)?;
-            if now.signed_duration_since(idle_since) < WAKE_AFTER_IDLE {
+            let idle_long_enough = chrono::DateTime::parse_from_rfc3339(&agent.updated_at)
+                .is_ok_and(|since| now.signed_duration_since(since) >= WAKE_AFTER_IDLE);
+            if !idle_long_enough {
                 continue;
             }
             // A Coordinator waiting on a human gets its messages with the answer.
@@ -175,16 +176,19 @@ impl<R: Rex> Serve<R> {
             {
                 continue;
             }
+            // Any doubt, including a failed check, means not now.
             let still_idle = self
                 .rex
-                .program_status(session, block)?
-                .is_some_and(|s| idle(Some(&s.state)));
-            if !still_idle || !self.rex.input_is_empty(session, block)? {
+                .program_status(session, block)
+                .is_ok_and(|s| s.is_some_and(|s| idle(Some(&s.state))));
+            if !still_idle || !self.rex.input_is_empty(session, block).unwrap_or(false) {
                 continue;
             }
-            self.rex.submit(session, block, crate::inbox::WAKE_TOKEN)?;
             self.woken.insert(agent.id.clone(), Instant::now());
-            println!("{}: woke it for unread messages", agent.id);
+            match self.rex.submit(session, block, crate::inbox::WAKE_TOKEN) {
+                Ok(()) => println!("{}: woke it for unread messages", agent.id),
+                Err(err) => println!("{}: wake failed: {err:#}", agent.id),
+            }
         }
         Ok(())
     }
