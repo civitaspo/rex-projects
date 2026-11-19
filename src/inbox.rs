@@ -20,7 +20,8 @@ pub fn take(store: &mut Store, agent_id: &str) -> Result<(Vec<Message>, usize)> 
     let count = unread
         .iter()
         .take_while(|m| {
-            size += m.body.chars().count();
+            // Count what `render` prints for the message, not just its body.
+            size += m.body.chars().count() + m.from.chars().count() + m.sent_at.len() + 16;
             size <= MAX_BATCH_CHARS
         })
         .count()
@@ -145,6 +146,22 @@ mod tests {
         );
         let (messages, remaining) = take(&mut store, "demo-1-coordinator").unwrap();
         assert_eq!((messages.len(), remaining), (1, 0));
+    }
+
+    #[test]
+    fn counts_each_message_header_toward_a_batch() {
+        let mut store = store_with_agent();
+        for _ in 0..2000 {
+            send(&mut store, "x");
+        }
+        let (messages, remaining) = take(&mut store, "demo-1-coordinator").unwrap();
+        assert!(messages.len() < 2000 && remaining > 0, "{}", messages.len());
+        let text = render(&messages, remaining).unwrap();
+        assert!(
+            text.chars().count() <= MAX_BATCH_CHARS + 200,
+            "{}",
+            text.len()
+        );
     }
 
     #[test]
