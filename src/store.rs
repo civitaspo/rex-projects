@@ -139,6 +139,18 @@ impl Store {
         Ok(seq)
     }
 
+    /// Records several events in one transaction: all of them or none.
+    pub fn append_all(&mut self, actor: &str, events: &[Event]) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for event in events {
+            append_in(&tx, actor, event)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Creates a Ticket, allocating the next number in its Project.
     pub fn create_ticket(&mut self, actor: &str, new: NewTicket) -> Result<Ticket> {
         let tx = self
@@ -731,6 +743,17 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event) -> Result<()> {
                  WHERE id = ?1",
                 params![agent_id, activity, message, at],
             )?;
+        }
+        Event::AgentFinished { agent_id, reason } => {
+            require_agent(tx, agent_id)?;
+            let changed = tx.execute(
+                "UPDATE agents SET state = 'finished', exit_reason = ?2, updated_at = ?3
+                 WHERE id = ?1 AND state IN ('created', 'running')",
+                params![agent_id, reason, at],
+            )?;
+            if changed == 0 {
+                bail!("agent {agent_id} has already finished or exited");
+            }
         }
         Event::AgentExited { agent_id, reason } => {
             require_agent(tx, agent_id)?;

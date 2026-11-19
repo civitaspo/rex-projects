@@ -58,6 +58,19 @@ To tell a Coordinator something without interrupting it, leave a message in its 
 rex-projects ticket message demo-1 "Also update the changelog"
 ```
 
+A Coordinator can start helper Agents with the MCP tool `spawn_agent`: a `worker` changes code and a `reviewer` reviews without editing. Each helper runs in its own pane in the Ticket's tab, beside the Coordinator, and works in the same worktree. When it calls `done`, its summary goes to the Coordinator's inbox and its pane closes. Helpers count toward `limits.max_agents`. Choose each Role's provider and model per Project; a Role not listed uses the Coordinator's provider:
+
+```toml
+[[projects]]
+id = "demo"
+repo = "~/src/github.com/example/demo"
+coordinator = { provider = "claude" }
+roles.worker = { provider = "codex" }
+roles.reviewer = { provider = "claude", model = "opus" }
+```
+
+Put `<config dir>/roles/<role>.md` to replace a built-in Role's instructions (`coordinator`, `worker`, `reviewer`) or to add a Role.
+
 `ticket cleanup <id>` removes an ended Ticket's worktree and its `rex-projects/<id>` branch (or `rxp/<id>` from before the rename). Any other branch checked out in the worktree is kept. It refuses while the worktree holds uncommitted changes, commits that are on no remote, or ignored files such as `.env` or build output. Move anything you need out of the worktree, then pass `--discard-ignored` to delete the ignored files with it.
 
 ## Rex plugin

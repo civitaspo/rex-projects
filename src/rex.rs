@@ -37,6 +37,16 @@ pub trait Rex {
         command: &[String],
         cwd: &Path,
     ) -> Result<Window>;
+    /// Splits `anchor_block` without taking focus and runs `command` in the new
+    /// block: beside it when `beside`, else below it. Returns the new block.
+    fn split(
+        &mut self,
+        session_id: &str,
+        anchor_block: &str,
+        beside: bool,
+        command: &[String],
+        cwd: &Path,
+    ) -> Result<String>;
     /// Lists the block IDs of a session; empty if the session is gone.
     fn block_ids(&mut self, session_id: &str) -> Result<Vec<String>>;
     /// Returns the root `program_status` record, if the program reported one.
@@ -168,6 +178,31 @@ impl Rex for RexCli {
         })
     }
 
+    fn split(
+        &mut self,
+        session_id: &str,
+        anchor_block: &str,
+        beside: bool,
+        command: &[String],
+        cwd: &Path,
+    ) -> Result<String> {
+        let result = self.call(
+            "session.new_split",
+            json!({
+                "session_id": session_id,
+                "anchor_id": anchor_block,
+                "direction": if beside { "horizontal" } else { "vertical" },
+                "side": "after",
+                "focus": false,
+                "layout": { "block": {
+                    "flavor": TERMINAL_FLAVOR,
+                    "options": { "command": command, "cwd": cwd },
+                }},
+            }),
+        )?;
+        string(&result, "/block_ids/0")
+    }
+
     fn block_ids(&mut self, session_id: &str) -> Result<Vec<String>> {
         match self.call("session.list_blocks", json!({ "session_id": session_id })) {
             Ok(result) => Ok(result["blocks"]
@@ -236,6 +271,8 @@ pub mod fake {
         pub status: Option<Status>,
         /// Lines submitted with [`Rex::submit`].
         pub input: Vec<String>,
+        /// The block this one was split from, and whether beside it.
+        pub split_from: Option<(String, bool)>,
     }
 
     #[derive(Default)]
@@ -295,12 +332,42 @@ pub mod fake {
                     cwd: cwd.to_path_buf(),
                     status: None,
                     input: Vec::new(),
+                    split_from: None,
                 },
             );
             Ok(Window {
                 window_id,
                 block_id,
             })
+        }
+
+        fn split(
+            &mut self,
+            session_id: &str,
+            anchor_block: &str,
+            beside: bool,
+            command: &[String],
+            cwd: &Path,
+        ) -> Result<String> {
+            let anchor = self.blocks.get(anchor_block).context("no such block")?;
+            if anchor.session_id != session_id {
+                bail!("block {anchor_block} is not in {session_id}");
+            }
+            let window_label = anchor.window_label.clone();
+            let block_id = self.id("block");
+            self.blocks.insert(
+                block_id.clone(),
+                Block {
+                    session_id: session_id.to_owned(),
+                    window_label,
+                    command: command.to_vec(),
+                    cwd: cwd.to_path_buf(),
+                    status: None,
+                    input: Vec::new(),
+                    split_from: Some((anchor_block.to_owned(), beside)),
+                },
+            );
+            Ok(block_id)
         }
 
         fn block_ids(&mut self, session_id: &str) -> Result<Vec<String>> {

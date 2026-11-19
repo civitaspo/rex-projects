@@ -33,6 +33,16 @@ fn local_time(at: &str) -> String {
         .unwrap_or_else(|_| at.to_owned())
 }
 
+/// How history names an Agent: its Ticket has one Coordinator, so that one
+/// goes by its role.
+fn who(agent_id: &str) -> &str {
+    if agent_id.ends_with("-coordinator") {
+        "Coordinator"
+    } else {
+        agent_id
+    }
+}
+
 fn describe(actor: &str, event: &Event) -> Option<String> {
     Some(match event {
         Event::TicketCreated { ready, .. } => {
@@ -40,13 +50,22 @@ fn describe(actor: &str, event: &Event) -> Option<String> {
         }
         Event::TicketReadied { .. } => format!("readied by {actor}"),
         Event::TicketDispatched { agent_id, .. } => format!("dispatched to {agent_id}"),
-        Event::AgentLaunched { resume, .. } => if *resume {
-            "Coordinator resumed"
-        } else {
-            "Coordinator launched"
+        Event::AgentLaunched {
+            agent_id, resume, ..
+        } => {
+            let verb = if *resume { "resumed" } else { "launched" };
+            format!("{} {verb}", who(agent_id))
         }
-        .to_owned(),
-        Event::AgentExited { reason, .. } => format!("Coordinator exited: {reason}"),
+        Event::AgentExited { agent_id, reason } => {
+            format!("{} exited: {reason}", who(agent_id))
+        }
+        Event::AgentFinished { agent_id, reason } => format!("{agent_id} finished: {reason}"),
+        Event::AgentCreated {
+            agent_id,
+            role,
+            provider,
+            ..
+        } if role != "coordinator" => format!("{actor} spawned {agent_id} ({provider})"),
         Event::TicketReported {
             stage,
             summary,

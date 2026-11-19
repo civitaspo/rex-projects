@@ -118,7 +118,7 @@ impl<R: Rex> Serve<R> {
     pub fn tick(&mut self, config: &Config) -> Result<()> {
         self.keep_session_labels()?;
         for agent in self.store.agents(true)? {
-            if agent.state == "running"
+            if matches!(agent.state.as_str(), "running" | "finished")
                 && let Err(err) = self.reconcile(config, &agent)
             {
                 println!("{}: reconcile failed: {err:#}", agent.id);
@@ -127,7 +127,98 @@ impl<R: Rex> Serve<R> {
         self.release_done_panes = false;
         self.ensure_coordinators()?;
         self.dispatch(config)?;
-        self.ensure_coordinators()
+        self.ensure_coordinators()?;
+        self.launch_helpers()
+    }
+
+    /// Starts the helpers Coordinators spawned, in the Coordinator's tab: the
+    /// first beside the Coordinator, later ones below the newest live helper
+    /// (ADR-0013). A helper waits while its Coordinator has no pane.
+    fn launch_helpers(&mut self) -> Result<()> {
+        for agent in self.store.agents(true)? {
+            if agent.role == "coordinator" || agent.state != "created" {
+                continue;
+            }
+            let ticket = self
+                .store
+                .ticket(&agent.ticket_id)?
+                .with_context(|| format!("ticket {} does not exist", agent.ticket_id))?;
+            if !ticket.state.is_active() {
+                self.append(Event::AgentExited {
+                    agent_id: agent.id.clone(),
+                    reason: format!("ticket {}", ticket.state),
+                })?;
+                continue;
+            }
+            let Some(coordinator) = ticket
+                .coordinator_id
+                .as_deref()
+                .map(|id| self.store.agent(id))
+                .transpose()?
+                .flatten()
+                .filter(|c| c.state == "running")
+            else {
+                continue;
+            };
+            let (Some(session), Some(window), Some(coordinator_block)) = (
+                coordinator.rex_session_id.clone(),
+                coordinator.rex_window_id.clone(),
+                coordinator.rex_block_id.clone(),
+            ) else {
+                continue;
+            };
+            let newest_helper = self
+                .store
+                .agents_for_ticket(&ticket.id)?
+                .into_iter()
+                .filter(|a| a.role != "coordinator" && a.state == "running")
+                .filter(|a| a.rex_window_id.as_deref() == Some(window.as_str()))
+                .filter_map(|a| a.rex_block_id)
+                .next_back();
+            let (anchor, beside) = match newest_helper {
+                Some(block) => (block, false),
+                None => (coordinator_block, true),
+            };
+            let command = self.agent_command(&agent);
+            match self
+                .rex
+                .split(&session, &anchor, beside, &command, Path::new(&agent.cwd))
+            {
+                Ok(block) => {
+                    let launched = self.append(Event::AgentLaunched {
+                        agent_id: agent.id.clone(),
+                        rex_session_id: session.clone(),
+                        rex_window_id: window.clone(),
+                        rex_block_id: block.clone(),
+                        resume: false,
+                    });
+                    if let Err(err) = launched {
+                        let _ = self.rex.close_block(&session, &block);
+                        return Err(err);
+                    }
+                    println!("{}: launched in {block}", agent.id);
+                }
+                Err(err) => {
+                    println!("{}: launch failed: {err:#}", agent.id);
+                    self.store.append_all(
+                        ACTOR,
+                        &[
+                            Event::AgentExited {
+                                agent_id: agent.id.clone(),
+                                reason: "launch failed".into(),
+                            },
+                            Event::MessageSent {
+                                ticket_id: ticket.id.clone(),
+                                from: "rex-projects".into(),
+                                to: coordinator.id.clone(),
+                                body: format!("rex-projects could not start {}: {err:#}", agent.id),
+                            },
+                        ],
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Every active Ticket should have a running Coordinator. Starts the
@@ -198,13 +289,39 @@ impl<R: Rex> Serve<R> {
 
     fn reconcile(&mut self, config: &Config, agent: &Agent) -> Result<()> {
         let (Some(session), Some(block)) = (&agent.rex_session_id, &agent.rex_block_id) else {
+            // A helper stopped before it was launched has no block to close.
+            if agent.state == "finished" {
+                self.append(Event::AgentExited {
+                    agent_id: agent.id.clone(),
+                    reason: agent
+                        .exit_reason
+                        .clone()
+                        .unwrap_or_else(|| "finished".into()),
+                })?;
+            }
             return Ok(());
         };
         let ticket = self
             .store
             .ticket(&agent.ticket_id)?
             .with_context(|| format!("ticket {} does not exist", agent.ticket_id))?;
-        if !self.rex.block_ids(session)?.contains(block) {
+        let present = self.rex.block_ids(session)?.contains(block);
+        if agent.state == "finished" {
+            if present {
+                self.rex.close_block(session, block)?;
+            }
+            let reason = agent
+                .exit_reason
+                .clone()
+                .unwrap_or_else(|| "finished".into());
+            self.append(Event::AgentExited {
+                agent_id: agent.id.clone(),
+                reason: reason.clone(),
+            })?;
+            println!("{}: closed because it {reason}", agent.id);
+            return Ok(());
+        }
+        if !present {
             self.append(Event::AgentExited {
                 agent_id: agent.id.clone(),
                 reason: "block closed".into(),
@@ -212,6 +329,19 @@ impl<R: Rex> Serve<R> {
             println!("{}: block closed", agent.id);
             if ticket.state.is_terminal() {
                 self.release_empty_session(session)?;
+            } else if agent.role != "coordinator"
+                && let Some(coordinator) = &ticket.coordinator_id
+            {
+                // A helper is not resumed; its Coordinator decides what next.
+                self.append(Event::MessageSent {
+                    ticket_id: ticket.id.clone(),
+                    from: "rex-projects".into(),
+                    to: coordinator.clone(),
+                    body: format!(
+                        "{}'s pane closed before it called done. Its work so far is in the worktree.",
+                        agent.id
+                    ),
+                })?;
             }
             return Ok(());
         }
@@ -220,7 +350,11 @@ impl<R: Rex> Serve<R> {
                 || chrono::DateTime::parse_from_rfc3339(&ticket.updated_at).is_ok_and(|at| {
                     chrono::Utc::now().signed_duration_since(at) > DONE_PANE_RETENTION
                 }));
-        if done_long_ago || matches!(ticket.state, TicketState::Abandoned | TicketState::Failed) {
+        let helper_of_ended_ticket = agent.role != "coordinator" && ticket.state.is_terminal();
+        if done_long_ago
+            || helper_of_ended_ticket
+            || matches!(ticket.state, TicketState::Abandoned | TicketState::Failed)
+        {
             self.rex.close_block(session, block)?;
             self.append(Event::AgentExited {
                 agent_id: agent.id.clone(),
@@ -293,12 +427,9 @@ impl<R: Rex> Serve<R> {
             .next_back())
     }
 
-    fn launch(&mut self, agent: &Agent, ticket: &Ticket, resume: bool) -> Result<()> {
-        let known = self.known_session(&ticket.project_id)?;
-        let session = self
-            .rex
-            .ensure_session(&session_label(&ticket.project_id), known.as_deref())?;
-        let command: Vec<String> = [
+    /// The command a block runs to start `agent`.
+    fn agent_command(&self, agent: &Agent) -> Vec<String> {
+        [
             self.exe.as_os_str(),
             "--config-dir".as_ref(),
             self.paths.config_dir.as_os_str(),
@@ -310,7 +441,15 @@ impl<R: Rex> Serve<R> {
         ]
         .iter()
         .map(|s| s.to_string_lossy().into_owned())
-        .collect();
+        .collect()
+    }
+
+    fn launch(&mut self, agent: &Agent, ticket: &Ticket, resume: bool) -> Result<()> {
+        let known = self.known_session(&ticket.project_id)?;
+        let session = self
+            .rex
+            .ensure_session(&session_label(&ticket.project_id), known.as_deref())?;
+        let command = self.agent_command(agent);
         let label = format!("{} {}", ticket.id, ticket.title);
         let window = self
             .rex
@@ -333,19 +472,7 @@ impl<R: Rex> Serve<R> {
 
     fn dispatch(&mut self, config: &Config) -> Result<()> {
         let tickets = self.store.tickets(None)?;
-        // A done Ticket's pane stays open for a while so a human can read it,
-        // but it no longer takes a launch slot.
-        let done: HashSet<&str> = tickets
-            .iter()
-            .filter(|t| t.state == TicketState::Done)
-            .map(|t| t.id.as_str())
-            .collect();
-        let live = self
-            .store
-            .agents(true)?
-            .iter()
-            .filter(|a| !done.contains(a.ticket_id.as_str()))
-            .count();
+        let live = live_agents(&self.store)?;
         let (picked, next) = plan(config, &tickets, live, self.rotation);
         self.rotation = next;
         for ticket in tickets.iter().filter(|t| picked.contains(&t.id)) {
@@ -394,6 +521,23 @@ impl<R: Rex> Serve<R> {
         println!("{}: dispatched to {agent_id}", ticket.id);
         Ok(())
     }
+}
+
+/// How many Agents hold a launch slot under `limits.max_agents`. A done
+/// Ticket's pane stays open for a while so a human can read it, but it no
+/// longer takes a slot.
+pub fn live_agents(store: &Store) -> Result<usize> {
+    let done: HashSet<String> = store
+        .tickets(None)?
+        .into_iter()
+        .filter(|t| t.state == TicketState::Done)
+        .map(|t| t.id)
+        .collect();
+    Ok(store
+        .agents(true)?
+        .iter()
+        .filter(|a| !done.contains(&a.ticket_id))
+        .count())
 }
 
 fn session_label(project_id: &str) -> String {
@@ -602,6 +746,127 @@ mod tests {
         fn events(&self) -> usize {
             self.serve.store.events_since(0, 1000).unwrap().len()
         }
+    }
+
+    fn spawn(f: &mut Fixture, role: &str) -> String {
+        let id = format!("demo-1-{role}-1");
+        let cwd = f.agent().cwd;
+        f.serve
+            .store
+            .append_all(
+                "demo-1-coordinator",
+                &[
+                    Event::AgentCreated {
+                        agent_id: id.clone(),
+                        ticket_id: "demo-1".into(),
+                        project_id: "demo".into(),
+                        role: role.into(),
+                        provider: "codex".into(),
+                        cwd,
+                    },
+                    Event::MessageSent {
+                        ticket_id: "demo-1".into(),
+                        from: "demo-1-coordinator".into(),
+                        to: id.clone(),
+                        body: "Do it.".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        id
+    }
+
+    fn helper(f: &Fixture, id: &str) -> Agent {
+        f.serve.store.agent(id).unwrap().unwrap()
+    }
+
+    #[test]
+    fn launches_helpers_beside_the_coordinator_and_closes_them() {
+        let mut f = fixture();
+        f.tick();
+        let coordinator_block = f.agent().rex_block_id.unwrap();
+        let worker = spawn(&mut f, "worker");
+        f.tick();
+        let reviewer = spawn(&mut f, "reviewer");
+        f.tick();
+
+        // The first helper goes beside the Coordinator, the next below it.
+        let worker_block = helper(&f, &worker).rex_block_id.unwrap();
+        let reviewer_block = helper(&f, &reviewer).rex_block_id.unwrap();
+        let blocks = &f.serve.rex.blocks;
+        assert_eq!(
+            blocks[&worker_block].split_from,
+            Some((coordinator_block.clone(), true))
+        );
+        assert_eq!(
+            blocks[&reviewer_block].split_from,
+            Some((worker_block.clone(), false))
+        );
+        assert!(blocks[&worker_block].command.ends_with(&[
+            "agent".to_owned(),
+            "exec".to_owned(),
+            worker.clone()
+        ]));
+        assert_eq!(helper(&f, &worker).rex_window_id, f.agent().rex_window_id);
+
+        // A helper that finished has its pane closed.
+        f.serve
+            .store
+            .append(
+                &worker,
+                Event::AgentFinished {
+                    agent_id: worker.clone(),
+                    reason: "done".into(),
+                },
+            )
+            .unwrap();
+        f.tick();
+        assert_eq!(helper(&f, &worker).state, "exited");
+        assert!(!f.serve.rex.blocks.contains_key(&worker_block));
+
+        // A helper whose pane closed early is not resumed; its Coordinator hears.
+        f.serve.rex.blocks.remove(&reviewer_block);
+        f.tick();
+        assert_eq!(helper(&f, &reviewer).state, "exited");
+        let unread = f.serve.store.unread("demo-1-coordinator").unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].from, "rex-projects");
+        assert!(
+            unread[0].body.contains("before it called done"),
+            "{}",
+            unread[0].body
+        );
+        assert_eq!(f.state(), TicketState::Running);
+    }
+
+    #[test]
+    fn closes_helpers_when_their_ticket_ends() {
+        let mut f = fixture();
+        f.tick();
+        let worker = spawn(&mut f, "worker");
+        f.tick();
+        let block = helper(&f, &worker).rex_block_id.unwrap();
+        // A helper spawned just before the Ticket ended never launches.
+        let late = spawn(&mut f, "reviewer");
+        f.serve
+            .store
+            .append(
+                "demo-1-coordinator",
+                Event::TicketCompleted {
+                    ticket_id: "demo-1".into(),
+                    outcome: crate::domain::Outcome::Delivered,
+                    summary: "Shipped.".into(),
+                    artifacts: vec![],
+                },
+            )
+            .unwrap();
+        f.tick();
+        assert_eq!(helper(&f, &worker).state, "exited");
+        assert!(!f.serve.rex.blocks.contains_key(&block));
+        assert_eq!(helper(&f, &late).state, "exited");
+        assert_eq!(helper(&f, &late).rex_block_id, None);
+        // The Coordinator's pane of a done Ticket stays for the human.
+        assert_eq!(f.agent().state, "running");
     }
 
     #[test]

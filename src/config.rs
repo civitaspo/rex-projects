@@ -81,7 +81,25 @@ pub struct ProjectConfig {
     pub base_branch: Option<String>,
     #[serde(default)]
     pub coordinator: AgentSpec,
+    /// The provider and model of each helper Role, such as `worker`. A Role
+    /// not listed here uses the Coordinator's provider and the provider's
+    /// default model.
+    #[serde(default)]
+    pub roles: BTreeMap<String, AgentSpec>,
     pub tracker: Option<ProjectTracker>,
+}
+
+impl ProjectConfig {
+    /// The provider and model for Agents of `role`.
+    pub fn agent_spec(&self, role: &str) -> AgentSpec {
+        if role == "coordinator" {
+            return self.coordinator.clone();
+        }
+        self.roles.get(role).cloned().unwrap_or_else(|| AgentSpec {
+            provider: self.coordinator.provider.clone(),
+            model: None,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -154,6 +172,17 @@ impl Config {
             }
             self.provider(&project.coordinator.provider)
                 .with_context(|| format!("project {:?} coordinator", project.id))?;
+            for (role, spec) in &project.roles {
+                validate_id(role).with_context(|| format!("project {:?} role", project.id))?;
+                if role == "coordinator" {
+                    bail!(
+                        "project {:?} configures the Coordinator under `coordinator`, not `roles`",
+                        project.id
+                    );
+                }
+                self.provider(&spec.provider)
+                    .with_context(|| format!("project {:?} role {role:?}", project.id))?;
+            }
             if let Some(tracker) = &project.tracker
                 && !self.trackers.contains_key(&tracker.name)
             {
@@ -279,6 +308,44 @@ mod tests {
             tracker = { name = "missing" }
         "#;
         assert!(Config::parse(tracker).is_err());
+    }
+
+    #[test]
+    fn resolves_helper_roles() {
+        let config = Config::parse(
+            r#"
+            [[projects]]
+            id = "a"
+            repo = "/a"
+            coordinator = { provider = "claude", model = "big" }
+            roles.worker = { provider = "codex", model = "fast" }
+            "#,
+        )
+        .unwrap();
+        let project = config.project("a").unwrap();
+        let worker = project.agent_spec("worker");
+        assert_eq!(
+            (worker.provider.as_str(), worker.model.as_deref()),
+            ("codex", Some("fast"))
+        );
+        let reviewer = project.agent_spec("reviewer");
+        assert_eq!(
+            (reviewer.provider.as_str(), reviewer.model),
+            ("claude", None)
+        );
+        assert_eq!(
+            project.agent_spec("coordinator").model.as_deref(),
+            Some("big")
+        );
+
+        for bad in [
+            r#"roles.worker = { provider = "gemini" }"#,
+            r#"roles.Worker = { provider = "codex" }"#,
+            r#"roles.coordinator = { provider = "codex" }"#,
+        ] {
+            let text = format!("[[projects]]\nid = \"a\"\nrepo = \"/a\"\n{bad}\n");
+            assert!(Config::parse(&text).is_err(), "{bad}");
+        }
     }
 
     #[test]
