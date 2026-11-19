@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehav
 use serde::Serialize;
 
 use crate::domain::{
-    Agent, Event, ExternalRef, Outcome, Ticket, TicketState, is_closed_status, ticket_id,
+    Agent, Event, ExternalRef, Message, Outcome, Ticket, TicketState, is_closed_status, ticket_id,
 };
 
 const SCHEMA: &str = r#"
@@ -63,6 +63,16 @@ CREATE TABLE IF NOT EXISTS agents (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY,
+  ticket_id TEXT NOT NULL,
+  sender TEXT NOT NULL,
+  recipient TEXT NOT NULL,
+  body TEXT NOT NULL,
+  sent_at TEXT NOT NULL,
+  read_at TEXT
+);
+CREATE INDEX IF NOT EXISTS messages_by_recipient ON messages (recipient, id);
 "#;
 
 /// One row of the event log.
@@ -263,6 +273,36 @@ impl Store {
     }
 
     /// The underlying connection, for modules that keep their own tables.
+    /// The messages `agent_id` has not read yet, oldest first.
+    pub fn unread(&self, agent_id: &str) -> Result<Vec<Message>> {
+        self.query_messages(
+            "WHERE recipient = ?1 AND read_at IS NULL ORDER BY id",
+            params![agent_id],
+        )
+    }
+
+    /// Every message about a Ticket, oldest first.
+    pub fn ticket_messages(&self, ticket_id: &str) -> Result<Vec<Message>> {
+        self.query_messages("WHERE ticket_id = ?1 ORDER BY id", params![ticket_id])
+    }
+
+    fn query_messages(&self, filter: &str, args: impl rusqlite::Params) -> Result<Vec<Message>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, ticket_id, sender, recipient, body, sent_at FROM messages {filter}"
+        ))?;
+        let rows = stmt.query_map(args, |row| {
+            Ok(Message {
+                id: row.get(0)?,
+                ticket_id: row.get(1)?,
+                from: row.get(2)?,
+                to: row.get(3)?,
+                body: row.get(4)?,
+                sent_at: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
@@ -272,7 +312,7 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch("DELETE FROM tickets; DELETE FROM agents;")?;
+        tx.execute_batch("DELETE FROM tickets; DELETE FROM agents; DELETE FROM messages;")?;
         let events: Vec<(String, String)> = {
             let mut stmt = tx.prepare("SELECT at, payload FROM events ORDER BY seq")?;
             let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
@@ -599,6 +639,43 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event) -> Result<()> {
                     r.close_acknowledged = false;
                 }
             })?;
+        }
+        Event::MessageSent {
+            ticket_id,
+            from,
+            to,
+            body,
+        } => {
+            let recipient_ticket: Option<String> = tx
+                .query_row(
+                    "SELECT ticket_id FROM agents WHERE id = ?1",
+                    params![to],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match recipient_ticket {
+                None => bail!("agent {to} does not exist"),
+                Some(t) if t != *ticket_id => {
+                    bail!("agent {to} works on ticket {t}, not {ticket_id}")
+                }
+                Some(_) => {}
+            }
+            if body.trim().is_empty() {
+                bail!("a message must not be empty");
+            }
+            tx.execute(
+                "INSERT INTO messages (ticket_id, sender, recipient, body, sent_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![ticket_id, from, to, body, at],
+            )?;
+        }
+        Event::MessagesRead { agent_id, through } => {
+            require_agent(tx, agent_id)?;
+            tx.execute(
+                "UPDATE messages SET read_at = ?3
+                 WHERE recipient = ?1 AND id <= ?2 AND read_at IS NULL",
+                params![agent_id, through, at],
+            )?;
         }
         Event::AgentCreated {
             agent_id,

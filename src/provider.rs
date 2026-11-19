@@ -76,6 +76,20 @@ impl Harness<'_> {
                 if let Some(model) = self.model {
                     argv.extend(["-m".into(), model.into()]);
                 }
+                // Codex runs only hooks a human has trusted. The rex-projects
+                // hooks are passed below, and the human chose to run them
+                // without that step (ADR-0003).
+                argv.push("--dangerously-bypass-hook-trust".into());
+                let hook = |event: &str, name: &str| {
+                    let command = format!(
+                        "{} hook codex {name}",
+                        shell_quote(&self.exe.display().to_string())
+                    );
+                    format!(
+                        "hooks.{event}=[{{hooks=[{{type=\"command\",command={}}}]}}]",
+                        toml_string(&command)
+                    )
+                };
                 let env: Vec<String> = self
                     .env
                     .iter()
@@ -92,6 +106,8 @@ impl Harness<'_> {
                     // rex-projects tool call, and `-a never` refuses them.
                     r#"mcp_servers.rex_projects.default_tools_approval_mode="approve""#.to_owned(),
                     format!("mcp_servers.rex_projects.env={{{}}}", env.join(", ")),
+                    hook("Stop", "stop"),
+                    hook("UserPromptSubmit", "user-prompt-submit"),
                 ] {
                     argv.extend(["-c".into(), config]);
                 }
@@ -133,6 +149,7 @@ pub fn settings_json(exe: &Path) -> Value {
     json!({ "hooks": {
         "SessionStart": hook("session-start"),
         "UserPromptSubmit": hook("user-prompt-submit"),
+        "Stop": hook("stop"),
     }})
 }
 
@@ -454,14 +471,23 @@ mod tests {
     #[test]
     fn builds_codex_argv() {
         let new = argv(ProviderKind::Codex, Start::New { session_id: "u1" });
-        assert_eq!(new[..4], ["harness", "--extra", "-m", "m1"]);
+        assert_eq!(
+            new[..5],
+            [
+                "harness",
+                "--extra",
+                "-m",
+                "m1",
+                "--dangerously-bypass-hook-trust"
+            ]
+        );
         assert_eq!(new.last().unwrap(), "Start.");
         let configs: Vec<&str> = new
             .windows(2)
             .filter(|w| w[0] == "-c")
             .map(|w| w[1].as_str())
             .collect();
-        assert_eq!(configs.len(), 5);
+        assert_eq!(configs.len(), 7);
         // Every override must parse as TOML, as Codex parses it.
         let parsed: toml::Table = toml::from_str(&configs.join("\n")).unwrap();
         assert_eq!(
@@ -478,6 +504,17 @@ mod tests {
         assert_eq!(
             server["env"]["REX_PROJECTS_AGENT_LAUNCH"].as_str(),
             Some("2")
+        );
+
+        let stop = &parsed["hooks"]["Stop"][0]["hooks"][0];
+        assert_eq!(stop["type"].as_str(), Some("command"));
+        assert_eq!(
+            stop["command"].as_str(),
+            Some("'/bin/rex-projects' hook codex stop")
+        );
+        assert_eq!(
+            parsed["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str(),
+            Some("'/bin/rex-projects' hook codex user-prompt-submit")
         );
 
         let resume = argv(ProviderKind::Codex, Start::Resume { session_id: "s9" });
@@ -501,6 +538,10 @@ mod tests {
         assert_eq!(
             settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
             "'/a b/rex-projects' hook claude user-prompt-submit"
+        );
+        assert_eq!(
+            settings["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "'/a b/rex-projects' hook claude stop"
         );
     }
 

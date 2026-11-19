@@ -234,3 +234,31 @@ fn ticket_answer_needs_a_pane_for_text() {
     let output = env.run(&["ticket", "answer", "demo-1"], None, "");
     assert!(!output.status.success());
 }
+
+#[test]
+fn a_human_message_reaches_the_coordinator_when_its_turn_ends() {
+    let env = Env::dispatched();
+    let output = env.run(
+        &["ticket", "message", "demo-1", "Also update the README."],
+        None,
+        "",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stop = r#"{"session_id":"s1","hook_event_name":"Stop","stop_hook_active":false}"#;
+    let output = env.run(&["hook", "claude", "stop"], Some(AGENT), stop);
+    assert!(output.status.success());
+    let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(reply["decision"], "block");
+    let reason = reply["reason"].as_str().unwrap();
+    assert!(reason.contains("From human"), "{reason}");
+    assert!(reason.contains("Also update the README."), "{reason}");
+
+    // Delivered once: the next turn ends normally.
+    let output = env.run(&["hook", "claude", "stop"], Some(AGENT), stop);
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+}

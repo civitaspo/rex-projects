@@ -108,7 +108,17 @@ fn describe(actor: &str, event: &Event) -> Option<String> {
             };
             format!("{tracker} {reference} was {verb} outside rex-projects as {status}")
         }
+        Event::MessageSent { from, to, body, .. } => {
+            let first = body.lines().next().unwrap_or_default();
+            let more = if body.lines().nth(1).is_some() {
+                " …"
+            } else {
+                ""
+            };
+            format!("message {from} -> {to}: {first}{more}")
+        }
         Event::AgentCreated { .. }
+        | Event::MessagesRead { .. }
         | Event::AgentSessionBound { .. }
         | Event::AgentActivity { .. } => return None,
     })

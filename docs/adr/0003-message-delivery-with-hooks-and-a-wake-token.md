@@ -24,4 +24,4 @@ The check and the keystrokes are not atomic, so a short race window remains. If 
 
 ## Consequences
 
-Whether Codex supports a Stop hook that can continue a turn is unverified. If it does not, Codex Agents rely on the wake token alone.
+Codex's Stop hook continues a turn the same way, verified on codex-cli 0.169. Codex runs only hooks a human has trusted, so rex-projects passes its hooks on the command line and starts Codex with `--dangerously-bypass-hook-trust`. The human who owns the machine chose this over trusting the hooks by hand in each Codex: the flag also runs any other enabled hook in that process without the check.

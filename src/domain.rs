@@ -197,6 +197,19 @@ pub enum Event {
         reference: String,
         status: String,
     },
+    /// A message to an Agent's inbox, from another Agent, a human, or
+    /// rex-projects itself (ADR-0003).
+    MessageSent {
+        ticket_id: String,
+        from: String,
+        to: String,
+        body: String,
+    },
+    /// An Agent read its inbox up to and including message `through`.
+    MessagesRead {
+        agent_id: String,
+        through: i64,
+    },
     AgentCreated {
         agent_id: String,
         ticket_id: String,
@@ -240,6 +253,8 @@ impl Event {
             Self::TicketCancelled { .. } => "ticket_cancelled",
             Self::TicketFailed { .. } => "ticket_failed",
             Self::ExternalChanged { .. } => "external_changed",
+            Self::MessageSent { .. } => "message_sent",
+            Self::MessagesRead { .. } => "messages_read",
             Self::AgentCreated { .. } => "agent_created",
             Self::AgentLaunched { .. } => "agent_launched",
             Self::AgentSessionBound { .. } => "agent_session_bound",
@@ -260,6 +275,7 @@ impl Event {
             | Self::TicketCancelled { ticket_id, .. }
             | Self::TicketFailed { ticket_id, .. }
             | Self::ExternalChanged { ticket_id, .. }
+            | Self::MessageSent { ticket_id, .. }
             | Self::AgentCreated { ticket_id, .. } => Some(ticket_id),
             _ => None,
         }
@@ -272,7 +288,8 @@ impl Event {
             | Self::AgentLaunched { agent_id, .. }
             | Self::AgentSessionBound { agent_id, .. }
             | Self::AgentActivity { agent_id, .. }
-            | Self::AgentExited { agent_id, .. } => Some(agent_id),
+            | Self::AgentExited { agent_id, .. }
+            | Self::MessagesRead { agent_id, .. } => Some(agent_id),
             _ => None,
         }
     }
@@ -324,6 +341,17 @@ pub struct Agent {
     pub exit_reason: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// A message in an Agent's inbox.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Message {
+    pub id: i64,
+    pub ticket_id: String,
+    pub from: String,
+    pub to: String,
+    pub body: String,
+    pub sent_at: String,
 }
 
 /// Builds the id of a Ticket from its Project and number, such as `demo-12`.

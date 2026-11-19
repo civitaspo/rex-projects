@@ -113,6 +113,8 @@ impl Server {
                     "report" => self.report(args),
                     "ask" => self.ask(args),
                     "complete" => self.complete(args),
+                    "send" => self.send(args),
+                    "inbox_read" => self.inbox_read(),
                     _ => return Err((INVALID_PARAMS, format!("unknown tool {name:?}"))),
                 };
                 Ok(match result {
@@ -255,6 +257,51 @@ impl Server {
     }
 }
 
+impl Server {
+    fn send(&self, args: Value) -> Result<Value> {
+        #[derive(Deserialize)]
+        struct Args {
+            to: String,
+            body: String,
+        }
+        let args: Args = parse_args(args)?;
+        if args.body.chars().count() > crate::inbox::MAX_BODY_CHARS {
+            bail!(
+                "body is longer than {} characters; put long content in a file and send its path",
+                crate::inbox::MAX_BODY_CHARS
+            );
+        }
+        let (mut store, agent, ticket) = self.write_context()?;
+        let to = if args.to == "coordinator" {
+            ticket
+                .coordinator_id
+                .clone()
+                .context("the Ticket has no Coordinator")?
+        } else {
+            args.to
+        };
+        if to == agent.id {
+            bail!("you cannot send a message to yourself");
+        }
+        store.append(
+            &agent.id,
+            Event::MessageSent {
+                ticket_id: ticket.id.clone(),
+                from: agent.id.clone(),
+                to: to.clone(),
+                body: args.body,
+            },
+        )?;
+        Ok(json!({"sent_to": to}))
+    }
+
+    fn inbox_read(&self) -> Result<Value> {
+        let (mut store, agent, _) = self.write_context()?;
+        let (messages, remaining) = crate::inbox::take(&mut store, &agent.id)?;
+        Ok(json!({"messages": messages, "remaining": remaining}))
+    }
+}
+
 /// Whether a session started at launch `launch` has been superseded. An
 /// unknown launch is allowed.
 pub fn is_stale(launch: Option<i64>, agent: &Agent) -> bool {
@@ -381,6 +428,26 @@ fn tools() -> Value {
                 "required": ["outcome", "summary"],
                 "additionalProperties": false,
             },
+        },
+        {
+            "name": "send",
+            "description": "Send a message to another Agent on your Ticket. It waits in \
+                their inbox and reaches them when their turn ends or they next read it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string", "description": "An Agent id, or `coordinator`."},
+                    "body": {"type": "string"},
+                },
+                "required": ["to", "body"],
+                "additionalProperties": false,
+            },
+        },
+        {
+            "name": "inbox_read",
+            "description": "Read your unread messages and mark them read. Messages also \
+                reach you automatically, so call this when told you have unread messages.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
         },
     ])
 }
@@ -542,7 +609,17 @@ pub(crate) mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["ticket_get", "report", "ask", "complete"]);
+        assert_eq!(
+            names,
+            [
+                "ticket_get",
+                "report",
+                "ask",
+                "complete",
+                "send",
+                "inbox_read"
+            ]
+        );
         let reply = rpc(&server, "tools/call", json!({"name": "nope"}));
         assert_eq!(reply["error"]["code"], INVALID_PARAMS);
     }
@@ -726,5 +803,36 @@ pub(crate) mod tests {
 
         let current = Server::new(paths, "demo-1-coordinator".into(), Some(0));
         assert!(!call(&current, "report", json!({"stage": "plan"})).0);
+    }
+
+    #[test]
+    fn agents_message_each_other() {
+        let (dir, helper) = setup("demo-1-helper");
+        let coordinator = Server::new(helper.paths.clone(), "demo-1-coordinator".into(), None);
+        let (is_error, text) = call(
+            &helper,
+            "send",
+            json!({"to": "coordinator", "body": "Tests pass."}),
+        );
+        assert!(!is_error, "{text}");
+        assert!(text.contains("demo-1-coordinator"), "{text}");
+        let (is_error, text) = call(&coordinator, "inbox_read", json!({}));
+        assert!(!is_error, "{text}");
+        let read: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(read["messages"][0]["from"], "demo-1-helper");
+        assert_eq!(read["messages"][0]["body"], "Tests pass.");
+        assert_eq!(read["remaining"], 0);
+        let (_, text) = call(&coordinator, "inbox_read", json!({}));
+        assert!(text.contains("\"messages\": []"), "{text}");
+
+        for args in [
+            json!({"to": "demo-1-helper", "body": "me"}),
+            json!({"to": "nobody", "body": "hi"}),
+            json!({"to": "coordinator", "body": "  "}),
+            json!({"to": "coordinator", "body": "x".repeat(crate::inbox::MAX_BODY_CHARS + 1)}),
+        ] {
+            assert!(call(&helper, "send", args).0);
+        }
+        drop(dir);
     }
 }

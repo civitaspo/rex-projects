@@ -40,6 +40,8 @@ args = ["-a", "never", "-s", "workspace-write", "-c", "sandbox_workspace_write.w
 
 rex-projects lets Codex call its own MCP tools without asking, so `-a never` does not block a Coordinator's reports.
 
+rex-projects also gives Codex its hooks, which deliver messages between Agents, and starts Codex with `--dangerously-bypass-hook-trust`. Without that flag, Codex runs only hooks a human has trusted under `/hooks`. The flag skips that check for every enabled hook in that Codex process, including hooks in your own `~/.codex`.
+
 Claude Code asks whether to trust a new folder, and that prompt stops a Coordinator until you answer it. In our runs, a Ticket worktree was trusted once its Project repository had been trusted, so open `claude` once in each Project repository if you have not already. A Coordinator that reports no status for a minute, as when it waits on this prompt, appears under "Needs you" in the dashboard. Codex asks the same question and says that trusting a worktree applies to its repository root.
 
 When a Coordinator asks a question, its Ticket waits under "Needs you". Answer in the Coordinator's pane, or from any terminal:
@@ -48,7 +50,13 @@ When a Coordinator asks a question, its Ticket waits under "Needs you". Answer i
 rex-projects ticket answer demo-1 --text "Use the v2 API"
 ```
 
-`--text` types the answer into the Coordinator's pane and presses Return, and only does so while the Coordinator is idle. If you already replied in the pane and the Ticket still shows waiting, which can happen with a harness that has no prompt hook, run `ticket answer demo-1` without `--text`.
+`--text` types the answer into the Coordinator's pane and presses Return, and only does so while the Coordinator is idle. If you already replied in the pane and the Ticket still shows waiting, run `ticket answer demo-1` without `--text`.
+
+To tell a Coordinator something without interrupting it, leave a message in its inbox. It reaches the Coordinator when its current turn ends:
+
+```sh
+rex-projects ticket message demo-1 "Also update the changelog"
+```
 
 `ticket cleanup <id>` removes an ended Ticket's worktree and its `rex-projects/<id>` branch (or `rxp/<id>` from before the rename). Any other branch checked out in the worktree is kept. It refuses while the worktree holds uncommitted changes, commits that are on no remote, or ignored files such as `.env` or build output. Move anything you need out of the worktree, then pass `--discard-ignored` to delete the ignored files with it.
 
