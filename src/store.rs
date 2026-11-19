@@ -748,7 +748,11 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event) -> Result<()> {
             provider,
             cwd,
         } => {
-            ticket_state(tx, ticket_id)?;
+            let state = ticket_state(tx, ticket_id)?;
+            // A helper joins only a Ticket that is still being worked on.
+            if role != "coordinator" && !matches!(state, Running | Waiting) {
+                bail!("ticket {ticket_id} is {state}; helpers run only on a running Ticket");
+            }
             tx.execute(
                 "INSERT INTO agents (id, ticket_id, project_id, role, provider, cwd, state,
                    launches, created_at, updated_at)
@@ -765,13 +769,17 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event) -> Result<()> {
             ..
         } => {
             require_agent(tx, agent_id)?;
-            let state: String = tx.query_row(
-                "SELECT state FROM agents WHERE id = ?1",
+            let (state, ticket_id): (String, String) = tx.query_row(
+                "SELECT state, ticket_id FROM agents WHERE id = ?1",
                 params![agent_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
             if state == "finished" {
                 bail!("agent {agent_id} was stopped before it launched");
+            }
+            let ticket = ticket_state(tx, &ticket_id)?;
+            if ticket.is_terminal() {
+                bail!("ticket {ticket_id} is {ticket}; agent {agent_id} cannot launch");
             }
             tx.execute(
                 "UPDATE agents SET state = 'running', rex_session_id = ?2, rex_window_id = ?3,

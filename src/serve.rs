@@ -170,13 +170,11 @@ impl<R: Rex> Serve<R> {
             if quiet_since.is_none_or(|since| now.signed_duration_since(since) < WAKE_AFTER_IDLE) {
                 continue;
             }
-            // Only Agents of a running Ticket. A Coordinator waiting on a
-            // human gets its messages with the answer, and the pane of a done
-            // Ticket stays only for the human to read.
+            // Only Agents of a running Ticket. A Ticket waiting on a human
+            // resumes with the answer, and the pane of a done Ticket stays
+            // only for the human to read.
             let ticket_state = self.store.ticket(&agent.ticket_id)?.map(|t| t.state);
-            if ticket_state != Some(TicketState::Running)
-                && !(agent.role != "coordinator" && ticket_state == Some(TicketState::Waiting))
-            {
+            if ticket_state != Some(TicketState::Running) {
                 continue;
             }
             // Any doubt, including a failed check, means not now.
@@ -185,6 +183,10 @@ impl<R: Rex> Serve<R> {
                 .program_status(session, block)
                 .is_ok_and(|s| s.is_some_and(|s| idle(Some(&s.state))));
             if !still_idle || !self.rex.input_is_empty(session, block).unwrap_or(false) {
+                continue;
+            }
+            // A prompt typed meanwhile may have delivered the messages.
+            if self.store.unread(&agent.id)?.is_empty() {
                 continue;
             }
             self.woken.insert(agent.id.clone(), Instant::now());
@@ -267,25 +269,61 @@ impl<R: Rex> Serve<R> {
                 }
                 Err(err) => {
                     println!("{}: launch failed: {err:#}", agent.id);
-                    self.store.append_all(
-                        ACTOR,
-                        &[
-                            Event::AgentExited {
-                                agent_id: agent.id.clone(),
-                                reason: "launch failed".into(),
-                            },
-                            Event::MessageSent {
-                                ticket_id: ticket.id.clone(),
-                                from: "rex-projects".into(),
-                                to: coordinator.id.clone(),
-                                body: format!("rex-projects could not start {}: {err:#}", agent.id),
-                            },
-                        ],
+                    self.record_launch_failure(
+                        &agent,
+                        &ticket.id,
+                        &coordinator.id,
+                        &format!("{err:#}"),
                     )?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Records that a helper's pane could not be opened, and tells its
+    /// Coordinator. A stop the Coordinator committed meanwhile keeps its
+    /// reason and needs no notice.
+    fn record_launch_failure(
+        &mut self,
+        agent: &Agent,
+        ticket_id: &str,
+        coordinator_id: &str,
+        error: &str,
+    ) -> Result<()> {
+        self.store.with_tx(|tx| {
+            let (state, reason): (String, Option<String>) = tx.query_row(
+                "SELECT state, exit_reason FROM agents WHERE id = ?1",
+                rusqlite::params![agent.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let stopped = state == "finished";
+            let reason = match reason {
+                Some(reason) if stopped => reason,
+                _ => "launch failed".to_owned(),
+            };
+            crate::store::append_in(
+                tx,
+                ACTOR,
+                &Event::AgentExited {
+                    agent_id: agent.id.clone(),
+                    reason,
+                },
+            )?;
+            if !stopped {
+                crate::store::append_in(
+                    tx,
+                    ACTOR,
+                    &Event::MessageSent {
+                        ticket_id: ticket_id.to_owned(),
+                        from: "rex-projects".into(),
+                        to: coordinator_id.to_owned(),
+                        body: format!("rex-projects could not start {}: {error}", agent.id),
+                    },
+                )?;
+            }
+            Ok(())
+        })
     }
 
     /// Every active Ticket should have a running Coordinator. Starts the
@@ -843,7 +881,11 @@ mod tests {
     }
 
     fn spawn(f: &mut Fixture, role: &str) -> String {
-        let id = format!("demo-1-{role}-1");
+        spawn_named(f, role, &format!("demo-1-{role}-1"))
+    }
+
+    fn spawn_named(f: &mut Fixture, role: &str, id: &str) -> String {
+        let id = id.to_owned();
         let cwd = f.agent().cwd;
         f.serve
             .store
@@ -975,10 +1017,7 @@ mod tests {
                 },
             )
             .unwrap();
-        // Not while a human is typing, nor right after the Agent went idle.
-        f.serve.rex.blocks.get_mut(&block).unwrap().typing = true;
-        f.tick();
-        f.serve.rex.blocks.get_mut(&block).unwrap().typing = false;
+        // Not right after the Agent went idle.
         idle_for(&f, 10);
         f.tick();
         assert!(typed(&f).is_empty());
@@ -993,6 +1032,37 @@ mod tests {
             .conn()
             .execute("UPDATE messages SET sent_at = ?1", rusqlite::params![old])
             .unwrap();
+        // Everything else qualifies, but a human is typing.
+        f.serve.rex.blocks.get_mut(&block).unwrap().typing = true;
+        f.tick();
+        assert!(typed(&f).is_empty());
+        // Nor while the Ticket waits on a human, even for a helper.
+        f.serve.rex.blocks.get_mut(&block).unwrap().typing = false;
+        f.serve
+            .store
+            .append(
+                "demo-1-coordinator",
+                Event::TicketAsked {
+                    ticket_id: "demo-1".into(),
+                    question: "Which API?".into(),
+                },
+            )
+            .unwrap();
+        idle_for(&f, 60);
+        f.tick();
+        assert!(typed(&f).is_empty());
+        f.serve
+            .store
+            .append(
+                "human",
+                Event::TicketAnswered {
+                    ticket_id: "demo-1".into(),
+                    answer: None,
+                    question: Some("Which API?".into()),
+                },
+            )
+            .unwrap();
+        idle_for(&f, 60);
         f.tick();
         assert_eq!(typed(&f), [crate::inbox::WAKE_TOKEN]);
         // Once, then not again until the retry delay passes.
@@ -1053,6 +1123,109 @@ mod tests {
             .unwrap();
         f.tick();
         assert!(f.serve.rex.blocks[&block].input.is_empty());
+    }
+
+    #[test]
+    fn helpers_neither_join_nor_launch_on_an_ended_ticket() {
+        let mut f = fixture();
+        f.tick();
+        let worker = spawn(&mut f, "worker");
+        f.serve
+            .store
+            .append(
+                "human",
+                Event::TicketCancelled {
+                    ticket_id: "demo-1".into(),
+                    reason: "not needed".into(),
+                },
+            )
+            .unwrap();
+        // The split finished after the Ticket ended: no launch is recorded.
+        let err = f
+            .serve
+            .store
+            .append(
+                "serve",
+                Event::AgentLaunched {
+                    agent_id: worker.clone(),
+                    rex_session_id: "s".into(),
+                    rex_window_id: "w".into(),
+                    rex_block_id: "b".into(),
+                    resume: false,
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot launch"), "{err}");
+        // A spawn that lost the race to the cancel is refused in its transaction.
+        let err = f
+            .serve
+            .store
+            .append(
+                "demo-1-coordinator",
+                Event::AgentCreated {
+                    agent_id: "demo-1-reviewer-1".into(),
+                    ticket_id: "demo-1".into(),
+                    project_id: "demo".into(),
+                    role: "reviewer".into(),
+                    provider: "claude".into(),
+                    cwd: "/tmp".into(),
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("helpers run only"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_split_keeps_a_stop() {
+        let mut f = fixture();
+        f.tick();
+        let worker = spawn(&mut f, "worker");
+        // serve read the helper as created, then the Coordinator stopped it
+        // while the split was failing.
+        let created = helper(&f, &worker);
+        f.serve
+            .store
+            .append(
+                "demo-1-coordinator",
+                Event::AgentFinished {
+                    agent_id: worker.clone(),
+                    reason: "stopped by the Coordinator".into(),
+                },
+            )
+            .unwrap();
+        f.serve
+            .record_launch_failure(&created, "demo-1", "demo-1-coordinator", "no PTY")
+            .unwrap();
+        let stopped = helper(&f, &worker);
+        assert_eq!(stopped.state, "exited");
+        assert_eq!(
+            stopped.exit_reason.as_deref(),
+            Some("stopped by the Coordinator")
+        );
+        assert!(
+            f.serve
+                .store
+                .unread("demo-1-coordinator")
+                .unwrap()
+                .is_empty()
+        );
+
+        // Without a stop, the failure is recorded and the Coordinator hears.
+        let second = spawn_named(&mut f, "worker", "demo-1-worker-2");
+        let created = helper(&f, &second);
+        f.serve
+            .record_launch_failure(&created, "demo-1", "demo-1-coordinator", "no PTY")
+            .unwrap();
+        assert_eq!(
+            helper(&f, &second).exit_reason.as_deref(),
+            Some("launch failed")
+        );
+        let unread = f.serve.store.unread("demo-1-coordinator").unwrap();
+        assert!(
+            unread[0]
+                .body
+                .contains("could not start demo-1-worker-2: no PTY")
+        );
     }
 
     #[test]

@@ -278,27 +278,52 @@ fn cursor_position(vt: &str) -> Option<(usize, usize)> {
     Some((row.parse().ok()?, col.parse().ok()?))
 }
 
-/// Whether the cursor's row of a `vt` screen dump, whose last `rows` lines
-/// are the screen, is an empty input line: one prompt mark before the cursor,
-/// and after it nothing but dim text, which is how Claude Code and Codex draw
-/// the placeholder of an empty input box. Typed text is drawn in normal
-/// style, so a draft on either side of the cursor counts as input.
+/// Whether the input box under the cursor of a `vt` screen dump, whose last
+/// `rows` lines are the screen, is empty: one prompt mark before the cursor,
+/// and nothing but dim text after it, on its row and on the box's further
+/// rows. Claude Code and Codex draw an empty box's placeholder dim and typed
+/// text in normal style, so a draft anywhere in the box counts as input. The
+/// box ends at a blank row or a rule (`────`), as both draw it.
 fn input_line_is_empty(vt: &str, rows: usize, (row, col): (usize, usize)) -> bool {
     let lines: Vec<&str> = vt.strip_suffix('\n').unwrap_or(vt).split('\n').collect();
     let top = lines.len().saturating_sub(rows);
-    let Some(line) = lines.get(top + row.saturating_sub(1)) else {
+    let start = top + row.saturating_sub(1);
+    let Some(line) = lines.get(start) else {
         return false;
     };
-    let cells = cells(line);
-    let split = col.saturating_sub(1).min(cells.len());
-    let (before, after) = cells.split_at(split);
+    let row_cells = cells(line);
+    let split = col.saturating_sub(1).min(row_cells.len());
+    let (before, after) = row_cells.split_at(split);
     let marks: Vec<char> = before
         .iter()
         .map(|(c, _)| *c)
         .filter(|c| !c.is_whitespace())
         .collect();
     let one_mark = matches!(marks.as_slice(), [mark] if !mark.is_alphanumeric());
-    one_mark && after.iter().all(|(c, dim)| c.is_whitespace() || *dim)
+    let typed = |cells: &[(char, bool)]| cells.iter().any(|(c, dim)| !c.is_whitespace() && !dim);
+    if !one_mark || typed(after) {
+        return false;
+    }
+    // The box's further rows, such as the rest of a multi-line draft.
+    for line in &lines[start + 1..] {
+        let cells = cells(line);
+        let visible: Vec<char> = cells
+            .iter()
+            .map(|(c, _)| *c)
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        // A blank row has no visible cells, so it ends the box too.
+        let rule = visible
+            .iter()
+            .all(|c| ('\u{2500}'..='\u{257f}').contains(c));
+        if rule {
+            break;
+        }
+        if typed(&cells) {
+            return false;
+        }
+    }
+    true
 }
 
 /// The cells of one row of a `vt` dump, each a character and whether it is
@@ -388,11 +413,12 @@ mod tests {
         "\x1b[0m\x1b[1m\u{203a}\x1b[1C\x1b[0m\x1b[2mAsk Codex to do anything\x1b[0m\r";
     const CODEX_DRAFT: &str = "\x1b[0m\x1b[1m\u{203a}\x1b[1C\x1b[0mabc\r";
 
-    /// A 4-row screen under two lines of scrollback, with `prompt` on row 3
-    /// and the cursor sequence at the end, as `format` returns it.
+    /// A 5-row screen under two lines of scrollback, with `prompt` on row 3
+    /// and a rule and a status row below it, then the cursor sequence, as
+    /// `format` returns it.
     fn screen(prompt: &str, cursor: (usize, usize)) -> String {
         format!(
-            "old 1\r\nold 2\r\n\x1b[38;2;153;153;153mtitle\x1b[0m\r\n\r\n{prompt}\n\x1b[2mhint\x1b[0m\x1b[{};{}H\n",
+            "old 1\r\nold 2\r\n\x1b[38;2;153;153;153mtitle\x1b[0m\r\n\r\n{prompt}\n\x1b[38;2;136;136;136m\u{2500}\u{2500}\u{2500}\x1b[0m\r\n\x1b[38;2;255;193;7mauto mode on\x1b[0m\x1b[{};{}H\n",
             cursor.0, cursor.1
         )
     }
@@ -402,22 +428,37 @@ mod tests {
         for empty in [CLAUDE_EMPTY, CODEX_EMPTY] {
             let vt = screen(empty, (3, 3));
             assert_eq!(cursor_position(&vt), Some((3, 3)));
-            assert!(input_line_is_empty(&vt, 4, (3, 3)), "{vt:?}");
+            assert!(input_line_is_empty(&vt, 5, (3, 3)), "{vt:?}");
             // Another row, or a cursor off the screen, is not the input line.
-            assert!(!input_line_is_empty(&vt, 4, (2, 3)));
-            assert!(!input_line_is_empty(&vt, 4, (9, 3)));
+            assert!(!input_line_is_empty(&vt, 5, (2, 3)));
+            assert!(!input_line_is_empty(&vt, 5, (9, 3)));
         }
         for draft in [CLAUDE_DRAFT, CODEX_DRAFT] {
             // The cursor after the draft, or at its start.
-            assert!(!input_line_is_empty(&screen(draft, (3, 6)), 4, (3, 6)));
-            assert!(!input_line_is_empty(&screen(draft, (3, 3)), 4, (3, 3)));
+            assert!(!input_line_is_empty(&screen(draft, (3, 6)), 5, (3, 6)));
+            assert!(!input_line_is_empty(&screen(draft, (3, 3)), 5, (3, 3)));
         }
+        // The cursor on the blank first row of a multi-line draft: the box's
+        // next row holds typed text (Claude's rule and Codex's blank row end
+        // the box, so the status rows below do not count).
+        let multi = "\u{276f}\u{a0}\r\r\n  second line\r";
+        let vt = format!(
+            "old\r\n\r\n{multi}\r\n\x1b[38;2;136;136;136m\u{2500}\u{2500}\x1b[0m\r\n\x1b[38;2;255;193;7mauto\x1b[0m\x1b[2;3H\n"
+        );
+        assert!(!input_line_is_empty(&vt, 5, (2, 3)), "{vt:?}");
+        let codex = "\x1b[1m\u{203a}\x1b[1C\x1b[0m\r\r\n \x1b[1Csecond\r\r\n \r\r\n \x1b[1C\x1b[38;2;246;226;183mGPT\x1b[0m\x1b[1;3H\n";
+        assert!(!input_line_is_empty(codex, 4, (1, 3)), "{codex:?}");
+        let codex_empty = "\x1b[1m\u{203a}\x1b[1C\x1b[0m\x1b[2mAsk Codex\x1b[0m\r\r\n \r\r\n \x1b[1C\x1b[38;2;246;226;183mGPT\x1b[0m\x1b[1;3H\n";
+        assert!(
+            input_line_is_empty(codex_empty, 3, (1, 3)),
+            "{codex_empty:?}"
+        );
         // A 24-bit color whose numbers include 2 is not dim.
         let gray = "\u{203a} \x1b[38;2;2;2;2mtyped\x1b[0m\r";
-        assert!(!input_line_is_empty(&screen(gray, (3, 3)), 4, (3, 3)));
+        assert!(!input_line_is_empty(&screen(gray, (3, 3)), 5, (3, 3)));
         // OSC sequences, such as hyperlinks, take no cells.
         let link = "\u{276f} \x1b]8;;https://x\x1b\\\x1b[2mhint\x1b[0m\x1b]8;;\x1b\\\r";
-        assert!(input_line_is_empty(&screen(link, (3, 3)), 4, (3, 3)));
+        assert!(input_line_is_empty(&screen(link, (3, 3)), 5, (3, 3)));
     }
 }
 

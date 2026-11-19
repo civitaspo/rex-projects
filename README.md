@@ -52,7 +52,7 @@ rex-projects ticket answer demo-1 --text "Use the v2 API"
 
 `--text` types the answer into the Coordinator's pane and presses Return, and only does so while the Coordinator is idle. If you already replied in the pane and the Ticket still shows waiting, run `ticket answer demo-1` without `--text`.
 
-To tell a Coordinator something without interrupting it, leave a message in its inbox. It reaches the Coordinator when its current turn ends. If the Coordinator is already idle, `serve` wakes it once it has been idle for 30 seconds with an empty input line, by typing one fixed line that says it has new messages; the messages themselves never go through the terminal. A Coordinator waiting on your answer is not woken: answer it, in its pane or with `ticket answer`, and the messages arrive with your answer:
+To tell a Coordinator something without interrupting it, leave a message in its inbox. It reaches the Coordinator when its current turn ends. If the Coordinator is idle, `serve` wakes it once it has been idle for 30 seconds, the oldest unread message is 30 seconds old, and its input box is empty, by typing one fixed line that says it has new messages; the messages themselves never go through the terminal. A Coordinator waiting on your answer is not woken: answer it, in its pane or with `ticket answer`, and the messages arrive with your answer:
 
 ```sh
 rex-projects ticket message demo-1 "Also update the changelog"

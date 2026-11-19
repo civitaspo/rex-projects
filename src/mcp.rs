@@ -722,21 +722,15 @@ pub(crate) mod tests {
                 },
             )
             .unwrap();
-        for role in ["coordinator", "helper"] {
-            store
-                .append(
-                    "serve",
-                    Event::AgentCreated {
-                        agent_id: format!("demo-1-{role}"),
-                        ticket_id: "demo-1".into(),
-                        project_id: "demo".into(),
-                        role: role.into(),
-                        provider: "claude".into(),
-                        cwd: "/tmp".into(),
-                    },
-                )
-                .unwrap();
-        }
+        let created = |role: &str| Event::AgentCreated {
+            agent_id: format!("demo-1-{role}"),
+            ticket_id: "demo-1".into(),
+            project_id: "demo".into(),
+            role: role.into(),
+            provider: "claude".into(),
+            cwd: "/tmp".into(),
+        };
+        store.append("serve", created("coordinator")).unwrap();
         store
             .append(
                 "serve",
@@ -745,6 +739,9 @@ pub(crate) mod tests {
                     agent_id: "demo-1-coordinator".into(),
                 },
             )
+            .unwrap();
+        store
+            .append("demo-1-coordinator", created("helper"))
             .unwrap();
         paths
     }
