@@ -291,7 +291,7 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-fn append_in(tx: &Transaction<'_>, actor: &str, event: &Event) -> Result<i64> {
+pub(crate) fn append_in(tx: &Transaction<'_>, actor: &str, event: &Event) -> Result<i64> {
     let at = now();
     project(tx, &at, event)?;
     let project_id = match event {

@@ -18,6 +18,12 @@ pub fn branch(ticket_id: &str) -> String {
     format!("rex-projects/{ticket_id}")
 }
 
+/// Every branch name a Ticket's worktree may use: the current one and the
+/// one used before the rename to `rex-projects/`.
+pub fn ticket_branches(ticket_id: &str) -> [String; 2] {
+    [branch(ticket_id), format!("rxp/{ticket_id}")]
+}
+
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")
@@ -72,13 +78,14 @@ pub fn ensure(repo: &Path, dir: &Path, branch: &str, base: Option<&str>) -> Resu
     Ok(())
 }
 
-/// Removes the worktree and its branch, refusing when that would lose work:
-/// uncommitted changes, commits that are neither on a remote nor on `base`,
-/// or ignored files such as `.env`, unless `discard_ignored` is set.
+/// Removes the worktree and those of `branches` that exist, refusing when that
+/// would lose work: uncommitted changes, commits that are neither on a remote
+/// nor on `base`, or ignored files such as `.env`, unless `discard_ignored` is
+/// set. Other branches, even one checked out in the worktree, are kept.
 pub fn remove(
     repo: &Path,
     dir: &Path,
-    branch: &str,
+    branches: &[String],
     base: Option<&str>,
     discard_ignored: bool,
 ) -> Result<()> {
@@ -117,19 +124,12 @@ pub fn remove(
     }
     let base = base.unwrap_or("HEAD");
     // Check what the worktree actually has checked out, which may be another
-    // branch than `branch` (one named before a rename) or a detached HEAD.
-    let mut branches = vec![branch.to_owned()];
+    // branch than `branches` or a detached HEAD.
     if dir.exists() {
         let head = git(dir, &["rev-parse", "HEAD"])?;
         refuse_unpushed(repo, &head, &format!("the HEAD of {}", dir.display()), base)?;
-        if let Ok(current) = git(dir, &["symbolic-ref", "--short", "-q", "HEAD"])
-            && !current.is_empty()
-            && current != branch
-        {
-            branches.push(current);
-        }
     }
-    for b in &branches {
+    for b in branches {
         if branch_exists(repo, b) {
             refuse_unpushed(repo, b, &format!("branch {b}"), base)?;
         }
@@ -138,7 +138,7 @@ pub fn remove(
         let dir = dir.to_str().context("worktree path is not UTF-8")?;
         git(repo, &["worktree", "remove", dir])?;
     }
-    for b in &branches {
+    for b in branches {
         if branch_exists(repo, b) {
             git(repo, &["branch", "-D", b])?;
         }
@@ -185,7 +185,7 @@ pub fn cleanup_ticket(
     remove(
         &project.repo,
         &paths.worktree_dir(&project.id, id),
-        &branch(id),
+        &ticket_branches(id),
         project.base_branch.as_deref(),
         discard_ignored,
     )
@@ -224,12 +224,12 @@ pub(crate) mod tests {
         git(&dir, &["update-ref", "refs/remotes/origin/x", "HEAD"]).unwrap();
         std::fs::write(dir.join(".env"), "SECRET=1").unwrap();
 
-        let err = remove(repo.path(), &dir, &branch("demo-1"), None, false).unwrap_err();
+        let err = remove(repo.path(), &dir, &ticket_branches("demo-1"), None, false).unwrap_err();
         assert!(err.to_string().contains(".env"), "{err}");
 
         // An untracked file is not hidden either.
         std::fs::write(dir.join("notes.md"), "x").unwrap();
-        let err = remove(repo.path(), &dir, &branch("demo-1"), None, true).unwrap_err();
+        let err = remove(repo.path(), &dir, &ticket_branches("demo-1"), None, true).unwrap_err();
         assert!(err.to_string().contains("uncommitted"), "{err}");
         assert!(dir.join(".env").exists());
     }
@@ -243,14 +243,28 @@ pub(crate) mod tests {
         ensure(repo.path(), &dir, "rxp/demo-1", None).unwrap();
         git(&dir, &["commit", "-q", "--allow-empty", "-m", "work"]).unwrap();
 
-        let err = remove(repo.path(), &dir, &branch("demo-1"), None, false).unwrap_err();
+        let err = remove(repo.path(), &dir, &ticket_branches("demo-1"), None, false).unwrap_err();
         assert!(err.to_string().contains("not on any remote"), "{err}");
         assert!(dir.exists());
 
         git(&dir, &["update-ref", "refs/remotes/origin/x", "HEAD"]).unwrap();
-        remove(repo.path(), &dir, &branch("demo-1"), None, false).unwrap();
+        remove(repo.path(), &dir, &ticket_branches("demo-1"), None, false).unwrap();
         assert!(!dir.exists());
         assert!(!branch_exists(repo.path(), "rxp/demo-1"));
+    }
+
+    #[test]
+    fn keeps_other_branches_checked_out_in_the_worktree() {
+        let repo = temp_repo();
+        let state = tempfile::tempdir().unwrap();
+        let dir = state.path().join("demo/demo-1");
+        ensure(repo.path(), &dir, &branch("demo-1"), None).unwrap();
+        git(&dir, &["switch", "-q", "-c", "my-unrelated-branch"]).unwrap();
+
+        remove(repo.path(), &dir, &ticket_branches("demo-1"), None, false).unwrap();
+        assert!(!dir.exists());
+        assert!(!branch_exists(repo.path(), &branch("demo-1")));
+        assert!(branch_exists(repo.path(), "my-unrelated-branch"));
     }
 
     #[test]
@@ -271,10 +285,10 @@ pub(crate) mod tests {
         assert!(dir.join(".git").exists());
 
         std::fs::write(dir.join("file"), "x").unwrap();
-        assert!(remove(repo.path(), &dir, &branch, None, false).is_err());
+        assert!(remove(repo.path(), &dir, &ticket_branches("demo-1"), None, false).is_err());
         git(&dir, &["add", "file"]).unwrap();
         git(&dir, &["commit", "-q", "-m", "work"]).unwrap();
-        let err = remove(repo.path(), &dir, &branch, None, false).unwrap_err();
+        let err = remove(repo.path(), &dir, &ticket_branches("demo-1"), None, false).unwrap_err();
         assert!(err.to_string().contains("not on any remote"), "{err}");
 
         git(&dir, &["reset", "-q", "--hard", "main"]).unwrap();
@@ -283,11 +297,11 @@ pub(crate) mod tests {
         git(&dir, &["commit", "-q", "-m", "ignore"]).unwrap();
         git(&dir, &["update-ref", "refs/remotes/origin/x", "HEAD"]).unwrap();
         std::fs::write(dir.join(".env"), "SECRET=1").unwrap();
-        let err = remove(repo.path(), &dir, &branch, None, false).unwrap_err();
+        let err = remove(repo.path(), &dir, &ticket_branches("demo-1"), None, false).unwrap_err();
         assert!(err.to_string().contains("ignored files"), "{err}");
         assert!(err.to_string().contains(".env"), "{err}");
         assert!(dir.join(".env").exists());
-        remove(repo.path(), &dir, &branch, None, true).unwrap();
+        remove(repo.path(), &dir, &ticket_branches("demo-1"), None, true).unwrap();
         assert!(!dir.exists());
         assert!(!branch_exists(repo.path(), &branch));
     }

@@ -50,7 +50,7 @@ rex-projects ticket answer demo-1 --text "Use the v2 API"
 
 `--text` types the answer into the Coordinator's pane and presses Return, and only does so while the Coordinator is idle. If you already replied in the pane and the Ticket still shows waiting, which can happen with a harness that has no prompt hook, run `ticket answer demo-1` without `--text`.
 
-`ticket cleanup <id>` removes an ended Ticket's worktree and branch. It refuses while the worktree holds uncommitted changes, commits that are on no remote, or ignored files such as `.env` or build output. Move anything you need out of the worktree, then pass `--discard-ignored` to delete the ignored files with it.
+`ticket cleanup <id>` removes an ended Ticket's worktree and its `rex-projects/<id>` branch (or `rxp/<id>` from before the rename). Any other branch checked out in the worktree is kept. It refuses while the worktree holds uncommitted changes, commits that are on no remote, or ignored files such as `.env` or build output. Move anything you need out of the worktree, then pass `--discard-ignored` to delete the ignored files with it.
 
 ## Rex plugin
 
