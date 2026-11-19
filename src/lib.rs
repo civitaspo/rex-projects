@@ -6,6 +6,7 @@ pub mod config;
 pub mod domain;
 pub mod history;
 pub mod hook;
+pub mod inbox;
 pub mod mcp;
 pub mod paths;
 pub mod provider;

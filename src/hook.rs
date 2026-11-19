@@ -1,11 +1,14 @@
-//! Harness hook handlers (ADR-0002). A hook must never break the harness: it
-//! prints nothing to stdout, reports errors on stderr, and always exits 0.
+//! Harness hook handlers (ADR-0002, ADR-0003). A hook must never break the
+//! harness: it prints only hook output JSON to stdout, reports errors on
+//! stderr, and always exits 0.
 
 use std::io::Read;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+
+use serde_json::json;
 
 use crate::domain::{Event, TicketState};
 use crate::mcp::is_stale;
@@ -44,12 +47,15 @@ pub fn main(config_dir: Option<PathBuf>, state_dir: Option<PathBuf>, provider: &
         let paths = Paths::resolve(config_dir, state_dir)?;
         handle(&paths, &agent_id, launch, provider, event, &input)
     });
-    if let Err(err) = result {
-        eprintln!("rex-projects hook {provider} {event}: {err:#}");
+    match result {
+        Ok(Some(output)) => println!("{output}"),
+        Ok(None) => {}
+        Err(err) => eprintln!("rex-projects hook {provider} {event}: {err:#}"),
     }
 }
 
-/// Applies one hook `event` from `provider` for `agent_id`.
+/// Applies one hook `event` from `provider` for `agent_id`, returning what
+/// the hook prints for the harness.
 pub fn handle(
     paths: &Paths,
     agent_id: &str,
@@ -57,11 +63,11 @@ pub fn handle(
     provider: &str,
     event: &str,
     input: &[u8],
-) -> Result<()> {
+) -> Result<Option<String>> {
     if !matches!(provider, "claude" | "codex") {
         bail!("unknown provider {provider:?}");
     }
-    if !matches!(event, "session-start" | "user-prompt-submit") {
+    if !matches!(event, "session-start" | "user-prompt-submit" | "stop") {
         bail!("unknown hook event {event:?}");
     }
     let payload: Payload = serde_json::from_slice(input).context("invalid hook input")?;
@@ -70,7 +76,7 @@ pub fn handle(
         .agent(agent_id)?
         .with_context(|| format!("agent {agent_id} does not exist"))?;
     if is_stale(launch, &agent) {
-        return Ok(());
+        return Ok(None);
     }
     if event == "session-start" {
         let session_id = payload
@@ -86,16 +92,19 @@ pub fn handle(
                 },
             )?;
         }
-        return Ok(());
+        return Ok(None);
+    }
+    if event == "stop" {
+        // Unread messages continue the turn instead of ending it.
+        let (messages, remaining) = crate::inbox::take(&mut store, agent_id)?;
+        return Ok(crate::inbox::render(&messages, remaining)
+            .map(|reason| json!({"decision": "block", "reason": reason}).to_string()));
     }
     // A human typed into the Coordinator's TUI: that answers a waiting Ticket.
-    if agent.role != "coordinator" {
-        return Ok(());
-    }
     let ticket = store
         .ticket(&agent.ticket_id)?
         .with_context(|| format!("ticket {} does not exist", agent.ticket_id))?;
-    if ticket.state == TicketState::Waiting {
+    if agent.role == "coordinator" && ticket.state == TicketState::Waiting {
         store.append(
             "human",
             Event::TicketAnswered {
@@ -105,7 +114,15 @@ pub fn handle(
             },
         )?;
     }
-    Ok(())
+    // Unread messages ride along with the human's prompt.
+    let (messages, remaining) = crate::inbox::take(&mut store, agent_id)?;
+    Ok(crate::inbox::render(&messages, remaining).map(|context| {
+        json!({"hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": context,
+        }})
+        .to_string()
+    }))
 }
 
 fn truncate(text: &str) -> String {
@@ -138,7 +155,7 @@ mod tests {
         store.ticket("demo-1").unwrap().unwrap().state
     }
 
-    fn prompt(paths: &Paths, agent: &str, launch: Option<i64>) -> Result<()> {
+    fn prompt(paths: &Paths, agent: &str, launch: Option<i64>) -> Result<Option<String>> {
         let input =
             br#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"Use v2"}"#;
         handle(paths, agent, launch, "claude", "user-prompt-submit", input)
@@ -217,9 +234,61 @@ mod tests {
         let paths = dispatched(dir.path());
         let agent = "demo-1-coordinator";
         assert!(handle(&paths, agent, None, "gemini", "session-start", b"{}").is_err());
-        assert!(handle(&paths, agent, None, "claude", "stop", b"{}").is_err());
+        assert!(handle(&paths, agent, None, "claude", "pre-tool-use", b"{}").is_err());
         assert!(handle(&paths, agent, None, "claude", "session-start", b"{}").is_err());
         assert!(handle(&paths, agent, None, "claude", "session-start", b"nope").is_err());
+    }
+
+    fn send(paths: &Paths, to: &str, body: &str) {
+        Store::open(&paths.db_file())
+            .unwrap()
+            .append(
+                "demo-1-helper",
+                Event::MessageSent {
+                    ticket_id: "demo-1".into(),
+                    from: "demo-1-helper".into(),
+                    to: to.into(),
+                    body: body.into(),
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn stop_continues_the_turn_with_unread_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = dispatched(dir.path());
+        let input = br#"{"session_id":"s1","hook_event_name":"Stop","stop_hook_active":false}"#;
+        let stop = |launch| handle(&paths, "demo-1-coordinator", launch, "codex", "stop", input);
+        assert_eq!(stop(None).unwrap(), None);
+        send(&paths, "demo-1-coordinator", "Review done: 2 findings.");
+        // A superseded process does not take the messages.
+        assert_eq!(stop(Some(4)).unwrap(), None);
+        let output: serde_json::Value =
+            serde_json::from_str(&stop(None).unwrap().unwrap()).unwrap();
+        assert_eq!(output["decision"], "block");
+        let reason = output["reason"].as_str().unwrap();
+        assert!(reason.contains("Review done: 2 findings."), "{reason}");
+        assert!(reason.contains("demo-1-helper"), "{reason}");
+        assert_eq!(stop(None).unwrap(), None);
+    }
+
+    #[test]
+    fn a_prompt_carries_unread_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = dispatched(dir.path());
+        assert_eq!(prompt(&paths, "demo-1-coordinator", None).unwrap(), None);
+        send(&paths, "demo-1-coordinator", "CI is green.");
+        let output = prompt(&paths, "demo-1-coordinator", None).unwrap().unwrap();
+        let output: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let hook = &output["hookSpecificOutput"];
+        assert_eq!(hook["hookEventName"], "UserPromptSubmit");
+        assert!(
+            hook["additionalContext"]
+                .as_str()
+                .unwrap()
+                .contains("CI is green.")
+        );
     }
 
     #[test]

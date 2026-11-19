@@ -120,11 +120,23 @@ pub enum TicketCommand {
     ///
     /// With `--text`, the answer is typed into the Coordinator's pane and
     /// submitted. Without it, the Ticket is only marked answered, for when you
-    /// already replied in the pane and the harness has no hook to record it.
+    /// already replied in the pane and its prompt hook did not record it.
     Answer {
         id: String,
         #[arg(long)]
         text: Option<String>,
+    },
+    /// Leave a message in an Agent's inbox.
+    ///
+    /// The message goes to the Ticket's Coordinator, or to `--agent`. It
+    /// reaches the Agent when its turn ends or it next reads its inbox,
+    /// without interrupting it.
+    Message {
+        id: String,
+        text: String,
+        /// The Agent to message, by id. Defaults to the Coordinator.
+        #[arg(long)]
+        agent: Option<String>,
     },
     /// Create a Ticket from an item in an external tracker.
     Import {
@@ -400,6 +412,31 @@ fn ticket(paths: &Paths, command: TicketCommand) -> Result<()> {
                 text,
             )?;
             println!("{id} is running");
+        }
+        TicketCommand::Message { id, text, agent } => {
+            let ticket = store
+                .ticket(&id)?
+                .with_context(|| format!("ticket {id} does not exist"))?;
+            let to = agent
+                .or(ticket.coordinator_id)
+                .with_context(|| format!("ticket {id} has no Coordinator yet"))?;
+            if text.chars().count() > crate::inbox::MAX_BODY_CHARS {
+                bail!(
+                    "the message is longer than {} characters",
+                    crate::inbox::MAX_BODY_CHARS
+                );
+            }
+            let from = actor();
+            store.append(
+                &from,
+                Event::MessageSent {
+                    ticket_id: id,
+                    from: from.clone(),
+                    to: to.clone(),
+                    body: text,
+                },
+            )?;
+            println!("sent to {to}");
         }
         TicketCommand::Import {
             reference,
