@@ -506,6 +506,12 @@ mod tests {
         assert!(!input_line_is_empty(gap, 4, (1, 3)), "{gap:?}");
         let codex_gap = "\x1b[1m\u{203a}\x1b[1C\x1b[0m\r\r\n \r\r\n \x1b[1Clater\r\r\n \r\r\n \x1b[1C\x1b[38;2;246;226;183mGPT\x1b[0m \u{b7} \x1b[38;2;171;223;167m~/src\x1b[0m\x1b[1;3H\n";
         assert!(!input_line_is_empty(codex_gap, 5, (1, 3)), "{codex_gap:?}");
+        // As captured from both TUIs: the draft "\n\nthird line", with the
+        // cursor on its blank first row (paths shortened).
+        let claude_real = "\u{276f}\u{a0}\r\r\n\r\r\n  third line\r\r\n\x1b[0m\x1b[38;2;136;136;136m\u{2500}\u{2500}\u{2500}\r\r\n\x1b[2C\x1b[0m\x1b[38;2;255;193;7m\u{23f5}\u{23f5} auto mode on\x1b[0m\x1b[38;2;153;153;153m (shift+tab to cycle)\x1b[0m\x1b[1;3H\n";
+        assert!(!input_line_is_empty(claude_real, 5, (1, 3)));
+        let codex_real = "\x1b[0m\x1b[1m\u{203a}\x1b[0m\r\r\n \r\r\n \x1b[1Cthird\x1b[1Cline\r\r\n \r\r\n \x1b[1C\x1b[0m\x1b[38;2;246;226;183mGPT-6.2-Sol low\x1b[0m \u{b7} \x1b[0m\x1b[38;2;171;223;167m~/src/demo\x1b[0m\x1b[1;3H\n";
+        assert!(!input_line_is_empty(codex_real, 5, (1, 3)));
         // Codex's own blank row before its colored status row ends the box.
         let codex_status = "\x1b[1m\u{203a}\x1b[1C\x1b[0m\x1b[2mAsk Codex\x1b[0m\r\r\n \r\r\n \x1b[1C\x1b[38;2;246;226;183mGPT-6.2\x1b[0m \u{b7} \x1b[38;2;171;223;167m~/src\x1b[0m\x1b[1;3H\n";
         assert!(

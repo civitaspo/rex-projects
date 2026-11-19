@@ -1071,6 +1071,71 @@ mod tests {
     }
 
     #[test]
+    fn wakes_a_helper_only_while_its_ticket_runs() {
+        let mut f = fixture();
+        f.tick();
+        let worker = spawn(&mut f, "worker");
+        f.tick();
+        let block = helper(&f, &worker).rex_block_id.unwrap();
+        f.serve.rex.blocks.get_mut(&block).unwrap().status = Some(crate::rex::Status {
+            state: "idle".into(),
+            message: None,
+        });
+        f.tick();
+        // The worker's task was read at launch; a question's answer waits.
+        let conn = f.serve.store.conn();
+        conn.execute("UPDATE messages SET read_at = sent_at", [])
+            .unwrap();
+        f.serve
+            .store
+            .append(
+                "demo-1-coordinator",
+                Event::MessageSent {
+                    ticket_id: "demo-1".into(),
+                    from: "demo-1-coordinator".into(),
+                    to: worker.clone(),
+                    body: "Use the v2 API.".into(),
+                },
+            )
+            .unwrap();
+        f.serve
+            .store
+            .append(
+                "demo-1-coordinator",
+                Event::TicketAsked {
+                    ticket_id: "demo-1".into(),
+                    question: "Ship today?".into(),
+                },
+            )
+            .unwrap();
+        let age = |f: &Fixture| {
+            let conn = f.serve.store.conn();
+            conn.execute("UPDATE agents SET updated_at = '2000-01-01T00:00:00Z'", [])
+                .unwrap();
+            conn.execute("UPDATE messages SET sent_at = '2000-01-01T00:00:00Z'", [])
+                .unwrap();
+        };
+        // Every other condition holds, but the Ticket waits on a human.
+        age(&f);
+        f.tick();
+        assert!(f.serve.rex.blocks[&block].input.is_empty());
+        f.serve
+            .store
+            .append(
+                "human",
+                Event::TicketAnswered {
+                    ticket_id: "demo-1".into(),
+                    answer: None,
+                    question: Some("Ship today?".into()),
+                },
+            )
+            .unwrap();
+        age(&f);
+        f.tick();
+        assert_eq!(f.serve.rex.blocks[&block].input, [crate::inbox::WAKE_TOKEN]);
+    }
+
+    #[test]
     fn does_not_wake_a_blocked_agent() {
         let mut f = fixture();
         f.tick();
