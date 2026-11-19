@@ -351,7 +351,7 @@ impl Store {
         };
         for (at, payload) in events {
             let event: Event = serde_json::from_str(&payload)?;
-            project(&tx, &at, &event)?;
+            project(&tx, &at, &event, Replay::Yes)?;
         }
         tx.commit()?;
         Ok(())
@@ -364,7 +364,7 @@ fn now() -> String {
 
 pub(crate) fn append_in(tx: &Transaction<'_>, actor: &str, event: &Event) -> Result<i64> {
     let at = now();
-    project(tx, &at, event)?;
+    project(tx, &at, event, Replay::No)?;
     let project_id = match event {
         Event::TicketCreated { project_id, .. } | Event::AgentCreated { project_id, .. } => {
             Some(project_id.clone())
@@ -546,7 +546,17 @@ fn update_refs(
     Ok(())
 }
 
-fn project(tx: &Transaction<'_>, at: &str, event: &Event) -> Result<()> {
+/// Whether `project` replays a stored event or admits a new one. Checks
+/// added after events were first stored apply only to new events, so a
+/// rebuild still accepts the history an earlier version committed.
+#[derive(Clone, Copy, PartialEq)]
+enum Replay {
+    Yes,
+    No,
+}
+
+fn project(tx: &Transaction<'_>, at: &str, event: &Event, replay: Replay) -> Result<()> {
+    let admit = replay == Replay::No;
     use TicketState::*;
     match event {
         Event::TicketCreated {
@@ -745,14 +755,17 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event) -> Result<()> {
                 // A helper is never resumed, so nothing would read it. An
                 // exited Coordinator reads it once relaunched.
                 Some((_, role, state))
-                    if role != "coordinator" && matches!(state.as_str(), "finished" | "exited") =>
+                    if admit
+                        && role != "coordinator"
+                        && matches!(state.as_str(), "finished" | "exited") =>
                 {
                     bail!("agent {to} has {state}; spawn a new helper instead")
                 }
                 Some(_) => {}
             }
             // A helper that finished or was stopped can no longer report.
-            if let Some((_, _, state)) = agent(from)?
+            if admit
+                && let Some((_, _, state)) = agent(from)?
                 && matches!(state.as_str(), "finished" | "exited")
             {
                 bail!("agent {from} has {state} and can no longer send messages; stop working");
@@ -784,7 +797,7 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event) -> Result<()> {
         } => {
             let state = ticket_state(tx, ticket_id)?;
             // A helper joins only a Ticket that is still being worked on.
-            if role != "coordinator" && !matches!(state, Running | Waiting) {
+            if admit && role != "coordinator" && !matches!(state, Running | Waiting) {
                 bail!("ticket {ticket_id} is {state}; helpers run only on a running Ticket");
             }
             tx.execute(
@@ -808,11 +821,11 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event) -> Result<()> {
                 params![agent_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-            if state == "finished" {
+            if admit && state == "finished" {
                 bail!("agent {agent_id} was stopped before it launched");
             }
             let ticket = ticket_state(tx, &ticket_id)?;
-            if ticket.is_terminal() {
+            if admit && ticket.is_terminal() {
                 bail!("ticket {ticket_id} is {ticket}; agent {agent_id} cannot launch");
             }
             tx.execute(
@@ -1124,6 +1137,55 @@ mod tests {
             .map(|e| e.event.kind())
             .collect();
         assert_eq!(kinds, vec!["ticket_created", "ticket_cancelled"]);
+    }
+
+    #[test]
+    fn rebuild_accepts_history_that_newer_checks_reject() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = new_ticket(&mut store, true).id;
+        let agent_id = agent(&mut store, &id);
+        store
+            .append(
+                "human",
+                Event::TicketCancelled {
+                    ticket_id: id.clone(),
+                    reason: "not needed".into(),
+                },
+            )
+            .unwrap();
+        // An earlier version stored these events; this one refuses new ones.
+        let late = [
+            Event::AgentLaunched {
+                agent_id: agent_id.clone(),
+                rex_session_id: "session:1".into(),
+                rex_window_id: "window:1".into(),
+                rex_block_id: "block:1".into(),
+                resume: false,
+            },
+            Event::AgentExited {
+                agent_id: agent_id.clone(),
+                reason: "block closed".into(),
+            },
+            Event::MessageSent {
+                ticket_id: id.clone(),
+                from: agent_id.clone(),
+                to: agent_id.clone(),
+                body: "late".into(),
+            },
+        ];
+        assert!(store.append("serve", late[0].clone()).is_err());
+        for event in &late {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO events (at, actor, kind, payload) VALUES (?1, 'serve', ?2, ?3)",
+                    params![now(), event.kind(), serde_json::to_string(event).unwrap()],
+                )
+                .unwrap();
+        }
+        store.rebuild().unwrap();
+        assert_eq!(store.ticket_messages(&id).unwrap().len(), 1);
+        assert!(store.append("serve", late[2].clone()).is_err());
     }
 
     #[test]
