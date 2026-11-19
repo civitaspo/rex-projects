@@ -112,6 +112,7 @@ impl Harness<'_> {
                     // rex-projects tool call, and `-a never` refuses them.
                     r#"mcp_servers.rex_projects.default_tools_approval_mode="approve""#.to_owned(),
                     format!("mcp_servers.rex_projects.env={{{}}}", env.join(", ")),
+                    hook("SessionStart", "session-start"),
                     hook("Stop", "stop"),
                     hook("UserPromptSubmit", "user-prompt-submit"),
                 ] {
@@ -529,7 +530,7 @@ mod tests {
             .filter(|w| w[0] == "-c")
             .map(|w| w[1].as_str())
             .collect();
-        assert_eq!(configs.len(), 7);
+        assert_eq!(configs.len(), 8);
         // Every override must parse as TOML, as Codex parses it.
         let parsed: toml::Table = toml::from_str(&configs.join("\n")).unwrap();
         assert_eq!(
@@ -557,6 +558,10 @@ mod tests {
         assert_eq!(
             parsed["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str(),
             Some("'/bin/rex-projects' hook codex user-prompt-submit")
+        );
+        assert_eq!(
+            parsed["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str(),
+            Some("'/bin/rex-projects' hook codex session-start")
         );
 
         let resume = argv(ProviderKind::Codex, Start::Resume { session_id: "s9" });

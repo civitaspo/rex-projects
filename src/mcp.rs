@@ -574,8 +574,9 @@ fn tools() -> Value {
         },
         {
             "name": "report",
-            "description": "Report progress on your Ticket. Call it whenever the Stage \
-                changes or something notable happens. Omitted fields keep their values.",
+            "description": "Coordinator only. Report progress on your Ticket. Call it \
+                whenever the Stage changes or something notable happens. Omitted fields keep \
+                their values. Helpers send progress to the Coordinator with `send` instead.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

@@ -476,6 +476,14 @@ impl<R: Rex> Serve<R> {
         }
         if agent.harness_session_id.is_none()
             && config.provider(&agent.provider)?.kind == ProviderKind::Codex
+            // The SessionStart hook binds the session. Fall back to the newest
+            // session in the Agent's directory only while no other live Agent
+            // works there, since helpers share their Coordinator's worktree.
+            && !self
+                .store
+                .agents(true)?
+                .iter()
+                .any(|other| other.id != agent.id && other.cwd == agent.cwd)
             && let Some(after) = provider::launched_at(&self.paths.agent_dir(&agent.id))
             && let Some(sessions) = provider::codex_sessions_dir()
             && let Some(id) = provider::find_codex_session(&sessions, Path::new(&agent.cwd), after)
