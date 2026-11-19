@@ -257,14 +257,9 @@ impl Rex for RexCli {
             .as_u64()
             .context("terminal size has no rows")? as usize;
         let vt = call("format", json!({ "format": "vt", "extra_cursor": true }))?;
-        let text = call("format", json!({ "format": "text" }))?;
-        let cursor = cursor_position(vt["content"].as_str().unwrap_or_default())
-            .context("terminal screen has no cursor position")?;
-        Ok(input_line_is_empty(
-            text["content"].as_str().unwrap_or_default(),
-            rows,
-            cursor,
-        ))
+        let vt = vt["content"].as_str().unwrap_or_default();
+        let cursor = cursor_position(vt).context("terminal screen has no cursor position")?;
+        Ok(input_line_is_empty(vt, rows, cursor))
     }
 
     fn submit(&mut self, session_id: &str, block_id: &str, text: &str) -> Result<()> {
@@ -283,21 +278,92 @@ fn cursor_position(vt: &str) -> Option<(usize, usize)> {
     Some((row.parse().ok()?, col.parse().ok()?))
 }
 
-/// Whether the cursor's row of the screen, the last `rows` lines of `text`,
-/// shows only a prompt mark before the cursor. A TUI's empty input box may
-/// show placeholder text after the cursor, which does not count.
-fn input_line_is_empty(text: &str, rows: usize, (row, col): (usize, usize)) -> bool {
-    let lines: Vec<&str> = text.lines().collect();
+/// Whether the cursor's row of a `vt` screen dump, whose last `rows` lines
+/// are the screen, is an empty input line: one prompt mark before the cursor,
+/// and after it nothing but dim text, which is how Claude Code and Codex draw
+/// the placeholder of an empty input box. Typed text is drawn in normal
+/// style, so a draft on either side of the cursor counts as input.
+fn input_line_is_empty(vt: &str, rows: usize, (row, col): (usize, usize)) -> bool {
+    let lines: Vec<&str> = vt.strip_suffix('\n').unwrap_or(vt).split('\n').collect();
     let top = lines.len().saturating_sub(rows);
     let Some(line) = lines.get(top + row.saturating_sub(1)) else {
         return false;
     };
-    let before: String = line.chars().take(col.saturating_sub(1)).collect();
-    let mut marks = before.split_whitespace();
-    matches!(
-        (marks.next(), marks.next()),
-        (Some(mark), None) if mark.chars().count() == 1 && !mark.chars().all(char::is_alphanumeric)
-    )
+    let cells = cells(line);
+    let split = col.saturating_sub(1).min(cells.len());
+    let (before, after) = cells.split_at(split);
+    let marks: Vec<char> = before
+        .iter()
+        .map(|(c, _)| *c)
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let one_mark = matches!(marks.as_slice(), [mark] if !mark.is_alphanumeric());
+    one_mark && after.iter().all(|(c, dim)| c.is_whitespace() || *dim)
+}
+
+/// The cells of one row of a `vt` dump, each a character and whether it is
+/// drawn dim (SGR 2). Cursor-forward moves become spaces; other escape
+/// sequences are skipped.
+fn cells(line: &str) -> Vec<(char, bool)> {
+    let mut cells = Vec::new();
+    let mut dim = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.next() {
+                Some('[') => {
+                    let mut params = String::new();
+                    let mut last = None;
+                    for c in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&c) {
+                            last = Some(c);
+                            break;
+                        }
+                        params.push(c);
+                    }
+                    match last {
+                        Some('m') => dim = sgr_dim(&params, dim),
+                        Some('C') => {
+                            let n = params.parse().unwrap_or(1);
+                            cells.extend(std::iter::repeat_n((' ', dim), n));
+                        }
+                        _ => {}
+                    }
+                }
+                // OSC: up to BEL or ESC \.
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' || (c == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            c if c.is_control() => {}
+            c => cells.push((c, dim)),
+        }
+    }
+    cells
+}
+
+/// Applies an SGR parameter list to the dim attribute.
+fn sgr_dim(params: &str, mut dim: bool) -> bool {
+    let mut params = params.split(';');
+    while let Some(p) = params.next() {
+        match p {
+            "" | "0" | "22" => dim = false,
+            "2" => dim = true,
+            // Extended colors carry their own numbers, which are not styles.
+            "38" | "48" | "58" => match params.next() {
+                Some("2") => drop(params.nth(2)),
+                Some("5") => drop(params.next()),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    dim
 }
 
 /// Shortens `text` to at most `max` characters.
@@ -315,27 +381,43 @@ mod tests {
         assert_eq!(cursor_position("no cursor"), None);
     }
 
+    /// Rows as Claude Code and Codex draw them, from `vt` dumps.
+    const CLAUDE_EMPTY: &str = "\u{276f}\u{a0}\x1b[0m\x1b[2mTry \"edit store.rs\"\x1b[0m\r";
+    const CLAUDE_DRAFT: &str = "\u{276f}\u{a0}abc\r";
+    const CODEX_EMPTY: &str =
+        "\x1b[0m\x1b[1m\u{203a}\x1b[1C\x1b[0m\x1b[2mAsk Codex to do anything\x1b[0m\r";
+    const CODEX_DRAFT: &str = "\x1b[0m\x1b[1m\u{203a}\x1b[1C\x1b[0mabc\r";
+
+    /// A 4-row screen under two lines of scrollback, with `prompt` on row 3
+    /// and the cursor sequence at the end, as `format` returns it.
+    fn screen(prompt: &str, cursor: (usize, usize)) -> String {
+        format!(
+            "old 1\r\nold 2\r\n\x1b[38;2;153;153;153mtitle\x1b[0m\r\n\r\n{prompt}\n\x1b[2mhint\x1b[0m\x1b[{};{}H\n",
+            cursor.0, cursor.1
+        )
+    }
+
     #[test]
     fn tells_an_empty_input_line_from_typed_text() {
-        // Captured from Claude Code and Codex in a 24-row terminal.
-        let mut screen: Vec<String> = (0..21).map(|i| format!("scrollback {i}")).collect();
-        screen.extend((0..20).map(|_| String::new()));
-        screen.push("────".into());
-        screen.push("❯ Try \"fix lint errors\"".into());
-        screen.push("  ⏵⏵ auto mode on".into());
-        let text = screen.join("\n");
-        // The visible screen is the last 24 lines; the prompt is on row 23.
-        assert!(input_line_is_empty(&text, 24, (23, 3)));
-        assert!(!input_line_is_empty(&text, 24, (23, 6)));
-        assert!(!input_line_is_empty(&text, 24, (22, 3)));
-        assert!(!input_line_is_empty(&text, 24, (40, 3)));
-        assert!(input_line_is_empty(
-            "› Ask Codex to do anything",
-            24,
-            (1, 3)
-        ));
-        assert!(!input_line_is_empty("› abc", 24, (1, 6)));
-        assert!(!input_line_is_empty("ab", 24, (1, 3)));
+        for empty in [CLAUDE_EMPTY, CODEX_EMPTY] {
+            let vt = screen(empty, (3, 3));
+            assert_eq!(cursor_position(&vt), Some((3, 3)));
+            assert!(input_line_is_empty(&vt, 4, (3, 3)), "{vt:?}");
+            // Another row, or a cursor off the screen, is not the input line.
+            assert!(!input_line_is_empty(&vt, 4, (2, 3)));
+            assert!(!input_line_is_empty(&vt, 4, (9, 3)));
+        }
+        for draft in [CLAUDE_DRAFT, CODEX_DRAFT] {
+            // The cursor after the draft, or at its start.
+            assert!(!input_line_is_empty(&screen(draft, (3, 6)), 4, (3, 6)));
+            assert!(!input_line_is_empty(&screen(draft, (3, 3)), 4, (3, 3)));
+        }
+        // A 24-bit color whose numbers include 2 is not dim.
+        let gray = "\u{203a} \x1b[38;2;2;2;2mtyped\x1b[0m\r";
+        assert!(!input_line_is_empty(&screen(gray, (3, 3)), 4, (3, 3)));
+        // OSC sequences, such as hyperlinks, take no cells.
+        let link = "\u{276f} \x1b]8;;https://x\x1b\\\x1b[2mhint\x1b[0m\x1b]8;;\x1b\\\r";
+        assert!(input_line_is_empty(&screen(link, (3, 3)), 4, (3, 3)));
     }
 }
 

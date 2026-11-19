@@ -347,11 +347,6 @@ impl Server {
             .unwrap_or(project.agent_spec(&args.role).provider);
         config.provider(&provider)?;
         let max = config.limits.max_agents as usize;
-        if crate::serve::live_agents(&store)? >= max {
-            bail!(
-                "all {max} Agent slots are in use; wait for a helper to finish, or do the work yourself"
-            );
-        }
         let n = store
             .agents_for_ticket(&ticket.id)?
             .iter()
@@ -359,7 +354,7 @@ impl Server {
             .count()
             + 1;
         let id = format!("{}-{}-{n}", ticket.id, args.role);
-        store.append_all(
+        let admitted = store.append_within_slots(
             &agent.id,
             &[
                 Event::AgentCreated {
@@ -377,7 +372,13 @@ impl Server {
                     body: args.task,
                 },
             ],
+            max,
         )?;
+        if !admitted {
+            bail!(
+                "all {max} Agent slots are in use; wait for a helper to finish, or do the work yourself"
+            );
+        }
         Ok(json!({
             "agent_id": id,
             "role": args.role,
@@ -456,7 +457,13 @@ impl Server {
         for artifact in &args.artifacts {
             body.push_str(&format!("\nartifact: {artifact}"));
         }
-        let body = crate::rex::truncate(&body, crate::inbox::MAX_BODY_CHARS);
+        if body.chars().count() > crate::inbox::MAX_BODY_CHARS {
+            bail!(
+                "the summary and artifacts are longer than {} characters; shorten the summary \
+                 or put the details in a file and list its path as an artifact",
+                crate::inbox::MAX_BODY_CHARS
+            );
+        }
         store.append_all(
             &agent.id,
             &[
@@ -1097,6 +1104,16 @@ pub(crate) mod tests {
         // The worker's done reaches the Coordinator's inbox.
         let worker = Server::new(coordinator.paths.clone(), "demo-1-worker-1".into(), None);
         assert!(call(&worker, "done", json!({"summary": " "})).0);
+        // A result too long for one message is refused, and the helper can retry.
+        let long = "x".repeat(crate::inbox::MAX_BODY_CHARS);
+        let (is_error, text) = call(
+            &worker,
+            "done",
+            json!({"summary": long, "artifacts": ["a"]}),
+        );
+        assert!(is_error);
+        assert!(text.contains("shorten the summary"), "{text}");
+        assert_eq!(agent(&coordinator, "demo-1-worker-1").state, "created");
         let (is_error, text) = call(
             &worker,
             "done",

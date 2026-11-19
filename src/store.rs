@@ -151,6 +151,41 @@ impl Store {
         Ok(())
     }
 
+    /// Records `events` only if fewer than `max` Agent slots are in use, in
+    /// one transaction, so two admissions cannot both take the last slot.
+    /// Returns whether they were recorded.
+    pub fn append_within_slots(
+        &mut self,
+        actor: &str,
+        events: &[Event],
+        max: usize,
+    ) -> Result<bool> {
+        self.with_tx(|tx| {
+            if slots_in_use(tx)? >= max {
+                return Ok(false);
+            }
+            for event in events {
+                append_in(tx, actor, event)?;
+            }
+            Ok(true)
+        })
+    }
+
+    /// Runs `f` in one write transaction, committing only if it succeeds.
+    pub fn with_tx<T>(&mut self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let value = f(&tx)?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    /// How many Agent slots under `limits.max_agents` are in use.
+    pub fn slots_in_use(&self) -> Result<usize> {
+        slots_in_use(&self.conn)
+    }
+
     /// Creates a Ticket, allocating the next number in its Project.
     pub fn create_ticket(&mut self, actor: &str, new: NewTicket) -> Result<Ticket> {
         let tx = self
@@ -381,6 +416,22 @@ pub(crate) fn append_in(tx: &Transaction<'_>, actor: &str, event: &Event) -> Res
         ],
     )?;
     Ok(tx.last_insert_rowid())
+}
+
+/// Agent slots in use: every Agent that has not exited, except on a done
+/// Ticket, whose pane stays only for the human to read, plus a slot reserved
+/// for each active Ticket whose Coordinator has exited and will be relaunched.
+fn slots_in_use(conn: &Connection) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT
+           (SELECT COUNT(*) FROM agents a JOIN tickets t ON t.id = a.ticket_id
+             WHERE a.state != 'exited' AND t.state != 'done')
+         + (SELECT COUNT(*) FROM tickets t JOIN agents a ON a.id = t.coordinator_id
+             WHERE t.state IN ('running', 'waiting', 'verifying') AND a.state = 'exited')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
 }
 
 fn lookup(tx: &Transaction<'_>, table: &str, id: &str) -> Result<Option<String>> {
@@ -714,6 +765,14 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event) -> Result<()> {
             ..
         } => {
             require_agent(tx, agent_id)?;
+            let state: String = tx.query_row(
+                "SELECT state FROM agents WHERE id = ?1",
+                params![agent_id],
+                |row| row.get(0),
+            )?;
+            if state == "finished" {
+                bail!("agent {agent_id} was stopped before it launched");
+            }
             tx.execute(
                 "UPDATE agents SET state = 'running', rex_session_id = ?2, rex_window_id = ?3,
                    rex_block_id = ?4, launches = launches + 1, activity = NULL,

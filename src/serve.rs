@@ -2,7 +2,7 @@
 //! blocks reconciled with the state database.
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -150,9 +150,10 @@ impl<R: Rex> Serve<R> {
                 continue;
             };
             let idle = |activity: Option<&str>| matches!(activity, Some("idle" | "done"));
+            let unread = self.store.unread(&agent.id)?;
             if agent.state != "running"
                 || !idle(agent.activity.as_deref())
-                || self.store.unread(&agent.id)?.is_empty()
+                || unread.is_empty()
                 || self
                     .woken
                     .get(&agent.id)
@@ -160,19 +161,21 @@ impl<R: Rex> Serve<R> {
             {
                 continue;
             }
-            // `updated_at` moves with each activity change, so it tells how
-            // long the Agent has been idle.
-            let idle_long_enough = chrono::DateTime::parse_from_rfc3339(&agent.updated_at)
-                .is_ok_and(|since| now.signed_duration_since(since) >= WAKE_AFTER_IDLE);
-            if !idle_long_enough {
+            // Wait from the later of going idle and the first unread message.
+            // `updated_at` moves with each activity change.
+            let quiet_since = [agent.updated_at.as_str(), unread[0].sent_at.as_str()]
+                .iter()
+                .filter_map(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                .max();
+            if quiet_since.is_none_or(|since| now.signed_duration_since(since) < WAKE_AFTER_IDLE) {
                 continue;
             }
-            // A Coordinator waiting on a human gets its messages with the answer.
-            if agent.role == "coordinator"
-                && self
-                    .store
-                    .ticket(&agent.ticket_id)?
-                    .is_some_and(|t| t.state == TicketState::Waiting)
+            // Only Agents of a running Ticket. A Coordinator waiting on a
+            // human gets its messages with the answer, and the pane of a done
+            // Ticket stays only for the human to read.
+            let ticket_state = self.store.ticket(&agent.ticket_id)?.map(|t| t.state);
+            if ticket_state != Some(TicketState::Running)
+                && !(agent.role != "coordinator" && ticket_state == Some(TicketState::Waiting))
             {
                 continue;
             }
@@ -255,8 +258,10 @@ impl<R: Rex> Serve<R> {
                         resume: false,
                     });
                     if let Err(err) = launched {
+                        // For example, the Coordinator stopped it meanwhile.
                         let _ = self.rex.close_block(&session, &block);
-                        return Err(err);
+                        println!("{}: launch not recorded: {err:#}", agent.id);
+                        continue;
                     }
                     println!("{}: launched in {block}", agent.id);
                 }
@@ -381,29 +386,58 @@ impl<R: Rex> Serve<R> {
                 reason: reason.clone(),
             })?;
             println!("{}: closed ({reason})", agent.id);
+            if ticket.state.is_terminal() {
+                self.release_empty_session(session)?;
+            }
             return Ok(());
         }
         if !present {
-            self.append(Event::AgentExited {
-                agent_id: agent.id.clone(),
-                reason: "block closed".into(),
+            // Decide from the Agent's state in the same transaction as the
+            // exit: a helper may have called done since this tick read it.
+            let notify = ticket
+                .coordinator_id
+                .clone()
+                .filter(|_| agent.role != "coordinator" && !ticket.state.is_terminal());
+            let reason = self.store.with_tx(|tx| {
+                let (state, reason): (String, Option<String>) = tx.query_row(
+                    "SELECT state, exit_reason FROM agents WHERE id = ?1",
+                    rusqlite::params![agent.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let finished = state == "finished";
+                let reason = match reason {
+                    Some(reason) if finished => reason,
+                    _ => "block closed".to_owned(),
+                };
+                crate::store::append_in(
+                    tx,
+                    ACTOR,
+                    &Event::AgentExited {
+                        agent_id: agent.id.clone(),
+                        reason: reason.clone(),
+                    },
+                )?;
+                // A helper is not resumed; its Coordinator decides what next.
+                if let Some(coordinator) = notify.filter(|_| !finished) {
+                    crate::store::append_in(
+                        tx,
+                        ACTOR,
+                        &Event::MessageSent {
+                            ticket_id: ticket.id.clone(),
+                            from: "rex-projects".into(),
+                            to: coordinator,
+                            body: format!(
+                                "{}'s pane closed before it called done. Its work so far is in the worktree.",
+                                agent.id
+                            ),
+                        },
+                    )?;
+                }
+                Ok(reason)
             })?;
-            println!("{}: block closed", agent.id);
+            println!("{}: {reason}", agent.id);
             if ticket.state.is_terminal() {
                 self.release_empty_session(session)?;
-            } else if agent.role != "coordinator"
-                && let Some(coordinator) = &ticket.coordinator_id
-            {
-                // A helper is not resumed; its Coordinator decides what next.
-                self.append(Event::MessageSent {
-                    ticket_id: ticket.id.clone(),
-                    from: "rex-projects".into(),
-                    to: coordinator.clone(),
-                    body: format!(
-                        "{}'s pane closed before it called done. Its work so far is in the worktree.",
-                        agent.id
-                    ),
-                })?;
             }
             return Ok(());
         }
@@ -534,7 +568,7 @@ impl<R: Rex> Serve<R> {
 
     fn dispatch(&mut self, config: &Config) -> Result<()> {
         let tickets = self.store.tickets(None)?;
-        let live = live_agents(&self.store)?;
+        let live = self.store.slots_in_use()?;
         let (picked, next) = plan(config, &tickets, live, self.rotation);
         self.rotation = next;
         for ticket in tickets.iter().filter(|t| picked.contains(&t.id)) {
@@ -566,40 +600,30 @@ impl<R: Rex> Serve<R> {
             project.base_branch.as_deref(),
         )?;
         let agent_id = coordinator_id(&ticket.id);
+        let mut events = Vec::new();
         if self.store.agent(&agent_id)?.is_none() {
-            self.append(Event::AgentCreated {
+            events.push(Event::AgentCreated {
                 agent_id: agent_id.clone(),
                 ticket_id: ticket.id.clone(),
                 project_id: project.id.clone(),
                 role: "coordinator".into(),
                 provider: project.coordinator.provider.clone(),
                 cwd: dir.display().to_string(),
-            })?;
+            });
         }
-        self.append(Event::TicketDispatched {
+        events.push(Event::TicketDispatched {
             ticket_id: ticket.id.clone(),
             agent_id: agent_id.clone(),
-        })?;
-        println!("{}: dispatched to {agent_id}", ticket.id);
+        });
+        // A helper may have taken the slot while the worktree was prepared.
+        let max = config.limits.max_agents as usize;
+        if self.store.append_within_slots(ACTOR, &events, max)? {
+            println!("{}: dispatched to {agent_id}", ticket.id);
+        } else {
+            println!("{}: no Agent slot is free; it stays ready", ticket.id);
+        }
         Ok(())
     }
-}
-
-/// How many Agents hold a launch slot under `limits.max_agents`. A done
-/// Ticket's pane stays open for a while so a human can read it, but it no
-/// longer takes a slot.
-pub fn live_agents(store: &Store) -> Result<usize> {
-    let done: HashSet<String> = store
-        .tickets(None)?
-        .into_iter()
-        .filter(|t| t.state == TicketState::Done)
-        .map(|t| t.id)
-        .collect();
-    Ok(store
-        .agents(true)?
-        .iter()
-        .filter(|a| !done.contains(&a.ticket_id))
-        .count())
 }
 
 fn session_label(project_id: &str) -> String {
@@ -951,7 +975,16 @@ mod tests {
         f.tick();
         assert!(typed(&f).is_empty());
 
+        // Idle for long, but the message just arrived: give a human time.
         idle_for(&f, 60);
+        f.tick();
+        assert!(typed(&f).is_empty());
+        let old = (chrono::Utc::now() - chrono::Duration::seconds(40)).to_rfc3339();
+        f.serve
+            .store
+            .conn()
+            .execute("UPDATE messages SET sent_at = ?1", rusqlite::params![old])
+            .unwrap();
         f.tick();
         assert_eq!(typed(&f), [crate::inbox::WAKE_TOKEN]);
         // Once, then not again until the retry delay passes.
@@ -981,13 +1014,133 @@ mod tests {
                 },
             )
             .unwrap();
-        f.serve
-            .store
-            .conn()
-            .execute("UPDATE agents SET updated_at = '2000-01-01T00:00:00Z'", [])
+        let conn = f.serve.store.conn();
+        conn.execute("UPDATE agents SET updated_at = '2000-01-01T00:00:00Z'", [])
+            .unwrap();
+        conn.execute("UPDATE messages SET sent_at = '2000-01-01T00:00:00Z'", [])
             .unwrap();
         f.tick();
         assert!(f.serve.rex.blocks[&block].input.is_empty());
+
+        // Idle now, but the Ticket is done: its pane is only for reading.
+        f.serve.rex.blocks.get_mut(&block).unwrap().status = Some(crate::rex::Status {
+            state: "idle".into(),
+            message: None,
+        });
+        f.tick();
+        f.serve
+            .store
+            .append(
+                "demo-1-coordinator",
+                Event::TicketCompleted {
+                    ticket_id: "demo-1".into(),
+                    outcome: crate::domain::Outcome::Delivered,
+                    summary: "Shipped.".into(),
+                    artifacts: vec![],
+                },
+            )
+            .unwrap();
+        let conn = f.serve.store.conn();
+        conn.execute("UPDATE agents SET updated_at = '2000-01-01T00:00:00Z'", [])
+            .unwrap();
+        f.tick();
+        assert!(f.serve.rex.blocks[&block].input.is_empty());
+    }
+
+    #[test]
+    fn a_stop_during_launch_wins() {
+        let mut f = fixture();
+        f.tick();
+        let worker = spawn(&mut f, "worker");
+        // The Coordinator stops the helper after serve chose to launch it.
+        f.serve
+            .store
+            .append(
+                "demo-1-coordinator",
+                Event::AgentFinished {
+                    agent_id: worker.clone(),
+                    reason: "stopped by the Coordinator".into(),
+                },
+            )
+            .unwrap();
+        let err = f
+            .serve
+            .store
+            .append(
+                "serve",
+                Event::AgentLaunched {
+                    agent_id: worker.clone(),
+                    rex_session_id: "s".into(),
+                    rex_window_id: "w".into(),
+                    rex_block_id: "b".into(),
+                    resume: false,
+                },
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("stopped before it launched"),
+            "{err}"
+        );
+        f.tick();
+        let stopped = helper(&f, &worker);
+        assert_eq!(stopped.state, "exited");
+        assert_eq!(
+            stopped.exit_reason.as_deref(),
+            Some("stopped by the Coordinator")
+        );
+        assert_eq!(f.serve.rex.blocks.len(), 1);
+    }
+
+    #[test]
+    fn a_done_helper_whose_pane_vanished_is_not_reported_as_lost() {
+        let mut f = fixture();
+        f.tick();
+        let worker = spawn(&mut f, "worker");
+        f.tick();
+        let block = helper(&f, &worker).rex_block_id.unwrap();
+        let running = helper(&f, &worker);
+        f.serve
+            .store
+            .append(
+                &worker,
+                Event::AgentFinished {
+                    agent_id: worker.clone(),
+                    reason: "done".into(),
+                },
+            )
+            .unwrap();
+        f.serve.rex.blocks.remove(&block);
+        // Reconcile with the state read before done committed.
+        let config = f.config.clone();
+        f.serve.reconcile(&config, &running).unwrap();
+        let exited = helper(&f, &worker);
+        assert_eq!(exited.state, "exited");
+        assert_eq!(exited.exit_reason.as_deref(), Some("done"));
+        assert!(
+            f.serve
+                .store
+                .unread("demo-1-coordinator")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn reserves_a_slot_for_a_coordinator_waiting_to_relaunch() {
+        let mut f = fixture();
+        f.tick();
+        assert_eq!(f.serve.store.slots_in_use().unwrap(), 1);
+        f.close_block();
+        f.serve.retry_delay = Duration::from_secs(3600);
+        f.serve.rex.fail_new_window = true;
+        f.tick();
+        assert_eq!(f.agent().state, "exited");
+        assert_eq!(f.serve.store.slots_in_use().unwrap(), 1);
+        // With one slot, a helper cannot take the exited Coordinator's slot.
+        let events = [Event::TicketReadied {
+            ticket_id: "demo-1".into(),
+        }];
+        assert!(!f.serve.store.append_within_slots("x", &events, 1).unwrap());
     }
 
     #[test]
