@@ -376,7 +376,7 @@ impl<R: Rex> Serve<R> {
                 agent_id: agent.id.clone(),
                 reason: reason.clone(),
             })?;
-            println!("{}: closed because it {reason}", agent.id);
+            println!("{}: closed ({reason})", agent.id);
             return Ok(());
         }
         if !present {
