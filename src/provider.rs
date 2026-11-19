@@ -16,7 +16,13 @@ use crate::domain::{Agent, Event, Ticket};
 use crate::paths::Paths;
 use crate::store::Store;
 
-const DEFAULT_COORDINATOR: &str = include_str!("roles/coordinator.md");
+/// The Roles rex-projects ships. `<config dir>/roles/<role>.md` overrides one,
+/// or adds a new Role.
+const BUILTIN_ROLES: [(&str, &str); 3] = [
+    ("coordinator", include_str!("roles/coordinator.md")),
+    ("worker", include_str!("roles/worker.md")),
+    ("reviewer", include_str!("roles/reviewer.md")),
+];
 
 /// How a harness session starts.
 #[derive(Clone, Copy, Debug)]
@@ -106,6 +112,7 @@ impl Harness<'_> {
                     // rex-projects tool call, and `-a never` refuses them.
                     r#"mcp_servers.rex_projects.default_tools_approval_mode="approve""#.to_owned(),
                     format!("mcp_servers.rex_projects.env={{{}}}", env.join(", ")),
+                    hook("SessionStart", "session-start"),
                     hook("Stop", "stop"),
                     hook("UserPromptSubmit", "user-prompt-submit"),
                 ] {
@@ -175,23 +182,38 @@ pub fn strip_frontmatter(text: &str) -> &str {
     text
 }
 
-/// The Agent's instructions: its Role, then the Ticket's Playbook if any.
+/// The instructions of `role`: the override in the config directory, else
+/// the built-in text.
+pub fn role_base_text(paths: &Paths, role: &str) -> Result<String> {
+    let override_path = paths.config_dir.join("roles").join(format!("{role}.md"));
+    match std::fs::read_to_string(&override_path) {
+        Ok(text) => Ok(text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => BUILTIN_ROLES
+            .iter()
+            .find(|(name, _)| *name == role)
+            .map(|(_, text)| (*text).to_owned())
+            .with_context(|| {
+                format!(
+                    "role {role:?} is not built in and {} does not exist",
+                    override_path.display()
+                )
+            }),
+        Err(err) => Err(err).with_context(|| format!("failed to read {}", override_path.display())),
+    }
+}
+
+/// The Agent's instructions: its Role, then, for the Coordinator, the
+/// Ticket's Playbook if any.
 pub fn role_text(
     paths: &Paths,
     project: &ProjectConfig,
     ticket: &Ticket,
     role: &str,
 ) -> Result<String> {
-    let override_path = paths.config_dir.join("roles").join(format!("{role}.md"));
-    let mut text = match std::fs::read_to_string(&override_path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound && role == "coordinator" => {
-            DEFAULT_COORDINATOR.to_owned()
-        }
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to read {}", override_path.display()));
-        }
-    };
+    let mut text = role_base_text(paths, role)?;
+    if role != "coordinator" {
+        return Ok(text);
+    }
     let playbook = ticket
         .playbook
         .as_ref()
@@ -221,6 +243,15 @@ pub fn initial_prompt(ticket: &Ticket) -> String {
     format!(
         "You are the Coordinator for Ticket {}: {}. Start by calling ticket_get.",
         ticket.id, ticket.title
+    )
+}
+
+/// A helper's first prompt carries the task its Coordinator gave it.
+pub fn helper_prompt(agent: &Agent, ticket: &Ticket, task: &str) -> String {
+    format!(
+        "You are {}, the {} for Ticket {}: {}. Your task from the Coordinator:\n\n{task}\n\n\
+         Call ticket_get if you need the Ticket's Brief. When you are finished, call done.",
+        agent.id, agent.role, ticket.id, ticket.title
     )
 }
 
@@ -307,12 +338,24 @@ pub fn exec(paths: &Paths, agent_id: &str) -> Result<()> {
         },
     };
     let prompt = match start {
+        Start::New { .. } if agent.role != "coordinator" => {
+            // The task waits in the helper's inbox; take it into the prompt.
+            let (messages, _) = crate::inbox::take(&mut store, agent_id)?;
+            let task: Vec<&str> = messages.iter().map(|m| m.body.as_str()).collect();
+            helper_prompt(&agent, &ticket, &task.join("\n\n"))
+        }
         Start::New { .. } => initial_prompt(&ticket),
         Start::Resume { .. } => resume_prompt(&ticket),
     };
+    // A model belongs to a provider, so a helper started on another provider
+    // than its Role's uses that provider's default model.
+    let spec = project.agent_spec(&agent.role);
+    let model = (spec.provider == agent.provider)
+        .then_some(spec.model)
+        .flatten();
     let argv = Harness {
         provider: &provider,
-        model: project.coordinator.model.as_deref(),
+        model: model.as_deref(),
         agent_dir: &dir,
         exe: &exe,
         env: &env,
@@ -487,7 +530,7 @@ mod tests {
             .filter(|w| w[0] == "-c")
             .map(|w| w[1].as_str())
             .collect();
-        assert_eq!(configs.len(), 7);
+        assert_eq!(configs.len(), 8);
         // Every override must parse as TOML, as Codex parses it.
         let parsed: toml::Table = toml::from_str(&configs.join("\n")).unwrap();
         assert_eq!(
@@ -515,6 +558,10 @@ mod tests {
         assert_eq!(
             parsed["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str(),
             Some("'/bin/rex-projects' hook codex user-prompt-submit")
+        );
+        assert_eq!(
+            parsed["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str(),
+            Some("'/bin/rex-projects' hook codex session-start")
         );
 
         let resume = argv(ProviderKind::Codex, Start::Resume { session_id: "s9" });

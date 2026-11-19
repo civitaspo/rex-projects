@@ -115,6 +115,10 @@ impl Server {
                     "complete" => self.complete(args),
                     "send" => self.send(args),
                     "inbox_read" => self.inbox_read(),
+                    "spawn_agent" => self.spawn_agent(args),
+                    "agents_list" => self.agents_list(),
+                    "agent_stop" => self.agent_stop(args),
+                    "done" => self.done(args),
                     _ => return Err((INVALID_PARAMS, format!("unknown tool {name:?}"))),
                 };
                 Ok(match result {
@@ -193,6 +197,10 @@ impl Server {
             bail!("progress must be between 0 and 100");
         }
         let (mut store, agent, ticket) = self.write_context()?;
+        require_coordinator(
+            &agent,
+            "report; send your progress to the Coordinator instead",
+        )?;
         store.append(
             &agent.id,
             Event::TicketReported {
@@ -300,6 +308,184 @@ impl Server {
         let (messages, remaining) = crate::inbox::take(&mut store, &agent.id)?;
         Ok(json!({"messages": messages, "remaining": remaining}))
     }
+
+    fn spawn_agent(&self, args: Value) -> Result<Value> {
+        #[derive(Deserialize)]
+        struct Args {
+            role: String,
+            task: String,
+            provider: Option<String>,
+        }
+        let args: Args = parse_args(args)?;
+        let (mut store, agent, ticket) = self.write_context()?;
+        require_coordinator(&agent, "spawn helper Agents")?;
+        if !matches!(ticket.state, TicketState::Running | TicketState::Waiting) {
+            bail!(
+                "ticket {} is {}; helpers run only on a running Ticket",
+                ticket.id,
+                ticket.state
+            );
+        }
+        crate::config::validate_id(&args.role).context("invalid role")?;
+        if args.role == "coordinator" {
+            bail!("a Ticket has one Coordinator; spawn a helper Role such as worker or reviewer");
+        }
+        crate::provider::role_base_text(&self.paths, &args.role)?;
+        if args.task.trim().is_empty() {
+            bail!("task must not be empty");
+        }
+        if args.task.chars().count() > crate::inbox::MAX_BODY_CHARS {
+            bail!(
+                "task is longer than {} characters; put details in a file and pass its path",
+                crate::inbox::MAX_BODY_CHARS
+            );
+        }
+        let config = Config::load(&self.paths.config_file())?;
+        let project = config.project(&ticket.project_id)?;
+        let provider = args
+            .provider
+            .unwrap_or(project.agent_spec(&args.role).provider);
+        config.provider(&provider)?;
+        let max = config.limits.max_agents as usize;
+        // Number the helper, check the slot limit, and record it in one
+        // transaction, so parallel spawns neither collide nor overrun.
+        let id = store.with_tx(|tx| {
+            let n: i64 = tx.query_row(
+                "SELECT COUNT(*) + 1 FROM agents WHERE ticket_id = ?1 AND role = ?2",
+                rusqlite::params![ticket.id, args.role],
+                |row| row.get(0),
+            )?;
+            let id = format!("{}-{}-{n}", ticket.id, args.role);
+            if crate::store::slots_in_use_in(tx)? >= max {
+                bail!(
+                    "all {max} Agent slots are in use; wait for a helper to finish, or do the work yourself"
+                );
+            }
+            for event in [
+                Event::AgentCreated {
+                    agent_id: id.clone(),
+                    ticket_id: ticket.id.clone(),
+                    project_id: ticket.project_id.clone(),
+                    role: args.role.clone(),
+                    provider: provider.clone(),
+                    cwd: agent.cwd.clone(),
+                },
+                Event::MessageSent {
+                    ticket_id: ticket.id.clone(),
+                    from: agent.id.clone(),
+                    to: id.clone(),
+                    body: args.task.clone(),
+                },
+            ] {
+                crate::store::append_in(tx, &agent.id, &event)?;
+            }
+            Ok(id)
+        })?;
+        Ok(json!({
+            "agent_id": id,
+            "role": args.role,
+            "provider": provider,
+            "instruction": "rex-projects starts it in a pane beside yours within a few seconds. \
+                Its result reaches you as a message when it calls done. If you have nothing \
+                else to do meanwhile, end your turn.",
+        }))
+    }
+
+    fn agents_list(&self) -> Result<Value> {
+        let (store, agent, ticket) = self.context()?;
+        require_coordinator(&agent, "list helper Agents")?;
+        let helpers: Vec<Value> = store
+            .agents_for_ticket(&ticket.id)?
+            .into_iter()
+            .filter(|a| a.id != agent.id)
+            .map(|a| {
+                json!({
+                    "id": a.id,
+                    "role": a.role,
+                    "provider": a.provider,
+                    "state": a.state,
+                    "activity": a.activity,
+                    "exit_reason": a.exit_reason,
+                })
+            })
+            .collect();
+        Ok(json!({"agents": helpers}))
+    }
+
+    fn agent_stop(&self, args: Value) -> Result<Value> {
+        #[derive(Deserialize)]
+        struct Args {
+            agent_id: String,
+        }
+        let args: Args = parse_args(args)?;
+        let (mut store, agent, ticket) = self.write_context()?;
+        require_coordinator(&agent, "stop helper Agents")?;
+        let helper = store
+            .agent(&args.agent_id)?
+            .filter(|a| a.ticket_id == ticket.id && a.id != agent.id)
+            .with_context(|| {
+                format!("{} is not a helper on ticket {}", args.agent_id, ticket.id)
+            })?;
+        store.append(
+            &agent.id,
+            Event::AgentFinished {
+                agent_id: helper.id.clone(),
+                reason: "stopped by the Coordinator".into(),
+            },
+        )?;
+        Ok(json!({"stopped": helper.id}))
+    }
+
+    fn done(&self, args: Value) -> Result<Value> {
+        #[derive(Deserialize)]
+        struct Args {
+            summary: String,
+            #[serde(default)]
+            artifacts: Vec<String>,
+        }
+        let args: Args = parse_args(args)?;
+        if args.summary.trim().is_empty() {
+            bail!("summary must not be empty");
+        }
+        let (mut store, agent, ticket) = self.write_context()?;
+        if agent.role == "coordinator" {
+            bail!("the Coordinator ends its Ticket with `complete`, not `done`");
+        }
+        let coordinator = ticket
+            .coordinator_id
+            .clone()
+            .context("the Ticket has no Coordinator")?;
+        let mut body = format!("{} finished its task.\n\n{}", agent.id, args.summary.trim());
+        for artifact in &args.artifacts {
+            body.push_str(&format!("\nartifact: {artifact}"));
+        }
+        if body.chars().count() > crate::inbox::MAX_BODY_CHARS {
+            bail!(
+                "the summary and artifacts are longer than {} characters; shorten the summary \
+                 or put the details in a file and list its path as an artifact",
+                crate::inbox::MAX_BODY_CHARS
+            );
+        }
+        store.append_all(
+            &agent.id,
+            &[
+                Event::MessageSent {
+                    ticket_id: ticket.id.clone(),
+                    from: agent.id.clone(),
+                    to: coordinator,
+                    body,
+                },
+                Event::AgentFinished {
+                    agent_id: agent.id.clone(),
+                    reason: "done".into(),
+                },
+            ],
+        )?;
+        Ok(json!({
+            "instruction": "Your result is on its way to the Coordinator. Stop now; \
+                rex-projects closes this pane.",
+        }))
+    }
 }
 
 /// Whether a session started at launch `launch` has been superseded. An
@@ -390,8 +576,9 @@ fn tools() -> Value {
         },
         {
             "name": "report",
-            "description": "Report progress on your Ticket. Call it whenever the Stage \
-                changes or something notable happens. Omitted fields keep their values.",
+            "description": "Coordinator only. Report progress on your Ticket. Call it \
+                whenever the Stage changes or something notable happens. Omitted fields keep \
+                their values. Helpers send progress to the Coordinator with `send` instead.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -444,6 +631,51 @@ fn tools() -> Value {
             },
         },
         {
+            "name": "spawn_agent",
+            "description": "Coordinator only. Start a helper Agent in its own pane in your \
+                Ticket's worktree, such as a worker to implement or a reviewer to review. \
+                Its result reaches you as a message when it calls done.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "role": {"type": "string", "description": "worker, reviewer, or another Role configured for this Project."},
+                    "task": {"type": "string", "description": "Everything the helper needs to know: what to do, where, and how you will judge the result."},
+                    "provider": {"type": "string", "description": "A configured provider such as claude or codex. Defaults to the Role's provider."},
+                },
+                "required": ["role", "task"],
+                "additionalProperties": false,
+            },
+        },
+        {
+            "name": "agents_list",
+            "description": "Coordinator only. List your Ticket's helper Agents and their state.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+        },
+        {
+            "name": "agent_stop",
+            "description": "Coordinator only. Stop a helper Agent and close its pane.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"agent_id": {"type": "string"}},
+                "required": ["agent_id"],
+                "additionalProperties": false,
+            },
+        },
+        {
+            "name": "done",
+            "description": "Helpers only. Finish your task: your summary goes to the \
+                Coordinator, and your pane closes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string", "description": "What you did, how you verified it, and anything left open. A reviewer lists its findings here."},
+                    "artifacts": artifacts,
+                },
+                "required": ["summary"],
+                "additionalProperties": false,
+            },
+        },
+        {
             "name": "inbox_read",
             "description": "Read your unread messages and mark them read. Messages also \
                 reach you automatically, so call this when told you have unread messages.",
@@ -492,21 +724,15 @@ pub(crate) mod tests {
                 },
             )
             .unwrap();
-        for role in ["coordinator", "helper"] {
-            store
-                .append(
-                    "serve",
-                    Event::AgentCreated {
-                        agent_id: format!("demo-1-{role}"),
-                        ticket_id: "demo-1".into(),
-                        project_id: "demo".into(),
-                        role: role.into(),
-                        provider: "claude".into(),
-                        cwd: "/tmp".into(),
-                    },
-                )
-                .unwrap();
-        }
+        let created = |role: &str| Event::AgentCreated {
+            agent_id: format!("demo-1-{role}"),
+            ticket_id: "demo-1".into(),
+            project_id: "demo".into(),
+            role: role.into(),
+            provider: "claude".into(),
+            cwd: "/tmp".into(),
+        };
+        store.append("serve", created("coordinator")).unwrap();
         store
             .append(
                 "serve",
@@ -515,6 +741,9 @@ pub(crate) mod tests {
                     agent_id: "demo-1-coordinator".into(),
                 },
             )
+            .unwrap();
+        store
+            .append("demo-1-coordinator", created("helper"))
             .unwrap();
         paths
     }
@@ -617,6 +846,10 @@ pub(crate) mod tests {
                 "ask",
                 "complete",
                 "send",
+                "spawn_agent",
+                "agents_list",
+                "agent_stop",
+                "done",
                 "inbox_read"
             ]
         );
@@ -777,7 +1010,232 @@ pub(crate) mod tests {
             )
             .0
         );
-        assert!(!call(&server, "report", json!({"stage": "help"})).0);
+        // Helpers send progress to the Coordinator rather than report it.
+        assert!(call(&server, "report", json!({"stage": "help"})).0);
+        assert!(
+            call(
+                &server,
+                "spawn_agent",
+                json!({"role": "worker", "task": "x"})
+            )
+            .0
+        );
+        assert!(call(&server, "agents_list", json!({})).0);
+    }
+
+    fn agent(server: &Server, id: &str) -> Agent {
+        Store::open(&server.paths.db_file())
+            .unwrap()
+            .agent(id)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn spawns_lists_stops_and_hears_from_helpers() {
+        let (_dir, coordinator) = setup("demo-1-coordinator");
+        let (is_error, text) = call(
+            &coordinator,
+            "spawn_agent",
+            json!({"role": "worker", "task": "Add the flag.", "provider": "codex"}),
+        );
+        assert!(!is_error, "{text}");
+        let spawned: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(spawned["agent_id"], "demo-1-worker-1");
+        let worker = agent(&coordinator, "demo-1-worker-1");
+        assert_eq!(
+            (
+                worker.role.as_str(),
+                worker.provider.as_str(),
+                worker.state.as_str()
+            ),
+            ("worker", "codex", "created")
+        );
+        let store = Store::open(&coordinator.paths.db_file()).unwrap();
+        let task = store.unread("demo-1-worker-1").unwrap();
+        assert_eq!(task[0].body, "Add the flag.");
+
+        // A second worker gets the next number and the Role's default provider.
+        let (_, text) = call(
+            &coordinator,
+            "spawn_agent",
+            json!({"role": "worker", "task": "Fix the docs."}),
+        );
+        let spawned: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(spawned["agent_id"], "demo-1-worker-2");
+        assert_eq!(spawned["provider"], "claude");
+
+        let (_, text) = call(&coordinator, "agents_list", json!({}));
+        let listed: Value = serde_json::from_str(&text).unwrap();
+        let ids: Vec<&str> = listed["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["demo-1-helper", "demo-1-worker-1", "demo-1-worker-2"]);
+
+        assert!(
+            !call(
+                &coordinator,
+                "agent_stop",
+                json!({"agent_id": "demo-1-worker-2"})
+            )
+            .0
+        );
+        assert_eq!(agent(&coordinator, "demo-1-worker-2").state, "finished");
+        assert!(
+            call(
+                &coordinator,
+                "agent_stop",
+                json!({"agent_id": "demo-1-worker-2"})
+            )
+            .0
+        );
+        assert!(
+            call(
+                &coordinator,
+                "agent_stop",
+                json!({"agent_id": "demo-1-coordinator"})
+            )
+            .0
+        );
+
+        // The worker's done reaches the Coordinator's inbox.
+        let worker = Server::new(coordinator.paths.clone(), "demo-1-worker-1".into(), None);
+        assert!(call(&worker, "done", json!({"summary": " "})).0);
+        // A result too long for one message is refused, and the helper can retry.
+        let long = "x".repeat(crate::inbox::MAX_BODY_CHARS);
+        let (is_error, text) = call(
+            &worker,
+            "done",
+            json!({"summary": long, "artifacts": ["a"]}),
+        );
+        assert!(is_error);
+        assert!(text.contains("shorten the summary"), "{text}");
+        assert_eq!(agent(&coordinator, "demo-1-worker-1").state, "created");
+        let (is_error, text) = call(
+            &worker,
+            "done",
+            json!({"summary": "Added --flag; tests pass.", "artifacts": ["src/cli.rs"]}),
+        );
+        assert!(!is_error, "{text}");
+        assert_eq!(agent(&coordinator, "demo-1-worker-1").state, "finished");
+        let (_, text) = call(&coordinator, "inbox_read", json!({}));
+        let read: Value = serde_json::from_str(&text).unwrap();
+        let body = read["messages"][0]["body"].as_str().unwrap();
+        assert!(
+            body.starts_with("demo-1-worker-1 finished its task."),
+            "{body}"
+        );
+        assert!(body.contains("Added --flag; tests pass."), "{body}");
+        assert!(body.contains("artifact: src/cli.rs"), "{body}");
+        assert!(call(&worker, "done", json!({"summary": "again"})).0);
+        assert!(call(&coordinator, "done", json!({"summary": "x"})).0);
+    }
+
+    #[test]
+    fn a_stopped_helper_neither_sends_nor_receives() {
+        let (_dir, coordinator) = setup("demo-1-coordinator");
+        let helper = Server::new(coordinator.paths.clone(), "demo-1-helper".into(), None);
+        assert!(
+            !call(
+                &coordinator,
+                "agent_stop",
+                json!({"agent_id": "demo-1-helper"})
+            )
+            .0
+        );
+        // Its late report does not reach the Coordinator.
+        let (is_error, text) = call(
+            &helper,
+            "send",
+            json!({"to": "coordinator", "body": "stale"}),
+        );
+        assert!(is_error);
+        assert!(text.contains("can no longer send"), "{text}");
+        assert!(call(&helper, "done", json!({"summary": "stale"})).0);
+        // Nothing would read a message to it.
+        let (is_error, text) = call(
+            &coordinator,
+            "send",
+            json!({"to": "demo-1-helper", "body": "one more thing"}),
+        );
+        assert!(is_error);
+        assert!(text.contains("spawn a new helper"), "{text}");
+        let store = Store::open(&coordinator.paths.db_file()).unwrap();
+        assert!(store.unread("demo-1-coordinator").unwrap().is_empty());
+        assert!(store.unread("demo-1-helper").unwrap().is_empty());
+
+        // An exited Coordinator still gets messages, read once relaunched.
+        let mut store = store;
+        store
+            .append(
+                "serve",
+                Event::AgentExited {
+                    agent_id: "demo-1-coordinator".into(),
+                    reason: "block closed".into(),
+                },
+            )
+            .unwrap();
+        store
+            .append(
+                "rex-projects",
+                Event::MessageSent {
+                    ticket_id: "demo-1".into(),
+                    from: "rex-projects".into(),
+                    to: "demo-1-coordinator".into(),
+                    body: "while you were away".into(),
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn refuses_bad_spawns() {
+        let (_dir, coordinator) = setup("demo-1-coordinator");
+        for args in [
+            json!({"role": "coordinator", "task": "x"}),
+            json!({"role": "Bad Role", "task": "x"}),
+            json!({"role": "astronaut", "task": "x"}),
+            json!({"role": "worker", "task": "  "}),
+            json!({"role": "worker", "task": "x", "provider": "gemini"}),
+        ] {
+            assert!(call(&coordinator, "spawn_agent", args.clone()).0, "{args}");
+        }
+        // A Role file in the config directory adds a Role.
+        let roles = coordinator.paths.config_dir.join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        std::fs::write(roles.join("astronaut.md"), "# Role: Astronaut\n").unwrap();
+        assert!(
+            !call(
+                &coordinator,
+                "spawn_agent",
+                json!({"role": "astronaut", "task": "x"})
+            )
+            .0
+        );
+
+        // With 4 slots, the Coordinator, the helper, and the astronaut hold
+        // three, so one more worker fits and the next does not.
+        let config = coordinator.paths.config_file();
+        let text = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, format!("[limits]\nmax_agents = 4\n{text}")).unwrap();
+        assert!(
+            !call(
+                &coordinator,
+                "spawn_agent",
+                json!({"role": "worker", "task": "x"})
+            )
+            .0
+        );
+        let (is_error, text) = call(
+            &coordinator,
+            "spawn_agent",
+            json!({"role": "worker", "task": "y"}),
+        );
+        assert!(is_error);
+        assert!(text.contains("Agent slots are in use"), "{text}");
     }
 
     #[test]

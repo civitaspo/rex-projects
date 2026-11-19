@@ -234,6 +234,12 @@ pub enum Event {
         activity: String,
         message: Option<String>,
     },
+    /// A helper Agent called `done`, or its Coordinator stopped it. `serve`
+    /// closes its block next.
+    AgentFinished {
+        agent_id: String,
+        reason: String,
+    },
     AgentExited {
         agent_id: String,
         reason: String,
@@ -259,6 +265,7 @@ impl Event {
             Self::AgentLaunched { .. } => "agent_launched",
             Self::AgentSessionBound { .. } => "agent_session_bound",
             Self::AgentActivity { .. } => "agent_activity",
+            Self::AgentFinished { .. } => "agent_finished",
             Self::AgentExited { .. } => "agent_exited",
         }
     }
@@ -288,6 +295,7 @@ impl Event {
             | Self::AgentLaunched { agent_id, .. }
             | Self::AgentSessionBound { agent_id, .. }
             | Self::AgentActivity { agent_id, .. }
+            | Self::AgentFinished { agent_id, .. }
             | Self::AgentExited { agent_id, .. }
             | Self::MessagesRead { agent_id, .. } => Some(agent_id),
             _ => None,
@@ -329,7 +337,8 @@ pub struct Agent {
     pub role: String,
     pub provider: String,
     pub cwd: String,
-    /// `created`, `running`, or `exited`.
+    /// `created`, `running`, `finished` (a helper whose block is about to
+    /// close), or `exited`.
     pub state: String,
     pub harness_session_id: Option<String>,
     pub rex_session_id: Option<String>,

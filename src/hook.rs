@@ -95,6 +95,15 @@ pub fn handle(
         return Ok(None);
     }
     if event == "stop" {
+        // A Coordinator that asked a human waits for the answer; its messages
+        // come with the answer's prompt instead.
+        if agent.role == "coordinator"
+            && store
+                .ticket(&agent.ticket_id)?
+                .is_some_and(|t| t.state == TicketState::Waiting)
+        {
+            return Ok(None);
+        }
         // Unread messages continue the turn instead of ending it.
         let (messages, remaining) = crate::inbox::take(&mut store, agent_id)?;
         return Ok(crate::inbox::render(&messages, remaining)
@@ -104,7 +113,9 @@ pub fn handle(
     let ticket = store
         .ticket(&agent.ticket_id)?
         .with_context(|| format!("ticket {} does not exist", agent.ticket_id))?;
-    if agent.role == "coordinator" && ticket.state == TicketState::Waiting {
+    // The wake token typed by `serve` is not a human's answer.
+    let woken = payload.prompt.as_deref().map(str::trim) == Some(crate::inbox::WAKE_TOKEN);
+    if agent.role == "coordinator" && ticket.state == TicketState::Waiting && !woken {
         store.append(
             "human",
             Event::TicketAnswered {
@@ -274,6 +285,22 @@ mod tests {
     }
 
     #[test]
+    fn a_waiting_coordinator_gets_messages_with_the_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = dispatched(dir.path());
+        ask(&paths);
+        send(&paths, "demo-1-coordinator", "Worker done.");
+        let input = br#"{"session_id":"s1","hook_event_name":"Stop","stop_hook_active":false}"#;
+        // The turn that asked ends; the message waits for the human.
+        let stop = handle(&paths, "demo-1-coordinator", None, "claude", "stop", input).unwrap();
+        assert_eq!(stop, None);
+        assert_eq!(state(&paths), TicketState::Waiting);
+        let output = prompt(&paths, "demo-1-coordinator", None).unwrap().unwrap();
+        assert!(output.contains("Worker done."), "{output}");
+        assert_eq!(state(&paths), TicketState::Running);
+    }
+
+    #[test]
     fn a_prompt_carries_unread_messages() {
         let dir = tempfile::tempdir().unwrap();
         let paths = dispatched(dir.path());
@@ -289,6 +316,29 @@ mod tests {
                 .unwrap()
                 .contains("CI is green.")
         );
+    }
+
+    #[test]
+    fn the_wake_token_is_not_an_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = dispatched(dir.path());
+        ask(&paths);
+        let input = serde_json::json!({
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": crate::inbox::WAKE_TOKEN,
+        })
+        .to_string();
+        handle(
+            &paths,
+            "demo-1-coordinator",
+            None,
+            "claude",
+            "user-prompt-submit",
+            input.as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(state(&paths), TicketState::Waiting);
     }
 
     #[test]

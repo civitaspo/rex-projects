@@ -139,6 +139,53 @@ impl Store {
         Ok(seq)
     }
 
+    /// Records several events in one transaction: all of them or none.
+    pub fn append_all(&mut self, actor: &str, events: &[Event]) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for event in events {
+            append_in(&tx, actor, event)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Records `events` only if fewer than `max` Agent slots are in use, in
+    /// one transaction, so two admissions cannot both take the last slot.
+    /// Returns whether they were recorded.
+    pub fn append_within_slots(
+        &mut self,
+        actor: &str,
+        events: &[Event],
+        max: usize,
+    ) -> Result<bool> {
+        self.with_tx(|tx| {
+            if slots_in_use_in(tx)? >= max {
+                return Ok(false);
+            }
+            for event in events {
+                append_in(tx, actor, event)?;
+            }
+            Ok(true)
+        })
+    }
+
+    /// Runs `f` in one write transaction, committing only if it succeeds.
+    pub fn with_tx<T>(&mut self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let value = f(&tx)?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    /// How many Agent slots under `limits.max_agents` are in use.
+    pub fn slots_in_use(&self) -> Result<usize> {
+        slots_in_use_in(&self.conn)
+    }
+
     /// Creates a Ticket, allocating the next number in its Project.
     pub fn create_ticket(&mut self, actor: &str, new: NewTicket) -> Result<Ticket> {
         let tx = self
@@ -275,32 +322,16 @@ impl Store {
     /// The underlying connection, for modules that keep their own tables.
     /// The messages `agent_id` has not read yet, oldest first.
     pub fn unread(&self, agent_id: &str) -> Result<Vec<Message>> {
-        self.query_messages(
-            "WHERE recipient = ?1 AND read_at IS NULL ORDER BY id",
-            params![agent_id],
-        )
+        unread_in(&self.conn, agent_id)
     }
 
     /// Every message about a Ticket, oldest first.
     pub fn ticket_messages(&self, ticket_id: &str) -> Result<Vec<Message>> {
-        self.query_messages("WHERE ticket_id = ?1 ORDER BY id", params![ticket_id])
-    }
-
-    fn query_messages(&self, filter: &str, args: impl rusqlite::Params) -> Result<Vec<Message>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT id, ticket_id, sender, recipient, body, sent_at FROM messages {filter}"
-        ))?;
-        let rows = stmt.query_map(args, |row| {
-            Ok(Message {
-                id: row.get(0)?,
-                ticket_id: row.get(1)?,
-                from: row.get(2)?,
-                to: row.get(3)?,
-                body: row.get(4)?,
-                sent_at: row.get(5)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        query_messages(
+            &self.conn,
+            "WHERE ticket_id = ?1 ORDER BY id",
+            params![ticket_id],
+        )
     }
 
     pub fn conn(&self) -> &Connection {
@@ -320,7 +351,7 @@ impl Store {
         };
         for (at, payload) in events {
             let event: Event = serde_json::from_str(&payload)?;
-            project(&tx, &at, &event)?;
+            project(&tx, &at, &event, Replay::Yes)?;
         }
         tx.commit()?;
         Ok(())
@@ -333,7 +364,7 @@ fn now() -> String {
 
 pub(crate) fn append_in(tx: &Transaction<'_>, actor: &str, event: &Event) -> Result<i64> {
     let at = now();
-    project(tx, &at, event)?;
+    project(tx, &at, event, Replay::No)?;
     let project_id = match event {
         Event::TicketCreated { project_id, .. } | Event::AgentCreated { project_id, .. } => {
             Some(project_id.clone())
@@ -369,6 +400,52 @@ pub(crate) fn append_in(tx: &Transaction<'_>, actor: &str, event: &Event) -> Res
         ],
     )?;
     Ok(tx.last_insert_rowid())
+}
+
+/// The messages `agent_id` has not read yet, oldest first.
+pub(crate) fn unread_in(conn: &Connection, agent_id: &str) -> Result<Vec<Message>> {
+    query_messages(
+        conn,
+        "WHERE recipient = ?1 AND read_at IS NULL ORDER BY id",
+        params![agent_id],
+    )
+}
+
+fn query_messages(
+    conn: &Connection,
+    filter: &str,
+    args: impl rusqlite::Params,
+) -> Result<Vec<Message>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, ticket_id, sender, recipient, body, sent_at FROM messages {filter}"
+    ))?;
+    let rows = stmt.query_map(args, |row| {
+        Ok(Message {
+            id: row.get(0)?,
+            ticket_id: row.get(1)?,
+            from: row.get(2)?,
+            to: row.get(3)?,
+            body: row.get(4)?,
+            sent_at: row.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Agent slots in use: every Agent that has not exited, except on a done
+/// Ticket, whose pane stays only for the human to read, plus a slot reserved
+/// for each active Ticket whose Coordinator has exited and will be relaunched.
+pub(crate) fn slots_in_use_in(conn: &Connection) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT
+           (SELECT COUNT(*) FROM agents a JOIN tickets t ON t.id = a.ticket_id
+             WHERE a.state != 'exited' AND t.state != 'done')
+         + (SELECT COUNT(*) FROM tickets t JOIN agents a ON a.id = t.coordinator_id
+             WHERE t.state IN ('running', 'waiting', 'verifying') AND a.state = 'exited')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
 }
 
 fn lookup(tx: &Transaction<'_>, table: &str, id: &str) -> Result<Option<String>> {
@@ -469,7 +546,17 @@ fn update_refs(
     Ok(())
 }
 
-fn project(tx: &Transaction<'_>, at: &str, event: &Event) -> Result<()> {
+/// Whether `project` replays a stored event or admits a new one. Checks
+/// added after events were first stored apply only to new events, so a
+/// rebuild still accepts the history an earlier version committed.
+#[derive(Clone, Copy, PartialEq)]
+enum Replay {
+    Yes,
+    No,
+}
+
+fn project(tx: &Transaction<'_>, at: &str, event: &Event, replay: Replay) -> Result<()> {
+    let admit = replay == Replay::No;
     use TicketState::*;
     match event {
         Event::TicketCreated {
@@ -646,19 +733,42 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event) -> Result<()> {
             to,
             body,
         } => {
-            let recipient_ticket: Option<String> = tx
-                .query_row(
-                    "SELECT ticket_id FROM agents WHERE id = ?1",
-                    params![to],
-                    |row| row.get(0),
+            let agent = |id: &str| {
+                tx.query_row(
+                    "SELECT ticket_id, role, state FROM agents WHERE id = ?1",
+                    params![id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
                 )
-                .optional()?;
-            match recipient_ticket {
+                .optional()
+            };
+            match agent(to)? {
                 None => bail!("agent {to} does not exist"),
-                Some(t) if t != *ticket_id => {
+                Some((t, _, _)) if t != *ticket_id => {
                     bail!("agent {to} works on ticket {t}, not {ticket_id}")
                 }
+                // A helper is never resumed, so nothing would read it. An
+                // exited Coordinator reads it once relaunched.
+                Some((_, role, state))
+                    if admit
+                        && role != "coordinator"
+                        && matches!(state.as_str(), "finished" | "exited") =>
+                {
+                    bail!("agent {to} has {state}; spawn a new helper instead")
+                }
                 Some(_) => {}
+            }
+            // A helper that finished or was stopped can no longer report.
+            if admit
+                && let Some((_, _, state)) = agent(from)?
+                && matches!(state.as_str(), "finished" | "exited")
+            {
+                bail!("agent {from} has {state} and can no longer send messages; stop working");
             }
             if body.trim().is_empty() {
                 bail!("a message must not be empty");
@@ -685,7 +795,11 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event) -> Result<()> {
             provider,
             cwd,
         } => {
-            ticket_state(tx, ticket_id)?;
+            let state = ticket_state(tx, ticket_id)?;
+            // A helper joins only a Ticket that is still being worked on.
+            if admit && role != "coordinator" && !matches!(state, Running | Waiting) {
+                bail!("ticket {ticket_id} is {state}; helpers run only on a running Ticket");
+            }
             tx.execute(
                 "INSERT INTO agents (id, ticket_id, project_id, role, provider, cwd, state,
                    launches, created_at, updated_at)
@@ -702,6 +816,18 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event) -> Result<()> {
             ..
         } => {
             require_agent(tx, agent_id)?;
+            let (state, ticket_id): (String, String) = tx.query_row(
+                "SELECT state, ticket_id FROM agents WHERE id = ?1",
+                params![agent_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if admit && state == "finished" {
+                bail!("agent {agent_id} was stopped before it launched");
+            }
+            let ticket = ticket_state(tx, &ticket_id)?;
+            if admit && ticket.is_terminal() {
+                bail!("ticket {ticket_id} is {ticket}; agent {agent_id} cannot launch");
+            }
             tx.execute(
                 "UPDATE agents SET state = 'running', rex_session_id = ?2, rex_window_id = ?3,
                    rex_block_id = ?4, launches = launches + 1, activity = NULL,
@@ -731,6 +857,17 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event) -> Result<()> {
                  WHERE id = ?1",
                 params![agent_id, activity, message, at],
             )?;
+        }
+        Event::AgentFinished { agent_id, reason } => {
+            require_agent(tx, agent_id)?;
+            let changed = tx.execute(
+                "UPDATE agents SET state = 'finished', exit_reason = ?2, updated_at = ?3
+                 WHERE id = ?1 AND state IN ('created', 'running')",
+                params![agent_id, reason, at],
+            )?;
+            if changed == 0 {
+                bail!("agent {agent_id} has already finished or exited");
+            }
         }
         Event::AgentExited { agent_id, reason } => {
             require_agent(tx, agent_id)?;
@@ -1000,6 +1137,55 @@ mod tests {
             .map(|e| e.event.kind())
             .collect();
         assert_eq!(kinds, vec!["ticket_created", "ticket_cancelled"]);
+    }
+
+    #[test]
+    fn rebuild_accepts_history_that_newer_checks_reject() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = new_ticket(&mut store, true).id;
+        let agent_id = agent(&mut store, &id);
+        store
+            .append(
+                "human",
+                Event::TicketCancelled {
+                    ticket_id: id.clone(),
+                    reason: "not needed".into(),
+                },
+            )
+            .unwrap();
+        // An earlier version stored these events; this one refuses new ones.
+        let late = [
+            Event::AgentLaunched {
+                agent_id: agent_id.clone(),
+                rex_session_id: "session:1".into(),
+                rex_window_id: "window:1".into(),
+                rex_block_id: "block:1".into(),
+                resume: false,
+            },
+            Event::AgentExited {
+                agent_id: agent_id.clone(),
+                reason: "block closed".into(),
+            },
+            Event::MessageSent {
+                ticket_id: id.clone(),
+                from: agent_id.clone(),
+                to: agent_id.clone(),
+                body: "late".into(),
+            },
+        ];
+        assert!(store.append("serve", late[0].clone()).is_err());
+        for event in &late {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO events (at, actor, kind, payload) VALUES (?1, 'serve', ?2, ?3)",
+                    params![now(), event.kind(), serde_json::to_string(event).unwrap()],
+                )
+                .unwrap();
+        }
+        store.rebuild().unwrap();
+        assert_eq!(store.ticket_messages(&id).unwrap().len(), 1);
+        assert!(store.append("serve", late[2].clone()).is_err());
     }
 
     #[test]

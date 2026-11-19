@@ -52,11 +52,24 @@ rex-projects ticket answer demo-1 --text "Use the v2 API"
 
 `--text` types the answer into the Coordinator's pane and presses Return, and only does so while the Coordinator is idle. If you already replied in the pane and the Ticket still shows waiting, run `ticket answer demo-1` without `--text`.
 
-To tell a Coordinator something without interrupting it, leave a message in its inbox. It reaches the Coordinator when its current turn ends:
+To tell a Coordinator something without interrupting it, leave a message in its inbox. It reaches the Coordinator when its current turn ends. If the Coordinator is idle, `serve` wakes it once it has been idle for 30 seconds, the oldest unread message is 30 seconds old, and its input box is empty, by typing one fixed line that says it has new messages; the messages themselves never go through the terminal. A Coordinator waiting on your answer is not woken: answer it, in its pane or with `ticket answer`, and the messages arrive with your answer:
 
 ```sh
 rex-projects ticket message demo-1 "Also update the changelog"
 ```
+
+A Coordinator can start helper Agents with the MCP tool `spawn_agent`: a `worker` changes code and a `reviewer` reviews without editing. Each helper runs in its own pane in the Ticket's tab, beside the Coordinator, and works in the same worktree. When it calls `done`, its summary goes to the Coordinator's inbox and its pane closes. Helpers count toward `limits.max_agents`. Choose each Role's provider and model per Project; a Role not listed uses the Coordinator's provider:
+
+```toml
+[[projects]]
+id = "demo"
+repo = "~/src/github.com/example/demo"
+coordinator = { provider = "claude" }
+roles.worker = { provider = "codex" }
+roles.reviewer = { provider = "claude", model = "opus" }
+```
+
+Put `<config dir>/roles/<role>.md` to replace a built-in Role's instructions (`coordinator`, `worker`, `reviewer`) or to add a Role.
 
 `ticket cleanup <id>` removes an ended Ticket's worktree and its `rex-projects/<id>` branch (or `rxp/<id>` from before the rename). Any other branch checked out in the worktree is kept. It refuses while the worktree holds uncommitted changes, commits that are on no remote, or ignored files such as `.env` or build output. Move anything you need out of the worktree, then pass `--discard-ignored` to delete the ignored files with it.
 

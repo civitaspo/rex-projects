@@ -74,14 +74,14 @@ pub fn needs_you(ticket: &Ticket, coordinator: Option<&Agent>, now: DateTime<Utc
         })
 }
 
-/// A running Coordinator that has not reported any status a minute after its
+/// A running Agent that has not reported any status a minute after its
 /// launch is usually stuck on a prompt the harness does not report, such as
 /// a folder trust dialog.
-pub fn is_silent(ticket: &Ticket, coordinator: &Agent, now: DateTime<Utc>) -> bool {
+pub fn is_silent(ticket: &Ticket, agent: &Agent, now: DateTime<Utc>) -> bool {
     ticket.state.is_active()
-        && coordinator.state == "running"
-        && coordinator.activity.is_none()
-        && DateTime::parse_from_rfc3339(&coordinator.updated_at)
+        && agent.state == "running"
+        && agent.activity.is_none()
+        && DateTime::parse_from_rfc3339(&agent.updated_at)
             .is_ok_and(|at| now.signed_duration_since(at) > SILENCE)
 }
 
@@ -124,6 +124,14 @@ pub fn build_rows(
                 None => "-".to_owned(),
             };
             let silent = coordinator.is_some_and(|a| is_silent(t, a, now));
+            // A helper stuck on a prompt stalls its Coordinator, which waits
+            // for its result, so it needs the human as much (ADR-0013).
+            let stuck_helper = agents.values().find(|a| {
+                a.ticket_id == t.id
+                    && a.role != "coordinator"
+                    && a.state == "running"
+                    && (a.activity.as_deref() == Some("blocked") || is_silent(t, a, now))
+            });
             let closed = t.unacknowledged_closes().next().filter(|_| t.state.is_active());
             let text = match (&t.question, &t.summary) {
                 (Some(q), _) if t.state == TicketState::Waiting => format!("? {q}"),
@@ -134,10 +142,21 @@ pub fn build_rows(
                     r.closed_externally.as_deref().unwrap_or_default()
                 ),
                 _ if silent => "No status from the Coordinator; check its pane".to_owned(),
+                _ if let Some(h) = stuck_helper => match (&h.activity, &h.activity_message) {
+                    (Some(a), Some(m)) if a == "blocked" => format!("{} is blocked: {m}", h.id),
+                    (Some(a), None) if a == "blocked" => format!("{} is blocked; check its pane", h.id),
+                    _ => format!("No status from {}; check its pane", h.id),
+                },
                 (_, Some(s)) => s.clone(),
                 _ => t.title.clone(),
             };
-            let target = coordinator.and_then(|a| {
+            // Jump to the helper that needs attention, else the Coordinator.
+            let needs = needs_you(t, coordinator, now);
+            let focus = match stuck_helper {
+                Some(h) if !(silent || t.state == TicketState::Waiting) => Some(h),
+                _ => coordinator,
+            };
+            let target = focus.and_then(|a| {
                 Some(JumpTarget {
                     session: a.rex_session_id.clone()?,
                     window: a.rex_window_id.clone(),
@@ -152,7 +171,7 @@ pub fn build_rows(
                 stage: t.stage.clone().unwrap_or_else(|| "-".to_owned()),
                 activity,
                 text: text.replace('\n', " "),
-                needs_you: needs_you(t, coordinator, now),
+                needs_you: needs || stuck_helper.is_some(),
                 target,
             }
         })
@@ -681,6 +700,32 @@ mod tests {
 
         t.state = TicketState::Done;
         assert!(!build_rows(&[t], &HashMap::new(), now(), true)[0].needs_you);
+    }
+
+    #[test]
+    fn a_blocked_helper_needs_you_and_is_the_jump_target() {
+        let mut t = ticket("a", 1, TicketState::Running);
+        t.coordinator_id = Some("agent-1".to_owned());
+        let mut helper = coordinator("a-1-worker-1", "blocked");
+        helper.role = "worker".to_owned();
+        helper.ticket_id = t.id.clone();
+        helper.activity_message = Some("Allow edit?".to_owned());
+        helper.rex_block_id = Some("block-helper".to_owned());
+        let mut agents = HashMap::from([
+            ("agent-1".to_owned(), coordinator("agent-1", "idle")),
+            (helper.id.clone(), helper.clone()),
+        ]);
+        let rows = build_rows(std::slice::from_ref(&t), &agents, now(), false);
+        assert!(rows[0].needs_you);
+        assert_eq!(rows[0].text, "a-1-worker-1 is blocked: Allow edit?");
+        assert_eq!(rows[0].target.as_ref().unwrap().block, "block-helper");
+
+        // A finished helper no longer needs anyone.
+        helper.state = "exited".to_owned();
+        agents.insert(helper.id.clone(), helper);
+        let rows = build_rows(&[t], &agents, now(), false);
+        assert!(!rows[0].needs_you);
+        assert_eq!(rows[0].target.as_ref().unwrap().block, "block:1");
     }
 
     #[test]

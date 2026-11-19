@@ -37,6 +37,16 @@ pub trait Rex {
         command: &[String],
         cwd: &Path,
     ) -> Result<Window>;
+    /// Splits `anchor_block` without taking focus and runs `command` in the new
+    /// block: beside it when `beside`, else below it. Returns the new block.
+    fn split(
+        &mut self,
+        session_id: &str,
+        anchor_block: &str,
+        beside: bool,
+        command: &[String],
+        cwd: &Path,
+    ) -> Result<String>;
     /// Lists the block IDs of a session; empty if the session is gone.
     fn block_ids(&mut self, session_id: &str) -> Result<Vec<String>>;
     /// Returns the root `program_status` record, if the program reported one.
@@ -44,6 +54,9 @@ pub trait Rex {
     fn close_block(&mut self, session_id: &str, block_id: &str) -> Result<()>;
     /// Destroys a session and every block left in it.
     fn destroy_session(&mut self, session_id: &str) -> Result<()>;
+    /// Whether the input line under the terminal's cursor holds no typed text:
+    /// nothing but a prompt mark, such as `❯` or `›`, before the cursor.
+    fn input_is_empty(&mut self, session_id: &str, block_id: &str) -> Result<bool>;
     /// Types `text` into the block's program and presses Return.
     fn submit(&mut self, session_id: &str, block_id: &str, text: &str) -> Result<()>;
 }
@@ -168,14 +181,46 @@ impl Rex for RexCli {
         })
     }
 
+    fn split(
+        &mut self,
+        session_id: &str,
+        anchor_block: &str,
+        beside: bool,
+        command: &[String],
+        cwd: &Path,
+    ) -> Result<String> {
+        let result = self.call(
+            "session.new_split",
+            json!({
+                "session_id": session_id,
+                "anchor_id": anchor_block,
+                "direction": if beside { "horizontal" } else { "vertical" },
+                "side": "after",
+                "focus": false,
+                "layout": { "block": {
+                    "flavor": TERMINAL_FLAVOR,
+                    "options": { "command": command, "cwd": cwd },
+                }},
+            }),
+        )?;
+        string(&result, "/block_ids/0")
+    }
+
     fn block_ids(&mut self, session_id: &str) -> Result<Vec<String>> {
         match self.call("session.list_blocks", json!({ "session_id": session_id })) {
-            Ok(result) => Ok(result["blocks"]
+            // A reply without a block list is an error, not an empty session:
+            // treating it as empty would relaunch Agents that still run.
+            Ok(result) => result["blocks"]
                 .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|b| b["block_id"].as_str().map(str::to_owned))
-                .collect()),
+                .with_context(|| format!("rex session.list_blocks returned no blocks: {result}"))?
+                .iter()
+                .map(|b| {
+                    b["block_id"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .with_context(|| format!("rex block has no block_id: {b}"))
+                })
+                .collect(),
             Err(err) if format!("{err:#}").contains("session_not_found") => Ok(Vec::new()),
             Err(err) => Err(err),
         }
@@ -189,9 +234,12 @@ impl Rex for RexCli {
         let root = result["records"]
             .as_array()
             .and_then(|records| records.iter().find(|r| r.get("id").is_none()));
-        Ok(root.map(|r| Status {
-            state: r["state"].as_str().unwrap_or("idle").to_owned(),
-            message: r["msg"].as_str().map(str::to_owned),
+        // A record without a state is unknown, never idle.
+        Ok(root.and_then(|r| {
+            Some(Status {
+                state: r["state"].as_str()?.to_owned(),
+                message: r["msg"].as_str().map(str::to_owned),
+            })
         }))
     }
 
@@ -208,6 +256,22 @@ impl Rex for RexCli {
         Ok(())
     }
 
+    fn input_is_empty(&mut self, session_id: &str, block_id: &str) -> Result<bool> {
+        let call = |method: &str, args: Value| {
+            self.call(
+                &format!("com.superlogical.terminal.{method}"),
+                json!({ "session_id": session_id, "block_id": block_id, "args": args }),
+            )
+        };
+        let rows = call("size", json!({}))?["rows"]
+            .as_u64()
+            .context("terminal size has no rows")? as usize;
+        let vt = call("format", json!({ "format": "vt", "extra_cursor": true }))?;
+        let vt = vt["content"].as_str().unwrap_or_default();
+        let cursor = cursor_position(vt).context("terminal screen has no cursor position")?;
+        Ok(input_line_is_empty(vt, rows, cursor))
+    }
+
     fn submit(&mut self, session_id: &str, block_id: &str, text: &str) -> Result<()> {
         // The text goes through stdin so that a leading `-` is not a flag.
         self.run(&["send", "-s", session_id, "-b", block_id], text)?;
@@ -215,9 +279,252 @@ impl Rex for RexCli {
     }
 }
 
+/// The 1-based (row, column) of the last cursor position sequence,
+/// `ESC [ row ; col H`, in a `vt` screen dump.
+fn cursor_position(vt: &str) -> Option<(usize, usize)> {
+    let start = vt.rfind("\x1b[")? + 2;
+    let end = start + vt[start..].find('H')?;
+    let (row, col) = vt[start..end].split_once(';')?;
+    Some((row.parse().ok()?, col.parse().ok()?))
+}
+
+/// Whether the input box under the cursor of a `vt` screen dump, whose last
+/// `rows` lines are the screen, is empty: one prompt mark before the cursor,
+/// and nothing but dim text after it, on its row and on the box's further
+/// rows. Claude Code and Codex draw an empty box's placeholder dim and typed
+/// text in normal style, so a draft anywhere in the box counts as input.
+///
+/// Claude ends the box with a rule (`────`), Codex with a blank row. A blank
+/// row followed by plain text, in the default color, could also be a blank
+/// line inside a draft, so that counts as input: when in doubt, not empty.
+fn input_line_is_empty(vt: &str, rows: usize, (row, col): (usize, usize)) -> bool {
+    let lines: Vec<&str> = vt.strip_suffix('\n').unwrap_or(vt).split('\n').collect();
+    let top = lines.len().saturating_sub(rows);
+    let start = top + row.saturating_sub(1);
+    let Some(line) = lines.get(start) else {
+        return false;
+    };
+    let row_cells = cells(line);
+    let split = col.saturating_sub(1).min(row_cells.len());
+    let (before, after) = row_cells.split_at(split);
+    let marks: Vec<char> = before
+        .iter()
+        .map(|cell| cell.c)
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let one_mark = matches!(marks.as_slice(), [mark] if !mark.is_alphanumeric());
+    let typed = |cells: &[Cell]| {
+        cells
+            .iter()
+            .any(|cell| !cell.c.is_whitespace() && !cell.dim)
+    };
+    if !one_mark || typed(after) {
+        return false;
+    }
+    // The box's further rows, such as the rest of a multi-line draft.
+    let rest: Vec<Vec<Cell>> = lines[start + 1..].iter().map(|l| cells(l)).collect();
+    for (i, cells) in rest.iter().enumerate() {
+        let visible: Vec<char> = cells
+            .iter()
+            .map(|cell| cell.c)
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        if visible.is_empty() {
+            let plain_text_follows = rest.get(i + 1).is_some_and(|next| {
+                next.iter()
+                    .any(|cell| cell.c.is_alphanumeric() && !cell.dim && !cell.colored)
+            });
+            return !plain_text_follows;
+        }
+        if visible
+            .iter()
+            .all(|c| ('\u{2500}'..='\u{257f}').contains(c))
+        {
+            return true;
+        }
+        if typed(cells) {
+            return false;
+        }
+    }
+    true
+}
+
+/// One cell of a `vt` row: its character, whether it is drawn dim (SGR 2),
+/// and whether it has a foreground color other than the default.
+#[derive(Clone, Copy)]
+struct Cell {
+    c: char,
+    dim: bool,
+    colored: bool,
+}
+
+/// The cells of one row of a `vt` dump. Cursor-forward moves become spaces;
+/// other escape sequences are skipped.
+fn cells(line: &str) -> Vec<Cell> {
+    let mut cells = Vec::new();
+    let mut style = Cell {
+        c: ' ',
+        dim: false,
+        colored: false,
+    };
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.next() {
+                Some('[') => {
+                    let mut params = String::new();
+                    let mut last = None;
+                    for c in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&c) {
+                            last = Some(c);
+                            break;
+                        }
+                        params.push(c);
+                    }
+                    match last {
+                        Some('m') => sgr(&params, &mut style),
+                        Some('C') => {
+                            let n = params.parse().unwrap_or(1);
+                            cells.extend(std::iter::repeat_n(Cell { c: ' ', ..style }, n));
+                        }
+                        _ => {}
+                    }
+                }
+                // OSC: up to BEL or ESC \.
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' || (c == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            c if c.is_control() => {}
+            c => cells.push(Cell { c, ..style }),
+        }
+    }
+    cells
+}
+
+/// Applies an SGR parameter list to the dim and foreground attributes.
+fn sgr(params: &str, style: &mut Cell) {
+    let mut params = params.split(';');
+    while let Some(p) = params.next() {
+        match p {
+            "" | "0" => {
+                style.dim = false;
+                style.colored = false;
+            }
+            "2" => style.dim = true,
+            "22" => style.dim = false,
+            "39" => style.colored = false,
+            // Extended colors carry their own numbers, which are not styles.
+            "38" | "48" | "58" => {
+                style.colored |= p == "38";
+                match params.next() {
+                    Some("2") => drop(params.nth(2)),
+                    Some("5") => drop(params.next()),
+                    _ => {}
+                }
+            }
+            p => {
+                if let Ok(n) = p.parse::<u8>()
+                    && matches!(n, 30..=37 | 90..=97)
+                {
+                    style.colored = true;
+                }
+            }
+        }
+    }
+}
+
 /// Shortens `text` to at most `max` characters.
 pub fn truncate(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_the_cursor() {
+        assert_eq!(cursor_position("x\x1b[0m\x1b[22;3H\n"), Some((22, 3)));
+        assert_eq!(cursor_position("no cursor"), None);
+    }
+
+    /// Rows as Claude Code and Codex draw them, from `vt` dumps.
+    const CLAUDE_EMPTY: &str = "\u{276f}\u{a0}\x1b[0m\x1b[2mTry \"edit store.rs\"\x1b[0m\r";
+    const CLAUDE_DRAFT: &str = "\u{276f}\u{a0}abc\r";
+    const CODEX_EMPTY: &str =
+        "\x1b[0m\x1b[1m\u{203a}\x1b[1C\x1b[0m\x1b[2mAsk Codex to do anything\x1b[0m\r";
+    const CODEX_DRAFT: &str = "\x1b[0m\x1b[1m\u{203a}\x1b[1C\x1b[0mabc\r";
+
+    /// A 5-row screen under two lines of scrollback, with `prompt` on row 3
+    /// and a rule and a status row below it, then the cursor sequence, as
+    /// `format` returns it.
+    fn screen(prompt: &str, cursor: (usize, usize)) -> String {
+        format!(
+            "old 1\r\nold 2\r\n\x1b[38;2;153;153;153mtitle\x1b[0m\r\n\r\n{prompt}\n\x1b[38;2;136;136;136m\u{2500}\u{2500}\u{2500}\x1b[0m\r\n\x1b[38;2;255;193;7mauto mode on\x1b[0m\x1b[{};{}H\n",
+            cursor.0, cursor.1
+        )
+    }
+
+    #[test]
+    fn tells_an_empty_input_line_from_typed_text() {
+        for empty in [CLAUDE_EMPTY, CODEX_EMPTY] {
+            let vt = screen(empty, (3, 3));
+            assert_eq!(cursor_position(&vt), Some((3, 3)));
+            assert!(input_line_is_empty(&vt, 5, (3, 3)), "{vt:?}");
+            // Another row, or a cursor off the screen, is not the input line.
+            assert!(!input_line_is_empty(&vt, 5, (2, 3)));
+            assert!(!input_line_is_empty(&vt, 5, (9, 3)));
+        }
+        for draft in [CLAUDE_DRAFT, CODEX_DRAFT] {
+            // The cursor after the draft, or at its start.
+            assert!(!input_line_is_empty(&screen(draft, (3, 6)), 5, (3, 6)));
+            assert!(!input_line_is_empty(&screen(draft, (3, 3)), 5, (3, 3)));
+        }
+        // The cursor on the blank first row of a multi-line draft: the box's
+        // next row holds typed text (Claude's rule and Codex's blank row end
+        // the box, so the status rows below do not count).
+        let multi = "\u{276f}\u{a0}\r\r\n  second line\r";
+        let vt = format!(
+            "old\r\n\r\n{multi}\r\n\x1b[38;2;136;136;136m\u{2500}\u{2500}\x1b[0m\r\n\x1b[38;2;255;193;7mauto\x1b[0m\x1b[2;3H\n"
+        );
+        assert!(!input_line_is_empty(&vt, 5, (2, 3)), "{vt:?}");
+        let codex = "\x1b[1m\u{203a}\x1b[1C\x1b[0m\r\r\n \x1b[1Csecond\r\r\n \r\r\n \x1b[1C\x1b[38;2;246;226;183mGPT\x1b[0m\x1b[1;3H\n";
+        assert!(!input_line_is_empty(codex, 4, (1, 3)), "{codex:?}");
+        let codex_empty = "\x1b[1m\u{203a}\x1b[1C\x1b[0m\x1b[2mAsk Codex\x1b[0m\r\r\n \r\r\n \x1b[1C\x1b[38;2;246;226;183mGPT\x1b[0m\x1b[1;3H\n";
+        assert!(
+            input_line_is_empty(codex_empty, 3, (1, 3)),
+            "{codex_empty:?}"
+        );
+        // A blank line inside a draft, with the cursor on the first row.
+        let gap = "\u{276f}\u{a0}\r\r\n\r\r\n  after a blank line\r\r\n\x1b[38;2;136;136;136m\u{2500}\u{2500}\x1b[0m\x1b[1;3H\n";
+        assert!(!input_line_is_empty(gap, 4, (1, 3)), "{gap:?}");
+        let codex_gap = "\x1b[1m\u{203a}\x1b[1C\x1b[0m\r\r\n \r\r\n \x1b[1Clater\r\r\n \r\r\n \x1b[1C\x1b[38;2;246;226;183mGPT\x1b[0m \u{b7} \x1b[38;2;171;223;167m~/src\x1b[0m\x1b[1;3H\n";
+        assert!(!input_line_is_empty(codex_gap, 5, (1, 3)), "{codex_gap:?}");
+        // As captured from both TUIs: the draft "\n\nthird line", with the
+        // cursor on its blank first row (paths shortened).
+        let claude_real = "\u{276f}\u{a0}\r\r\n\r\r\n  third line\r\r\n\x1b[0m\x1b[38;2;136;136;136m\u{2500}\u{2500}\u{2500}\r\r\n\x1b[2C\x1b[0m\x1b[38;2;255;193;7m\u{23f5}\u{23f5} auto mode on\x1b[0m\x1b[38;2;153;153;153m (shift+tab to cycle)\x1b[0m\x1b[1;3H\n";
+        assert!(!input_line_is_empty(claude_real, 5, (1, 3)));
+        let codex_real = "\x1b[0m\x1b[1m\u{203a}\x1b[0m\r\r\n \r\r\n \x1b[1Cthird\x1b[1Cline\r\r\n \r\r\n \x1b[1C\x1b[0m\x1b[38;2;246;226;183mGPT-6.2-Sol low\x1b[0m \u{b7} \x1b[0m\x1b[38;2;171;223;167m~/src/demo\x1b[0m\x1b[1;3H\n";
+        assert!(!input_line_is_empty(codex_real, 5, (1, 3)));
+        // Codex's own blank row before its colored status row ends the box.
+        let codex_status = "\x1b[1m\u{203a}\x1b[1C\x1b[0m\x1b[2mAsk Codex\x1b[0m\r\r\n \r\r\n \x1b[1C\x1b[38;2;246;226;183mGPT-6.2\x1b[0m \u{b7} \x1b[38;2;171;223;167m~/src\x1b[0m\x1b[1;3H\n";
+        assert!(
+            input_line_is_empty(codex_status, 3, (1, 3)),
+            "{codex_status:?}"
+        );
+        // A 24-bit color whose numbers include 2 is not dim.
+        let gray = "\u{203a} \x1b[38;2;2;2;2mtyped\x1b[0m\r";
+        assert!(!input_line_is_empty(&screen(gray, (3, 3)), 5, (3, 3)));
+        // OSC sequences, such as hyperlinks, take no cells.
+        let link = "\u{276f} \x1b]8;;https://x\x1b\\\x1b[2mhint\x1b[0m\x1b]8;;\x1b\\\r";
+        assert!(input_line_is_empty(&screen(link, (3, 3)), 5, (3, 3)));
+    }
 }
 
 /// An in-memory Rex for tests.
@@ -236,6 +543,10 @@ pub mod fake {
         pub status: Option<Status>,
         /// Lines submitted with [`Rex::submit`].
         pub input: Vec<String>,
+        /// The block this one was split from, and whether beside it.
+        pub split_from: Option<(String, bool)>,
+        /// Whether a human has typed into the input line.
+        pub typing: bool,
     }
 
     #[derive(Default)]
@@ -295,12 +606,44 @@ pub mod fake {
                     cwd: cwd.to_path_buf(),
                     status: None,
                     input: Vec::new(),
+                    split_from: None,
+                    typing: false,
                 },
             );
             Ok(Window {
                 window_id,
                 block_id,
             })
+        }
+
+        fn split(
+            &mut self,
+            session_id: &str,
+            anchor_block: &str,
+            beside: bool,
+            command: &[String],
+            cwd: &Path,
+        ) -> Result<String> {
+            let anchor = self.blocks.get(anchor_block).context("no such block")?;
+            if anchor.session_id != session_id {
+                bail!("block {anchor_block} is not in {session_id}");
+            }
+            let window_label = anchor.window_label.clone();
+            let block_id = self.id("block");
+            self.blocks.insert(
+                block_id.clone(),
+                Block {
+                    session_id: session_id.to_owned(),
+                    window_label,
+                    command: command.to_vec(),
+                    cwd: cwd.to_path_buf(),
+                    status: None,
+                    input: Vec::new(),
+                    split_from: Some((anchor_block.to_owned(), beside)),
+                    typing: false,
+                },
+            );
+            Ok(block_id)
         }
 
         fn block_ids(&mut self, session_id: &str) -> Result<Vec<String>> {
@@ -325,6 +668,10 @@ pub mod fake {
             self.sessions.retain(|_, id| id != session_id);
             self.blocks.retain(|_, b| b.session_id != session_id);
             Ok(())
+        }
+
+        fn input_is_empty(&mut self, _session_id: &str, block_id: &str) -> Result<bool> {
+            Ok(!self.blocks.get(block_id).context("no such block")?.typing)
         }
 
         fn submit(&mut self, _session_id: &str, block_id: &str, text: &str) -> Result<()> {

@@ -6,6 +6,11 @@ use anyhow::Result;
 use crate::domain::{Event, Message};
 use crate::store::Store;
 
+/// The one line `serve` types into an idle Agent's terminal when it has
+/// unread messages (ADR-0003). It never carries a message body; the prompt
+/// hook attaches the messages.
+pub const WAKE_TOKEN: &str = "rex-projects: you have new messages. Read them and continue; if none are shown, call inbox_read.";
+
 /// The longest message body accepted, in characters.
 pub const MAX_BODY_CHARS: usize = 20_000;
 /// Roughly how much message text one read or hook hands over, in characters.
@@ -15,7 +20,27 @@ const MAX_BATCH_CHARS: usize = 24_000;
 /// Marks the oldest unread messages of `agent_id` as read and returns them,
 /// with the number still unread after them.
 pub fn take(store: &mut Store, agent_id: &str) -> Result<(Vec<Message>, usize)> {
-    let unread = store.unread(agent_id)?;
+    // Reading and marking in one transaction keeps two readers, such as a
+    // hook and `inbox_read`, from both taking the same messages.
+    store.with_tx(|tx| {
+        let unread = crate::store::unread_in(tx, agent_id)?;
+        let (taken, rest) = batch(&unread);
+        if let Some(last) = taken.last() {
+            crate::store::append_in(
+                tx,
+                agent_id,
+                &Event::MessagesRead {
+                    agent_id: agent_id.to_owned(),
+                    through: last.id,
+                },
+            )?;
+        }
+        Ok((taken.to_vec(), rest.len()))
+    })
+}
+
+/// Splits `unread` into the oldest messages that fit one hand-over and the rest.
+fn batch(unread: &[Message]) -> (&[Message], &[Message]) {
     let mut size = 0;
     let count = unread
         .iter()
@@ -27,17 +52,7 @@ pub fn take(store: &mut Store, agent_id: &str) -> Result<(Vec<Message>, usize)> 
         .count()
         .max(1)
         .min(unread.len());
-    let (taken, rest) = unread.split_at(count);
-    if let Some(last) = taken.last() {
-        store.append(
-            agent_id,
-            Event::MessagesRead {
-                agent_id: agent_id.to_owned(),
-                through: last.id,
-            },
-        )?;
-    }
-    Ok((taken.to_vec(), rest.len()))
+    unread.split_at(count)
 }
 
 /// Formats messages for a harness hook, or `None` when there are none.
