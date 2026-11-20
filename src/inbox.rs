@@ -2,6 +2,7 @@
 //! Agent reads them with `inbox_read` or a hook hands them to the harness.
 
 use anyhow::Result;
+use rusqlite::Transaction;
 
 use crate::domain::{Event, Message};
 use crate::store::Store;
@@ -22,21 +23,24 @@ const MAX_BATCH_CHARS: usize = 24_000;
 pub fn take(store: &mut Store, agent_id: &str) -> Result<(Vec<Message>, usize)> {
     // Reading and marking in one transaction keeps two readers, such as a
     // hook and `inbox_read`, from both taking the same messages.
-    store.with_tx(|tx| {
-        let unread = crate::store::unread_in(tx, agent_id)?;
-        let (taken, rest) = batch(&unread);
-        if let Some(last) = taken.last() {
-            crate::store::append_in(
-                tx,
-                agent_id,
-                &Event::MessagesRead {
-                    agent_id: agent_id.to_owned(),
-                    through: last.id,
-                },
-            )?;
-        }
-        Ok((taken.to_vec(), rest.len()))
-    })
+    store.with_tx(|tx| take_in(tx, agent_id))
+}
+
+/// `take` inside the caller's transaction.
+pub(crate) fn take_in(tx: &Transaction<'_>, agent_id: &str) -> Result<(Vec<Message>, usize)> {
+    let unread = crate::store::unread_in(tx, agent_id)?;
+    let (taken, rest) = batch(&unread);
+    if let Some(last) = taken.last() {
+        crate::store::append_in(
+            tx,
+            agent_id,
+            &Event::MessagesRead {
+                agent_id: agent_id.to_owned(),
+                through: last.id,
+            },
+        )?;
+    }
+    Ok((taken.to_vec(), rest.len()))
 }
 
 /// Splits `unread` into the oldest messages that fit one hand-over and the rest.

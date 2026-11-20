@@ -295,8 +295,9 @@ fn cursor_position(vt: &str) -> Option<(usize, usize)> {
 /// text in normal style, so a draft anywhere in the box counts as input.
 ///
 /// Claude ends the box with a rule (`────`), Codex with a blank row. A blank
-/// row followed by plain text, in the default color, could also be a blank
-/// line inside a draft, so that counts as input: when in doubt, not empty.
+/// row followed, before the next rule, by a row of plain text with no color
+/// could also be a blank line inside a draft, so that counts as input: when
+/// in doubt, not empty.
 fn input_line_is_empty(vt: &str, rows: usize, (row, col): (usize, usize)) -> bool {
     let lines: Vec<&str> = vt.strip_suffix('\n').unwrap_or(vt).split('\n').collect();
     let top = lines.len().saturating_sub(rows);
@@ -323,24 +324,30 @@ fn input_line_is_empty(vt: &str, rows: usize, (row, col): (usize, usize)) -> boo
     }
     // The box's further rows, such as the rest of a multi-line draft.
     let rest: Vec<Vec<Cell>> = lines[start + 1..].iter().map(|l| cells(l)).collect();
-    for (i, cells) in rest.iter().enumerate() {
-        let visible: Vec<char> = cells
+    let is_rule = |cells: &[Cell]| {
+        let mut visible = cells
             .iter()
             .map(|cell| cell.c)
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        if visible.is_empty() {
-            let plain_text_follows = rest.get(i + 1).is_some_and(|next| {
-                next.iter()
-                    .any(|cell| cell.c.is_alphanumeric() && !cell.dim && !cell.colored)
-            });
-            return !plain_text_follows;
-        }
-        if visible
-            .iter()
-            .all(|c| ('\u{2500}'..='\u{257f}').contains(c))
-        {
+            .filter(|c| !c.is_whitespace());
+        visible.clone().next().is_some() && visible.all(|c| ('\u{2500}'..='\u{257f}').contains(&c))
+    };
+    for (i, cells) in rest.iter().enumerate() {
+        if is_rule(cells) {
             return true;
+        }
+        if cells.iter().all(|cell| cell.c.is_whitespace()) {
+            // Past a blank row, a row of plain text before the next rule may
+            // be more of the draft. Codex's status row below its box is
+            // partly colored, and typed text never is.
+            let plain_text_follows =
+                rest[i + 1..]
+                    .iter()
+                    .take_while(|row| !is_rule(row))
+                    .any(|row| {
+                        row.iter().all(|cell| !cell.colored)
+                            && row.iter().any(|cell| !cell.c.is_whitespace() && !cell.dim)
+                    });
+            return !plain_text_follows;
         }
         if typed(cells) {
             return false;
@@ -506,6 +513,19 @@ mod tests {
         assert!(!input_line_is_empty(gap, 4, (1, 3)), "{gap:?}");
         let codex_gap = "\x1b[1m\u{203a}\x1b[1C\x1b[0m\r\r\n \r\r\n \x1b[1Clater\r\r\n \r\r\n \x1b[1C\x1b[38;2;246;226;183mGPT\x1b[0m \u{b7} \x1b[38;2;171;223;167m~/src\x1b[0m\x1b[1;3H\n";
         assert!(!input_line_is_empty(codex_gap, 5, (1, 3)), "{codex_gap:?}");
+        // Two blank lines, or only punctuation, after the blank line.
+        let two_gaps = "\u{276f}\u{a0}\r\r\n\r\r\n\r\r\n  later\r\r\n\x1b[38;2;136;136;136m\u{2500}\u{2500}\x1b[0m\x1b[1;3H\n";
+        assert!(!input_line_is_empty(two_gaps, 5, (1, 3)), "{two_gaps:?}");
+        let codex_two_gaps = "\x1b[1m\u{203a}\x1b[1C\x1b[0m\r\r\n \r\r\n \r\r\n \x1b[1Clater\r\r\n \r\r\n \x1b[1C\x1b[38;2;246;226;183mGPT\x1b[0m \u{b7} \x1b[38;2;171;223;167m~/src\x1b[0m\x1b[1;3H\n";
+        assert!(
+            !input_line_is_empty(codex_two_gaps, 6, (1, 3)),
+            "{codex_two_gaps:?}"
+        );
+        let codex_marks = "\x1b[1m\u{203a}\x1b[1C\x1b[0m\r\r\n \r\r\n \x1b[1C!!!\r\r\n \r\r\n \x1b[1C\x1b[38;2;246;226;183mGPT\x1b[0m \u{b7} \x1b[38;2;171;223;167m~/src\x1b[0m\x1b[1;3H\n";
+        assert!(
+            !input_line_is_empty(codex_marks, 5, (1, 3)),
+            "{codex_marks:?}"
+        );
         // As captured from both TUIs: the draft "\n\nthird line", with the
         // cursor on its blank first row (paths shortened).
         let claude_real = "\u{276f}\u{a0}\r\r\n\r\r\n  third line\r\r\n\x1b[0m\x1b[38;2;136;136;136m\u{2500}\u{2500}\u{2500}\r\r\n\x1b[2C\x1b[0m\x1b[38;2;255;193;7m\u{23f5}\u{23f5} auto mode on\x1b[0m\x1b[38;2;153;153;153m (shift+tab to cycle)\x1b[0m\x1b[1;3H\n";
