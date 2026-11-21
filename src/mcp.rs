@@ -189,6 +189,9 @@ impl Server {
             let state = store.ticket(blocker)?.map(|t| t.state.to_string());
             blocked_by.push(json!({"id": blocker, "state": state}));
         }
+        let playbook = store.preparation(&ticket.id)?.and_then(|p| p.playbook).map(
+            |p| json!({"name": p.name, "sha256": p.sha256.chars().take(12).collect::<String>()}),
+        );
         Ok(json!({
             "notice": close_notice(&ticket),
             "project": {"id": ticket.project_id, "goal": goal},
@@ -206,6 +209,7 @@ impl Server {
                 "blocked_by": blocked_by,
                 "external_refs": ticket.external_refs,
                 "artifacts": ticket.artifacts,
+                "playbook_snapshot": playbook,
             },
         }))
     }
@@ -362,6 +366,17 @@ impl Server {
             bail!("a Ticket has one Coordinator; spawn a helper Role such as worker or reviewer");
         }
         crate::provider::role_base_text(&self.paths, &args.role)?;
+        if let Some(preparation) = store.preparation(&ticket.id)?
+            && let Some(spec) = preparation.playbook.and_then(|snapshot| snapshot.spec)
+            && let Some(roles) = spec.roles
+            && !roles.contains(&args.role)
+        {
+            bail!(
+                "Role {:?} is not allowed by the Ticket's Playbook; allowed Roles: {}",
+                args.role,
+                roles.join(", ")
+            );
+        }
         if args.task.trim().is_empty() {
             bail!("task must not be empty");
         }
@@ -898,6 +913,49 @@ pub(crate) mod tests {
         assert_eq!(value["project"], json!({"id": "demo", "goal": "Ship it"}));
         assert_eq!(value["ticket"]["brief"], "The Brief");
         assert_eq!(value["ticket"]["state"], "running");
+    }
+
+    #[test]
+    fn playbook_role_allowlist_is_enforced_and_snapshot_is_exposed() {
+        let (_dir, coordinator) = setup("demo-1-coordinator");
+        let mut store = Store::open(&coordinator.paths.db_file()).unwrap();
+        store
+            .append(
+                "serve",
+                Event::TicketPrepared {
+                    ticket_id: "demo-1".into(),
+                    base_commit: "abc123".into(),
+                    playbook: Some(crate::playbook::PlaybookSnapshot {
+                        name: "feature".into(),
+                        sha256: "b".repeat(64),
+                        body: "Instructions".into(),
+                        spec: Some(crate::playbook::PlaybookSpec {
+                            stages: vec![],
+                            roles: Some(vec!["worker".into()]),
+                            gates: Default::default(),
+                            verification: None,
+                            budgets: None,
+                        }),
+                    }),
+                },
+            )
+            .unwrap();
+        let (_, error) = call(
+            &coordinator,
+            "spawn_agent",
+            json!({"role":"reviewer", "task":"review"}),
+        );
+        assert!(
+            error.contains("not allowed by the Ticket's Playbook"),
+            "{error}"
+        );
+        let reply = call(&coordinator, "ticket_get", json!({})).1;
+        let value: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(value["ticket"]["playbook_snapshot"]["name"], "feature");
+        assert_eq!(
+            value["ticket"]["playbook_snapshot"]["sha256"],
+            "b".repeat(12)
+        );
     }
 
     #[test]

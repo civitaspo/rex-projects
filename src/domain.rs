@@ -152,6 +152,11 @@ pub enum Event {
         ticket_id: String,
         agent_id: String,
     },
+    TicketPrepared {
+        ticket_id: String,
+        base_commit: String,
+        playbook: Option<crate::playbook::PlaybookSnapshot>,
+    },
     TicketReported {
         ticket_id: String,
         stage: Option<String>,
@@ -252,6 +257,7 @@ impl Event {
             Self::TicketCreated { .. } => "ticket_created",
             Self::TicketReadied { .. } => "ticket_readied",
             Self::TicketDispatched { .. } => "ticket_dispatched",
+            Self::TicketPrepared { .. } => "ticket_prepared",
             Self::TicketReported { .. } => "ticket_reported",
             Self::TicketAsked { .. } => "ticket_asked",
             Self::TicketAnswered { .. } => "ticket_answered",
@@ -275,6 +281,7 @@ impl Event {
             Self::TicketCreated { ticket_id, .. }
             | Self::TicketReadied { ticket_id }
             | Self::TicketDispatched { ticket_id, .. }
+            | Self::TicketPrepared { ticket_id, .. }
             | Self::TicketReported { ticket_id, .. }
             | Self::TicketAsked { ticket_id, .. }
             | Self::TicketAnswered { ticket_id, .. }
