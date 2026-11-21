@@ -89,6 +89,11 @@ impl<'de> Deserialize<'de> for PlaybookSpec {
         let raw = Raw::deserialize(deserializer)?;
         if let Some(roles) = &raw.roles {
             validate_names("roles", roles).map_err(serde::de::Error::custom)?;
+            for role in roles {
+                crate::config::validate_id(role).map_err(|err| {
+                    serde::de::Error::custom(format!("roles entry {role:?} {err}"))
+                })?;
+            }
         }
         validate_names("stages", &raw.stages).map_err(serde::de::Error::custom)?;
         for (stage, kind) in &raw.gates {
@@ -156,7 +161,7 @@ fn split_markdown(text: &str) -> Result<(Option<Frontmatter>, &str)> {
     let mut offset = 0;
     for line in after_open.split_inclusive('\n') {
         offset += line.len();
-        if line.trim_end_matches(['\r', '\n']) == "---" {
+        if line.trim_end() == "---" {
             let yaml = &after_open[..offset - line.len()];
             let body = after_open[offset..].trim_start_matches(['\n', '\r']);
             let fm: Frontmatter = serde_yaml::from_str(yaml).context("invalid YAML frontmatter")?;
@@ -275,6 +280,24 @@ mod tests {
         );
         assert!(err.contains("feature/SKILL.md"));
         assert!(err.contains("rolse"));
+    }
+
+    #[test]
+    fn rejects_role_names_that_cannot_be_configured() {
+        let raw = "---\nrex-projects:\n  roles: [valid-role, 'not/a-role']\n---\nbody";
+        let err = format!(
+            "{:#}",
+            parse("feature", raw, Path::new("feature/SKILL.md")).unwrap_err()
+        );
+        assert!(err.contains("roles entry \"not/a-role\""), "{err}");
+    }
+
+    #[test]
+    fn accepts_closing_frontmatter_delimiter_with_trailing_whitespace() {
+        let raw = "---\nname: feature\nrex-projects:\n  roles: [worker]\n--- \t\nbody text\n";
+        let snapshot = parse("feature", raw, Path::new("feature/SKILL.md")).unwrap();
+        assert_eq!(snapshot.body, "body text\n");
+        assert_eq!(snapshot.spec.unwrap().roles.unwrap(), ["worker"]);
     }
 
     #[test]
