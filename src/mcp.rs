@@ -21,6 +21,7 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 
+const SUPERSEDED: &str = "this session was superseded by a newer launch of the Agent; stop working";
 const WAIT_INSTRUCTION: &str = "Your question is recorded and the Ticket is waiting. Stop working \
      now and wait for the human's reply in this conversation.";
 
@@ -146,9 +147,36 @@ impl Server {
     fn write_context(&self) -> Result<(Store, Agent, Ticket)> {
         let context = self.context()?;
         if is_stale(self.launch, &context.1) {
-            bail!("this session was superseded by a newer launch of the Agent; stop working");
+            bail!(SUPERSEDED);
         }
         Ok(context)
+    }
+
+    /// Checks again, inside the transaction that writes, that this session
+    /// is the Agent's current launch, so a relaunch between `write_context`
+    /// and the write cannot let the old session through.
+    fn require_current(&self, tx: &rusqlite::Transaction<'_>) -> Result<()> {
+        let launches: i64 = tx.query_row(
+            "SELECT launches FROM agents WHERE id = ?1",
+            rusqlite::params![self.agent_id],
+            |row| row.get(0),
+        )?;
+        if self.launch.is_some_and(|launch| launch != launches) {
+            bail!(SUPERSEDED);
+        }
+        Ok(())
+    }
+
+    /// Records `events` as this Agent, all or none, if this session is still
+    /// the Agent's current launch.
+    fn append_current(&self, store: &mut Store, events: &[Event]) -> Result<()> {
+        store.with_tx(|tx| {
+            self.require_current(tx)?;
+            for event in events {
+                crate::store::append_in(tx, &self.agent_id, event)?;
+            }
+            Ok(())
+        })
     }
 
     fn ticket_get(&self) -> Result<Value> {
@@ -201,16 +229,16 @@ impl Server {
             &agent,
             "report; send your progress to the Coordinator instead",
         )?;
-        store.append(
-            &agent.id,
-            Event::TicketReported {
+        self.append_current(
+            &mut store,
+            &[Event::TicketReported {
                 ticket_id: ticket.id.clone(),
                 stage: args.stage,
                 summary: args.summary,
                 progress: args.progress,
                 next: args.next,
                 artifacts: args.artifacts,
-            },
+            }],
         )?;
         status(&store, &ticket.id)
     }
@@ -226,12 +254,12 @@ impl Server {
         }
         let (mut store, agent, ticket) = self.write_context()?;
         require_coordinator(&agent, "ask")?;
-        store.append(
-            &agent.id,
-            Event::TicketAsked {
+        self.append_current(
+            &mut store,
+            &[Event::TicketAsked {
                 ticket_id: ticket.id.clone(),
                 question: args.question,
-            },
+            }],
         )?;
         let mut value = status(&store, &ticket.id)?;
         value["instruction"] = WAIT_INSTRUCTION.into();
@@ -252,14 +280,14 @@ impl Server {
         }
         let (mut store, agent, ticket) = self.write_context()?;
         require_coordinator(&agent, "complete")?;
-        store.append(
-            &agent.id,
-            Event::TicketCompleted {
+        self.append_current(
+            &mut store,
+            &[Event::TicketCompleted {
                 ticket_id: ticket.id.clone(),
                 outcome: args.outcome,
                 summary: args.summary,
                 artifacts: args.artifacts,
-            },
+            }],
         )?;
         status(&store, &ticket.id)
     }
@@ -291,21 +319,24 @@ impl Server {
         if to == agent.id {
             bail!("you cannot send a message to yourself");
         }
-        store.append(
-            &agent.id,
-            Event::MessageSent {
+        self.append_current(
+            &mut store,
+            &[Event::MessageSent {
                 ticket_id: ticket.id.clone(),
                 from: agent.id.clone(),
                 to: to.clone(),
                 body: args.body,
-            },
+            }],
         )?;
         Ok(json!({"sent_to": to}))
     }
 
     fn inbox_read(&self) -> Result<Value> {
         let (mut store, agent, _) = self.write_context()?;
-        let (messages, remaining) = crate::inbox::take(&mut store, &agent.id)?;
+        let (messages, remaining) = store.with_tx(|tx| {
+            self.require_current(tx)?;
+            crate::inbox::take_in(tx, &agent.id)
+        })?;
         Ok(json!({"messages": messages, "remaining": remaining}))
     }
 
@@ -350,6 +381,7 @@ impl Server {
         // Number the helper, check the slot limit, and record it in one
         // transaction, so parallel spawns neither collide nor overrun.
         let id = store.with_tx(|tx| {
+            self.require_current(tx)?;
             let n: i64 = tx.query_row(
                 "SELECT COUNT(*) + 1 FROM agents WHERE ticket_id = ?1 AND role = ?2",
                 rusqlite::params![ticket.id, args.role],
@@ -426,12 +458,12 @@ impl Server {
             .with_context(|| {
                 format!("{} is not a helper on ticket {}", args.agent_id, ticket.id)
             })?;
-        store.append(
-            &agent.id,
-            Event::AgentFinished {
+        self.append_current(
+            &mut store,
+            &[Event::AgentFinished {
                 agent_id: helper.id.clone(),
                 reason: "stopped by the Coordinator".into(),
-            },
+            }],
         )?;
         Ok(json!({"stopped": helper.id}))
     }
@@ -466,8 +498,8 @@ impl Server {
                 crate::inbox::MAX_BODY_CHARS
             );
         }
-        store.append_all(
-            &agent.id,
+        self.append_current(
+            &mut store,
             &[
                 Event::MessageSent {
                     ticket_id: ticket.id.clone(),
@@ -1261,6 +1293,32 @@ pub(crate) mod tests {
 
         let current = Server::new(paths, "demo-1-coordinator".into(), Some(0));
         assert!(!call(&current, "report", json!({"stage": "plan"})).0);
+
+        // A relaunch after `write_context` passed still stops the write.
+        let (mut store, _, row) = current.write_context().unwrap();
+        store
+            .append(
+                "serve",
+                Event::AgentLaunched {
+                    agent_id: "demo-1-coordinator".into(),
+                    rex_session_id: "session:1".into(),
+                    rex_window_id: "window:1".into(),
+                    rex_block_id: "block:1".into(),
+                    resume: false,
+                },
+            )
+            .unwrap();
+        let report = Event::TicketReported {
+            ticket_id: row.id,
+            stage: Some("review".into()),
+            summary: None,
+            progress: None,
+            next: None,
+            artifacts: vec![],
+        };
+        let err = current.append_current(&mut store, &[report]).unwrap_err();
+        assert!(err.to_string().contains("superseded"), "{err}");
+        assert_eq!(ticket(&current).stage.as_deref(), Some("plan"));
     }
 
     #[test]
