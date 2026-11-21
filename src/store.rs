@@ -63,6 +63,10 @@ CREATE TABLE IF NOT EXISTS agents (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS ticket_preparations (
+  ticket_id TEXT PRIMARY KEY REFERENCES tickets(id),
+  payload TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY,
   ticket_id TEXT NOT NULL,
@@ -338,12 +342,29 @@ impl Store {
         &self.conn
     }
 
+    pub fn preparation(
+        &self,
+        ticket_id: &str,
+    ) -> Result<Option<crate::playbook::TicketPreparation>> {
+        let payload: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT payload FROM ticket_preparations WHERE ticket_id = ?1",
+                params![ticket_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        payload
+            .map(|text| serde_json::from_str(&text).context("invalid Ticket preparation snapshot"))
+            .transpose()
+    }
+
     /// Drops the projections and rebuilds them by replaying every event.
     pub fn rebuild(&mut self) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch("DELETE FROM tickets; DELETE FROM agents; DELETE FROM messages;")?;
+        tx.execute_batch("DELETE FROM ticket_preparations; DELETE FROM tickets; DELETE FROM agents; DELETE FROM messages;")?;
         let events: Vec<(String, String)> = {
             let mut stmt = tx.prepare("SELECT at, payload FROM events ORDER BY seq")?;
             let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
@@ -611,6 +632,34 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event, replay: Replay) -> Res
             tx.execute(
                 "UPDATE tickets SET coordinator_id = ?2 WHERE id = ?1",
                 params![ticket_id, agent_id],
+            )?;
+        }
+        Event::TicketPrepared {
+            ticket_id,
+            base_commit,
+            playbook,
+        } => {
+            let state = ticket_state(tx, ticket_id)?;
+            require(ticket_id, state, &[Running], "prepare")?;
+            if base_commit.trim().is_empty() {
+                bail!("ticket {ticket_id} preparation requires a base commit");
+            }
+            if admit
+                && tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM ticket_preparations WHERE ticket_id = ?1)",
+                    params![ticket_id],
+                    |row| row.get::<_, bool>(0),
+                )?
+            {
+                bail!("ticket {ticket_id} already has a preparation snapshot");
+            }
+            let preparation = crate::playbook::TicketPreparation {
+                base_commit: base_commit.clone(),
+                playbook: playbook.clone(),
+            };
+            tx.execute(
+                "INSERT INTO ticket_preparations (ticket_id, payload) VALUES (?1, ?2)",
+                params![ticket_id, serde_json::to_string(&preparation)?],
             )?;
         }
         Event::TicketReported {
@@ -1096,6 +1145,40 @@ mod tests {
         assert_eq!(done.coordinator_id.as_deref(), Some(agent_id.as_str()));
         assert_eq!(done.next, None, "an ended Ticket has no next step");
         assert_eq!(done.progress, Some(100));
+    }
+
+    #[test]
+    fn stores_and_replays_dispatch_preparation_atomically() {
+        let mut store = Store::open_in_memory().unwrap();
+        let ticket = new_ticket(&mut store, true);
+        let id = ticket.id.clone();
+        let coordinator = agent(&mut store, &id);
+        store
+            .append_all(
+                "serve",
+                &[
+                    Event::TicketDispatched {
+                        ticket_id: id.clone(),
+                        agent_id: coordinator,
+                    },
+                    Event::TicketPrepared {
+                        ticket_id: id.clone(),
+                        base_commit: "abc123".into(),
+                        playbook: Some(crate::playbook::PlaybookSnapshot {
+                            name: "feature".into(),
+                            sha256: "a".repeat(64),
+                            body: "old body".into(),
+                            spec: None,
+                        }),
+                    },
+                ],
+            )
+            .unwrap();
+        let before = store.preparation(&id).unwrap().unwrap();
+        assert_eq!(before.base_commit, "abc123");
+        assert_eq!(before.playbook.as_ref().unwrap().body, "old body");
+        store.rebuild().unwrap();
+        assert_eq!(store.preparation(&id).unwrap().unwrap(), before);
     }
 
     #[test]

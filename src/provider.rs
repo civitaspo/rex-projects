@@ -239,6 +239,35 @@ pub fn role_text(
     Ok(text)
 }
 
+/// Builds a Role prompt from the dispatch snapshot when one exists. Legacy
+/// Tickets dispatched before snapshots retain the previous live-file behavior.
+pub fn role_text_with_store(
+    paths: &Paths,
+    project: &ProjectConfig,
+    ticket: &Ticket,
+    role: &str,
+    store: &Store,
+) -> Result<String> {
+    let mut text = role_base_text(paths, role)?;
+    if role != "coordinator" {
+        return Ok(text);
+    }
+    match store.preparation(&ticket.id)? {
+        Some(preparation) => {
+            if let Some(playbook) = preparation.playbook {
+                text = format!(
+                    "{}\n\n# Playbook: {}\n\n{}",
+                    text.trim_end(),
+                    playbook.name,
+                    playbook.body
+                );
+            }
+            Ok(text)
+        }
+        None => role_text(paths, project, ticket, role),
+    }
+}
+
 pub fn initial_prompt(ticket: &Ticket) -> String {
     format!(
         "You are the Coordinator for Ticket {}: {}. Start by calling ticket_get.",
@@ -315,7 +344,7 @@ pub fn exec(paths: &Paths, agent_id: &str) -> Result<()> {
     ]
     .map(|(k, v)| (k.to_owned(), v))
     .into();
-    let role = role_text(paths, project, &ticket, &agent.role)?;
+    let role = role_text_with_store(paths, project, &ticket, &agent.role, &store)?;
     let write = |name: &str, text: String| {
         let path = dir.join(name);
         std::fs::write(&path, text).with_context(|| format!("failed to write {}", path.display()))
@@ -458,6 +487,7 @@ fn session_meta(path: &Path, cwd: &Path) -> Option<(DateTime<Utc>, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::NewTicket;
 
     fn provider(kind: ProviderKind) -> ResolvedProvider {
         ResolvedProvider {
@@ -466,6 +496,149 @@ mod tests {
             command: "harness".into(),
             args: vec!["--extra".into()],
         }
+    }
+
+    #[test]
+    fn coordinator_resume_uses_the_dispatch_snapshot_after_playbook_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".rex-projects/playbooks/feature")).unwrap();
+        let file = repo.join(".rex-projects/playbooks/feature/SKILL.md");
+        std::fs::write(
+            &file,
+            "---\nname: feature\nrex-projects:\n  roles: [worker]\n---\nnew body\n",
+        )
+        .unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("config"),
+            state_dir: dir.path().join("state"),
+        };
+        let project =
+            crate::config::Config::parse(&format!("[[projects]]\nid='demo'\nrepo={:?}\n", repo))
+                .unwrap()
+                .projects
+                .remove(0);
+        let mut store = Store::open_in_memory().unwrap();
+        let ticket = store
+            .create_ticket(
+                "human",
+                NewTicket {
+                    project_id: "demo".into(),
+                    title: "T".into(),
+                    ready: true,
+                    playbook: Some("feature".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .append(
+                "serve",
+                Event::AgentCreated {
+                    agent_id: "demo-1-coordinator".into(),
+                    ticket_id: ticket.id.clone(),
+                    project_id: "demo".into(),
+                    role: "coordinator".into(),
+                    provider: "claude".into(),
+                    cwd: repo.display().to_string(),
+                },
+            )
+            .unwrap();
+        store
+            .append(
+                "serve",
+                Event::TicketDispatched {
+                    ticket_id: ticket.id.clone(),
+                    agent_id: "demo-1-coordinator".into(),
+                },
+            )
+            .unwrap();
+        let snapshot =
+            crate::playbook::resolve_for_ticket(&paths, &project, ticket.playbook.as_deref())
+                .unwrap()
+                .unwrap();
+        store
+            .append(
+                "serve",
+                Event::TicketPrepared {
+                    ticket_id: ticket.id.clone(),
+                    base_commit: "abc123".into(),
+                    playbook: Some(snapshot),
+                },
+            )
+            .unwrap();
+        std::fs::write(
+            &file,
+            "---\nname: feature\nrex-projects:\n  roles: [reviewer]\n---\nchanged body\n",
+        )
+        .unwrap();
+        let ticket = store.ticket(&ticket.id).unwrap().unwrap();
+        let role = role_text_with_store(&paths, &project, &ticket, "coordinator", &store).unwrap();
+        assert!(role.contains("new body"));
+        assert!(!role.contains("changed body"));
+    }
+
+    #[test]
+    fn replayed_pre_snapshot_dispatch_keeps_legacy_playbook_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".rex-projects/playbooks/feature")).unwrap();
+        std::fs::write(
+            repo.join(".rex-projects/playbooks/feature/SKILL.md"),
+            "---\nname: feature\n---\nlegacy instructions\n",
+        )
+        .unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("config"),
+            state_dir: dir.path().join("state"),
+        };
+        let project =
+            crate::config::Config::parse(&format!("[[projects]]\nid='demo'\nrepo={:?}\n", repo))
+                .unwrap()
+                .projects
+                .remove(0);
+        let mut store = Store::open_in_memory().unwrap();
+        let ticket = store
+            .create_ticket(
+                "human",
+                NewTicket {
+                    project_id: "demo".into(),
+                    title: "T".into(),
+                    ready: true,
+                    playbook: Some("feature".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .append(
+                "serve",
+                Event::AgentCreated {
+                    agent_id: "demo-1-coordinator".into(),
+                    ticket_id: ticket.id.clone(),
+                    project_id: "demo".into(),
+                    role: "coordinator".into(),
+                    provider: "claude".into(),
+                    cwd: repo.display().to_string(),
+                },
+            )
+            .unwrap();
+        store
+            .append(
+                "serve",
+                Event::TicketDispatched {
+                    ticket_id: ticket.id.clone(),
+                    agent_id: "demo-1-coordinator".into(),
+                },
+            )
+            .unwrap();
+
+        // This is the complete dispatch history written before TicketPrepared existed.
+        store.rebuild().unwrap();
+        assert!(store.preparation(&ticket.id).unwrap().is_none());
+        let ticket = store.ticket(&ticket.id).unwrap().unwrap();
+        let role = role_text_with_store(&paths, &project, &ticket, "coordinator", &store).unwrap();
+        assert!(role.contains("legacy instructions"));
     }
 
     fn argv(kind: ProviderKind, start: Start<'_>) -> Vec<String> {

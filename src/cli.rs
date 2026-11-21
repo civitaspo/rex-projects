@@ -380,11 +380,27 @@ fn ticket(paths: &Paths, command: TicketCommand) -> Result<()> {
             let ticket = store
                 .ticket(&id)?
                 .with_context(|| format!("ticket {id} does not exist"))?;
+            let playbook = store.preparation(&id)?.and_then(|p| p.playbook);
             if json {
-                println!("{}", serde_json::to_string_pretty(&ticket)?);
+                let mut value = serde_json::to_value(&ticket)?;
+                if let Some(playbook) = playbook {
+                    value["playbook_snapshot"] = serde_json::json!({
+                        "name": playbook.name,
+                        "sha256": playbook.sha256.chars().take(12).collect::<String>(),
+                    });
+                }
+                println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
                 let mut out = std::io::stdout().lock();
                 print_ticket(&mut out, &ticket)?;
+                if let Some(playbook) = playbook {
+                    writeln!(
+                        out,
+                        "playbook snapshot: {} ({})",
+                        playbook.name,
+                        playbook.sha256.chars().take(12).collect::<String>()
+                    )?;
+                }
                 let history = crate::history::entries(&store.ticket_events(&id)?);
                 if !history.is_empty() {
                     writeln!(out, "\nHistory:")?;

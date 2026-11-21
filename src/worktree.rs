@@ -41,6 +41,11 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// The commit currently checked out in a worktree.
+pub fn head_commit(repo: &Path) -> Result<String> {
+    git(repo, &["rev-parse", "HEAD"])
+}
+
 fn branch_exists(repo: &Path, branch: &str) -> bool {
     git(
         repo,

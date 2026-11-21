@@ -50,6 +50,18 @@ fn describe(actor: &str, event: &Event) -> Option<String> {
         }
         Event::TicketReadied { .. } => format!("readied by {actor}"),
         Event::TicketDispatched { agent_id, .. } => format!("dispatched to {agent_id}"),
+        Event::TicketPrepared {
+            base_commit,
+            playbook,
+            ..
+        } => match playbook {
+            Some(playbook) => format!(
+                "prepared {} ({}) at {base_commit}",
+                playbook.name,
+                playbook.sha256.chars().take(12).collect::<String>()
+            ),
+            None => format!("prepared at {base_commit}"),
+        },
         Event::AgentLaunched {
             agent_id, resume, ..
         } => {

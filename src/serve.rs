@@ -645,6 +645,10 @@ impl<R: Rex> Serve<R> {
             &worktree::branch(&ticket.id),
             project.base_branch.as_deref(),
         )?;
+        let base_commit = worktree::head_commit(&dir)
+            .with_context(|| format!("failed to read starting commit from {}", dir.display()))?;
+        let playbook =
+            crate::playbook::resolve_for_ticket(&self.paths, project, ticket.playbook.as_deref())?;
         let agent_id = coordinator_id(&ticket.id);
         let mut events = Vec::new();
         if self.store.agent(&agent_id)?.is_none() {
@@ -660,6 +664,11 @@ impl<R: Rex> Serve<R> {
         events.push(Event::TicketDispatched {
             ticket_id: ticket.id.clone(),
             agent_id: agent_id.clone(),
+        });
+        events.push(Event::TicketPrepared {
+            ticket_id: ticket.id.clone(),
+            base_commit,
+            playbook,
         });
         // A helper may have taken the slot while the worktree was prepared.
         let max = config.limits.max_agents as usize;
