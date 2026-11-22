@@ -170,6 +170,59 @@ impl Store {
         Ok(())
     }
 
+    /// Records a human answer and any matching time-budget extension atomically.
+    pub fn answer(
+        &mut self,
+        actor: &str,
+        ticket_id: &str,
+        answer: Option<String>,
+        question: Option<String>,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        append_in(
+            &tx,
+            actor,
+            &Event::TicketAnswered {
+                ticket_id: ticket_id.to_owned(),
+                answer,
+                question: question.clone(),
+            },
+        )?;
+        if actor == "human"
+            && let Some(question) = question
+        {
+            let exceeded: Option<(String, String)> = tx.query_row(
+                    "SELECT json_extract(payload, '$.budget'), json_extract(payload, '$.resume_state') FROM events WHERE ticket_id = ?1 AND kind = 'budget_exceeded' AND json_extract(payload, '$.question') = ?2 ORDER BY seq DESC LIMIT 1",
+                    params![ticket_id, question], |r| Ok((r.get(0)?, r.get(1)?))
+                ).optional()?;
+            if let Some((budget, resume_state)) = exceeded {
+                let already_extended: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM events WHERE ticket_id = ?1 AND kind = 'budget_extended' AND json_extract(payload, '$.question') = ?2)",
+                        params![ticket_id, question], |r| r.get(0)
+                    )?;
+                if !already_extended {
+                    let budget: crate::domain::BudgetKind =
+                        serde_json::from_value(serde_json::Value::String(budget))?;
+                    let resume_state = resume_state.parse::<TicketState>()?;
+                    append_in(
+                        &tx,
+                        actor,
+                        &Event::BudgetExtended {
+                            ticket_id: ticket_id.to_owned(),
+                            budget,
+                            resume_state,
+                            question,
+                        },
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Records `events` only if fewer than `max` Agent slots are in use, in
     /// one transaction, so two admissions cannot both take the last slot.
     /// Returns whether they were recorded.
@@ -382,11 +435,31 @@ impl Store {
             .transpose()
     }
 
+    pub fn budget_remaining(
+        &self,
+        ticket_id: &str,
+    ) -> Result<Option<crate::budget::BudgetRemaining>> {
+        let preparation = self.preparation(ticket_id)?;
+        let events = self.ticket_events(ticket_id)?;
+        if preparation.is_none() {
+            return Ok(None);
+        }
+        let remaining = crate::budget::remaining(preparation.as_ref(), &events)?;
+        if remaining.helpers.is_none() && remaining.minutes.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(remaining))
+    }
+
     pub fn pending_approval(
         &self,
         ticket_id: &str,
     ) -> Result<Option<crate::domain::ApprovalRequest>> {
         pending_approval_in(&self.conn, ticket_id)
+    }
+
+    pub fn budget_question_pending(&self, ticket_id: &str) -> Result<bool> {
+        budget_question_pending_in(&self.conn, ticket_id)
     }
 
     pub fn decide_approval(
@@ -666,6 +739,20 @@ fn preparation_in(
         .transpose()
 }
 
+pub(crate) fn budget_question_pending_in(tx: &Connection, ticket_id: &str) -> Result<bool> {
+    let open: Option<String> = tx.query_row(
+        "SELECT question FROM tickets WHERE id = ?1",
+        params![ticket_id],
+        |r| r.get(0),
+    )?;
+    let Some(open) = open else { return Ok(false) };
+    let question: Option<String> = tx.query_row(
+        "SELECT json_extract(payload, '$.question') FROM events WHERE ticket_id = ?1 AND kind = 'budget_exceeded' AND NOT EXISTS (SELECT 1 FROM events x WHERE x.ticket_id = events.ticket_id AND x.kind = 'budget_extended' AND json_extract(x.payload, '$.question') = json_extract(events.payload, '$.question')) ORDER BY seq DESC LIMIT 1",
+        params![ticket_id], |r| r.get(0)
+    ).optional()?;
+    Ok(question.as_deref() == Some(open.as_str()))
+}
+
 fn require_attempt_in(
     tx: &Transaction<'_>,
     ticket_id: &str,
@@ -921,7 +1008,16 @@ fn project(
             question,
         } => {
             let state = ticket_state(tx, ticket_id)?;
-            require(ticket_id, state, &[Running, Waiting], "ask on")?;
+            require(ticket_id, state, &[Running, Waiting, Verifying], "ask on")?;
+            if admit && state == Verifying {
+                let is_budget_question: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE ticket_id = ?1 AND kind = 'budget_exceeded' AND json_extract(payload, '$.question') = ?2)",
+                    params![ticket_id, question], |r| r.get(0)
+                )?;
+                if actor != "serve" || !is_budget_question {
+                    bail!("only serve may pause verification for an elapsed time budget");
+                }
+            }
             if pending_approval_in(tx, ticket_id)?.is_some() {
                 bail!("ticket {ticket_id} is waiting for an Approval");
             }
@@ -962,6 +1058,85 @@ fn project(
                     r.close_acknowledged = true;
                 }
             })?;
+        }
+        Event::BudgetExceeded {
+            ticket_id,
+            budget,
+            limit,
+            round,
+            resume_state,
+            question,
+        } => {
+            require(
+                ticket_id,
+                ticket_state(tx, ticket_id)?,
+                &[Running, Waiting, Verifying],
+                "record budget overrun",
+            )?;
+            if admit && actor != "serve" {
+                bail!("only serve may record a budget overrun");
+            }
+            if *budget != crate::domain::BudgetKind::Minutes
+                || *limit == 0
+                || *round == 0
+                || !matches!(resume_state, TicketState::Running | TicketState::Verifying)
+                || question.trim().is_empty()
+            {
+                bail!("invalid budget overrun");
+            }
+            if pending_approval_in(tx, ticket_id)?.is_some() {
+                bail!("ticket {ticket_id} is waiting for an Approval");
+            }
+            let open: Option<String> = tx.query_row(
+                "SELECT question FROM tickets WHERE id = ?1",
+                params![ticket_id],
+                |r| r.get(0),
+            )?;
+            if open.is_some() {
+                bail!("ticket {ticket_id} already has an open question");
+            }
+            let exceeded: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM events WHERE ticket_id = ?1 AND kind = 'budget_exceeded'",
+                params![ticket_id],
+                |r| r.get(0),
+            )?;
+            let extended: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM events WHERE ticket_id = ?1 AND kind = 'budget_extended'",
+                params![ticket_id],
+                |r| r.get(0),
+            )?;
+            if exceeded != extended {
+                bail!("ticket {ticket_id} already has an unanswered budget overrun");
+            }
+            if admit && i64::from(*round) != exceeded + 1 {
+                bail!("budget overrun round is stale or invalid");
+            }
+        }
+        Event::BudgetExtended {
+            ticket_id,
+            budget,
+            resume_state,
+            question,
+        } => {
+            require(
+                ticket_id,
+                ticket_state(tx, ticket_id)?,
+                &[Running],
+                "extend budget",
+            )?;
+            if admit && actor != "human" {
+                bail!("only a human answer may extend a budget");
+            }
+            if *budget != crate::domain::BudgetKind::Minutes {
+                bail!("unsupported budget extension");
+            }
+            let answered: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE ticket_id = ?1 AND kind = 'ticket_answered' AND json_extract(payload, '$.question') = ?2 AND actor = 'human')", params![ticket_id, question], |r| r.get(0))?;
+            let overrun: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE ticket_id = ?1 AND kind = 'budget_exceeded' AND json_extract(payload, '$.budget') = 'minutes' AND json_extract(payload, '$.question') = ?2)", params![ticket_id, question], |r| r.get(0))?;
+            let extended: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE ticket_id = ?1 AND kind = 'budget_extended' AND json_extract(payload, '$.question') = ?2)", params![ticket_id, question], |r| r.get(0))?;
+            if admit && (!answered || !overrun || extended) {
+                bail!("budget extension does not match one unanswered budget question");
+            }
+            set_ticket_state(tx, ticket_id, *resume_state, at)?;
         }
         Event::ApprovalRequested {
             ticket_id,
@@ -1628,6 +1803,168 @@ mod tests {
             )
             .unwrap();
         agent_id
+    }
+
+    #[test]
+    fn answering_a_budget_question_extends_once_and_replays() {
+        let mut store = Store::open_in_memory().unwrap();
+        let ticket = new_ticket(&mut store, true);
+        let id = ticket.id.clone();
+        let coordinator = agent(&mut store, &id);
+        store
+            .append(
+                "serve",
+                Event::TicketDispatched {
+                    ticket_id: id.clone(),
+                    agent_id: coordinator.clone(),
+                },
+            )
+            .unwrap();
+        store
+            .append(
+                "serve",
+                Event::TicketPrepared {
+                    ticket_id: id.clone(),
+                    base_commit: "abc123".into(),
+                    playbook: None,
+                    policy: Some(crate::policy::Policy {
+                        autonomy: crate::policy::Autonomy::A1,
+                        required_approvals: vec![],
+                        verification_attempts: 3,
+                        approvers: Default::default(),
+                        budgets: crate::policy::PolicyBudgets {
+                            helpers: None,
+                            minutes: Some(1),
+                        },
+                    }),
+                },
+            )
+            .unwrap();
+        let question = crate::budget::exceeded_question(1, 1);
+        store
+            .append_all(
+                "serve",
+                &[
+                    Event::BudgetExceeded {
+                        ticket_id: id.clone(),
+                        budget: crate::domain::BudgetKind::Minutes,
+                        limit: 1,
+                        round: 1,
+                        resume_state: TicketState::Running,
+                        question: question.clone(),
+                    },
+                    Event::TicketAsked {
+                        ticket_id: id.clone(),
+                        question: question.clone(),
+                    },
+                    Event::MessageSent {
+                        ticket_id: id.clone(),
+                        from: "rex-projects".into(),
+                        to: coordinator,
+                        body: question.clone(),
+                    },
+                ],
+            )
+            .unwrap();
+        store
+            .answer(
+                "human",
+                &id,
+                Some("Continue".into()),
+                Some(question.clone()),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.ticket_events(&id).unwrap().last().unwrap().event,
+            Event::BudgetExtended { .. }
+        ));
+        assert_eq!(
+            store.budget_remaining(&id).unwrap().unwrap().minutes,
+            Some(2)
+        );
+        assert!(
+            store
+                .answer("human", &id, None, Some(question.clone()))
+                .is_err(),
+            "stale duplicate answer must not add another extension"
+        );
+        assert_eq!(
+            store
+                .ticket_events(&id)
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(e.event, Event::BudgetExtended { .. }))
+                .count(),
+            1
+        );
+        store.rebuild().unwrap();
+        assert_eq!(
+            store.ticket(&id).unwrap().unwrap().state,
+            TicketState::Running
+        );
+        assert_eq!(
+            store
+                .ticket_events(&id)
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(e.event, Event::BudgetExtended { .. }))
+                .count(),
+            1
+        );
+        let next_question = crate::budget::exceeded_question(1, 2);
+        assert_ne!(question, next_question);
+        store
+            .append_all(
+                "serve",
+                &[
+                    Event::BudgetExceeded {
+                        ticket_id: id.clone(),
+                        budget: crate::domain::BudgetKind::Minutes,
+                        limit: 1,
+                        round: 2,
+                        resume_state: TicketState::Running,
+                        question: next_question.clone(),
+                    },
+                    Event::TicketAsked {
+                        ticket_id: id.clone(),
+                        question: next_question.clone(),
+                    },
+                    Event::MessageSent {
+                        ticket_id: id.clone(),
+                        from: "rex-projects".into(),
+                        to: "demo-1-coordinator".into(),
+                        body: next_question.clone(),
+                    },
+                ],
+            )
+            .unwrap();
+        store
+            .answer(
+                "human",
+                &id,
+                Some("Continue again".into()),
+                Some(next_question),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .ticket_events(&id)
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(e.event, Event::BudgetExtended { .. }))
+                .count(),
+            2
+        );
+        store.rebuild().unwrap();
+        assert_eq!(
+            store
+                .ticket_events(&id)
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(e.event, Event::BudgetExtended { .. }))
+                .count(),
+            2
+        );
     }
 
     #[test]

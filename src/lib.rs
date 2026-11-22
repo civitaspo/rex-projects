@@ -1,6 +1,7 @@
 //! rex-projects runs cooperating coding Agents on many Projects at once
 //! inside Rex. See `docs/adr/` for the design.
 
+pub mod budget;
 pub mod cli;
 pub mod config;
 pub mod domain;

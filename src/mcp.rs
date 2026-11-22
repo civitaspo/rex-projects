@@ -154,6 +154,12 @@ impl Server {
         if context.1.role == "coordinator" && context.2.state == TicketState::Verifying {
             bail!("Verification is running; Coordinator work is paused");
         }
+        if context.1.role == "coordinator" && context.2.question.is_some() {
+            let store = Store::open(&self.paths.db_file())?;
+            if store.budget_question_pending(&context.2.id)? {
+                bail!("the time budget question is open; wait for the human's answer");
+            }
+        }
         Ok(context)
     }
 
@@ -177,6 +183,14 @@ impl Server {
     fn append_current(&self, store: &mut Store, events: &[Event]) -> Result<()> {
         store.with_tx(|tx| {
             self.require_current(tx)?;
+            let (role, ticket_id): (String, String) = tx.query_row(
+                "SELECT role, ticket_id FROM agents WHERE id = ?1",
+                rusqlite::params![self.agent_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if role == "coordinator" && crate::store::budget_question_pending_in(tx, &ticket_id)? {
+                bail!("the time budget question is open; wait for the human's answer");
+            }
             for event in events {
                 crate::store::append_in(tx, &self.agent_id, event)?;
             }
@@ -197,6 +211,7 @@ impl Server {
         let playbook = store.preparation(&ticket.id)?.and_then(|p| p.playbook).map(
             |p| json!({"name": p.name, "sha256": p.sha256.chars().take(12).collect::<String>()}),
         );
+        let budget = store.budget_remaining(&ticket.id)?;
         Ok(json!({
             "notice": close_notice(&ticket),
             "project": {"id": ticket.project_id, "goal": goal},
@@ -216,6 +231,7 @@ impl Server {
                 "external_refs": ticket.external_refs,
                 "artifacts": ticket.artifacts,
                 "playbook_snapshot": playbook,
+                "budget_remaining": budget,
             },
         }))
     }
@@ -553,10 +569,39 @@ impl Server {
             .unwrap_or(project.agent_spec(&args.role).provider);
         config.provider(&provider)?;
         let max = config.limits.max_agents as usize;
+        let preparation = store.preparation(&ticket.id)?;
+        let spec = preparation
+            .as_ref()
+            .and_then(|p| p.playbook.as_ref())
+            .and_then(|p| p.spec.as_ref());
+        let helper_limit = crate::budget::effective(
+            spec.and_then(|s| s.budgets.as_ref()),
+            preparation
+                .as_ref()
+                .and_then(|p| p.policy.as_ref())
+                .map(|p| &p.budgets),
+        )
+        .helpers;
+        let verifier_role = spec
+            .and_then(|s| s.verification.as_ref())
+            .and_then(|v| v.verifier.as_ref())
+            .map(|v| v.role.clone());
         // Number the helper, check the slot limit, and record it in one
         // transaction, so parallel spawns neither collide nor overrun.
         let id = store.with_tx(|tx| {
             self.require_current(tx)?;
+            if crate::store::budget_question_pending_in(tx, &ticket.id)? {
+                bail!("the time budget question is open; answer it before spawning another helper");
+            }
+            if let Some(limit) = helper_limit {
+                let used: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM agents WHERE ticket_id = ?1 AND role != 'coordinator' AND (?2 IS NULL OR role != ?2)",
+                    rusqlite::params![ticket.id, verifier_role], |r| r.get(0)
+                )?;
+                if used >= i64::from(limit) {
+                    bail!("the helper budget is {limit}; call ask to request more time or finish with the helpers already started");
+                }
+            }
             let n: i64 = tx.query_row(
                 "SELECT COUNT(*) + 1 FROM agents WHERE ticket_id = ?1 AND role = ?2",
                 rusqlite::params![ticket.id, args.role],
@@ -746,6 +791,7 @@ fn status(store: &Store, ticket_id: &str) -> Result<Value> {
     let t = store
         .ticket(ticket_id)?
         .with_context(|| format!("ticket {ticket_id} does not exist"))?;
+    let budget = store.budget_remaining(ticket_id)?;
     Ok(json!({
         "notice": close_notice(&t),
         "id": t.id,
@@ -758,6 +804,7 @@ fn status(store: &Store, ticket_id: &str) -> Result<Value> {
         "pending_approval": t.pending_approval,
         "outcome": t.outcome,
         "artifacts": t.artifacts,
+        "budget_remaining": budget,
     }))
 }
 
@@ -1011,6 +1058,110 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = dispatched(dir.path());
         (dir, Server::new(paths, agent.into(), None))
+    }
+
+    fn install_helper_budget(server: &Server, limit: u32) {
+        Store::open(&server.paths.db_file())
+            .unwrap()
+            .append(
+                "serve",
+                Event::TicketPrepared {
+                    ticket_id: "demo-1".into(),
+                    base_commit: "abc123".into(),
+                    policy: None,
+                    playbook: Some(crate::playbook::PlaybookSnapshot {
+                        name: "feature".into(),
+                        sha256: "a".repeat(64),
+                        body: String::new(),
+                        spec: Some(crate::playbook::PlaybookSpec {
+                            stages: vec![],
+                            roles: None,
+                            gates: Default::default(),
+                            verification: None,
+                            budgets: Some(crate::playbook::BudgetSpec {
+                                helpers: Some(limit),
+                                minutes: None,
+                            }),
+                        }),
+                    }),
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn helper_budget_is_enforced_and_budget_question_blocks_spawning() {
+        let (_dir, server) = setup("demo-1-coordinator");
+        install_helper_budget(&server, 0);
+        let before = Store::open(&server.paths.db_file())
+            .unwrap()
+            .agents_for_ticket("demo-1")
+            .unwrap()
+            .len();
+        let (is_error, text) = call(
+            &server,
+            "spawn_agent",
+            json!({"role":"worker", "task":"do it"}),
+        );
+        assert!(is_error, "{text}");
+        assert!(
+            text.contains("helper budget is 0") && text.contains("ask"),
+            "{text}"
+        );
+        assert_eq!(
+            Store::open(&server.paths.db_file())
+                .unwrap()
+                .agents_for_ticket("demo-1")
+                .unwrap()
+                .len(),
+            before
+        );
+
+        let (_dir, server) = setup("demo-1-coordinator");
+        install_helper_budget(&server, 2);
+        let mut store = Store::open(&server.paths.db_file()).unwrap();
+        let before = store.agents_for_ticket("demo-1").unwrap().len();
+        let question = crate::budget::exceeded_question(60, 1);
+        let (_, budget_text) = call(&server, "ticket_get", json!({}));
+        assert!(budget_text.contains("\"helpers\": 1"), "{budget_text}");
+        store
+            .append_all(
+                "serve",
+                &[
+                    Event::BudgetExceeded {
+                        ticket_id: "demo-1".into(),
+                        budget: crate::domain::BudgetKind::Minutes,
+                        limit: 60,
+                        round: 1,
+                        resume_state: TicketState::Running,
+                        question: question.clone(),
+                    },
+                    Event::TicketAsked {
+                        ticket_id: "demo-1".into(),
+                        question: question.clone(),
+                    },
+                ],
+            )
+            .unwrap();
+        let (is_error, text) = call(
+            &server,
+            "spawn_agent",
+            json!({"role":"worker", "task":"do it"}),
+        );
+        assert!(
+            is_error && text.contains("budget question is open"),
+            "{text}"
+        );
+        let (is_error, text) = call(
+            &server,
+            "ask",
+            json!({"question":"replace the budget question?"}),
+        );
+        assert!(
+            is_error && text.contains("time budget question is open"),
+            "{text}"
+        );
+        assert_eq!(store.agents_for_ticket("demo-1").unwrap().len(), before);
     }
 
     fn ticket(server: &Server) -> Ticket {

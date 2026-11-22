@@ -135,6 +135,13 @@ fn describe(actor: &str, event: &Event) -> Option<String> {
             Some(answer) => format!("answered by {actor}: {answer}"),
             None => format!("answered by {actor}"),
         },
+        Event::BudgetExceeded { budget, limit, .. } => format!(
+            "{actor} recorded the {} budget overrun (limit: {limit})",
+            budget.label()
+        ),
+        Event::BudgetExtended { budget, .. } => {
+            format!("{actor} extended the {} budget", budget.label())
+        }
         Event::TicketCompleted {
             outcome,
             summary,
