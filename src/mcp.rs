@@ -113,6 +113,7 @@ impl Server {
                     "ticket_get" => self.ticket_get(),
                     "report" => self.report(args),
                     "ask" => self.ask(args),
+                    "request_approval" => self.request_approval(args),
                     "complete" => self.complete(args),
                     "send" => self.send(args),
                     "inbox_read" => self.inbox_read(),
@@ -206,6 +207,7 @@ impl Server {
                 "progress": ticket.progress,
                 "next": ticket.next,
                 "question": ticket.question,
+                "pending_approval": ticket.pending_approval,
                 "blocked_by": blocked_by,
                 "external_refs": ticket.external_refs,
                 "artifacts": ticket.artifacts,
@@ -267,6 +269,59 @@ impl Server {
         )?;
         let mut value = status(&store, &ticket.id)?;
         value["instruction"] = WAIT_INSTRUCTION.into();
+        Ok(value)
+    }
+
+    fn request_approval(&self, args: Value) -> Result<Value> {
+        #[derive(Deserialize)]
+        struct Args {
+            kind: String,
+            summary: String,
+            #[serde(default)]
+            artifacts: Vec<String>,
+        }
+        let args: Args = parse_args(args)?;
+        if args.kind.trim().is_empty() || args.summary.trim().is_empty() {
+            bail!("approval kind and summary must not be empty");
+        }
+        let (mut store, agent, ticket) = self.write_context()?;
+        require_coordinator(&agent, "request an Approval")?;
+        let policy = store.preparation(&ticket.id)?.and_then(|p| p.policy);
+        let nobody = policy
+            .as_ref()
+            .is_some_and(|p| p.approver(&args.kind) == crate::policy::Approver::Nobody);
+        store.with_tx(|tx| {
+            self.require_current(tx)?;
+            crate::store::append_in(
+                tx,
+                &agent.id,
+                &Event::ApprovalRequested {
+                    ticket_id: ticket.id.clone(),
+                    approval_kind: args.kind.clone(),
+                    summary: args.summary.clone(),
+                    artifacts: args.artifacts.clone(),
+                },
+            )?;
+            if nobody {
+                crate::store::append_in(
+                    tx,
+                    "policy",
+                    &Event::ApprovalDecided {
+                        ticket_id: ticket.id.clone(),
+                        approval_kind: args.kind.clone(),
+                        approved: true,
+                        note: Some("Approved by Policy".into()),
+                    },
+                )?;
+            }
+            Ok(())
+        })?;
+        let mut value = status(&store, &ticket.id)?;
+        if nobody {
+            value["approval"] = json!({"kind": args.kind, "approved": true, "actor": "policy"});
+        } else {
+            value["instruction"] = WAIT_INSTRUCTION.into();
+        }
         Ok(value)
     }
 
@@ -595,6 +650,7 @@ fn status(store: &Store, ticket_id: &str) -> Result<Value> {
         "progress": t.progress,
         "next": t.next,
         "question": t.question,
+        "pending_approval": t.pending_approval,
         "outcome": t.outcome,
         "artifacts": t.artifacts,
     }))
@@ -646,6 +702,20 @@ fn tools() -> Value {
                 "type": "object",
                 "properties": {"question": {"type": "string"}},
                 "required": ["question"],
+                "additionalProperties": false,
+            },
+        },
+        {
+            "name": "request_approval",
+            "description": "Coordinator only. Request a human decision for a Gate. The Ticket waits until the human approves or rejects it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "artifacts": artifacts,
+                },
+                "required": ["kind", "summary"],
                 "additionalProperties": false,
             },
         },
@@ -891,6 +961,7 @@ pub(crate) mod tests {
                 "ticket_get",
                 "report",
                 "ask",
+                "request_approval",
                 "complete",
                 "send",
                 "spawn_agent",
@@ -937,6 +1008,7 @@ pub(crate) mod tests {
                             budgets: None,
                         }),
                     }),
+                    policy: None,
                 },
             )
             .unwrap();
@@ -992,6 +1064,47 @@ pub(crate) mod tests {
         let (is_error, text) = call(&server, "report", json!({"summary": "more"}));
         assert!(is_error);
         assert!(text.contains("while it is done"), "{text}");
+    }
+
+    #[test]
+    fn request_approval_waits_for_human_or_records_policy_decision_atomically() {
+        let (_dir, server) = setup("demo-1-coordinator");
+        let mut store = Store::open(&server.paths.db_file()).unwrap();
+        store
+            .append(
+                "serve",
+                Event::TicketPrepared {
+                    ticket_id: "demo-1".into(),
+                    base_commit: "abc123".into(),
+                    playbook: None,
+                    policy: Some(crate::policy::Policy {
+                        autonomy: crate::policy::Autonomy::A1,
+                        required_approvals: vec![],
+                        verification_attempts: 3,
+                        approvers: [("release".into(), crate::policy::Approver::Nobody)].into(),
+                        budgets: Default::default(),
+                    }),
+                },
+            )
+            .unwrap();
+        let (is_error, text) = call(
+            &server,
+            "request_approval",
+            json!({"kind":"release", "summary":"Release it"}),
+        );
+        assert!(!is_error, "{text}");
+        assert!(text.contains("policy"));
+        let ticket = store.ticket("demo-1").unwrap().unwrap();
+        assert_eq!(ticket.state, TicketState::Running);
+        assert_eq!(ticket.pending_approval, None);
+        let events = store.ticket_events("demo-1").unwrap();
+        assert!(events.iter().any(|e| e.actor == "policy"
+            && matches!(e.event, Event::ApprovalDecided { approved: true, .. })));
+        assert!(
+            store.unread("demo-1-coordinator").unwrap()[0]
+                .body
+                .contains("Policy approved")
+        );
     }
 
     #[test]

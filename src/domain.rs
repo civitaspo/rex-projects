@@ -156,6 +156,21 @@ pub enum Event {
         ticket_id: String,
         base_commit: String,
         playbook: Option<crate::playbook::PlaybookSnapshot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy: Option<crate::policy::Policy>,
+    },
+    ApprovalRequested {
+        ticket_id: String,
+        approval_kind: String,
+        summary: String,
+        #[serde(default)]
+        artifacts: Vec<String>,
+    },
+    ApprovalDecided {
+        ticket_id: String,
+        approval_kind: String,
+        approved: bool,
+        note: Option<String>,
     },
     TicketReported {
         ticket_id: String,
@@ -258,6 +273,8 @@ impl Event {
             Self::TicketReadied { .. } => "ticket_readied",
             Self::TicketDispatched { .. } => "ticket_dispatched",
             Self::TicketPrepared { .. } => "ticket_prepared",
+            Self::ApprovalRequested { .. } => "approval_requested",
+            Self::ApprovalDecided { .. } => "approval_decided",
             Self::TicketReported { .. } => "ticket_reported",
             Self::TicketAsked { .. } => "ticket_asked",
             Self::TicketAnswered { .. } => "ticket_answered",
@@ -282,6 +299,8 @@ impl Event {
             | Self::TicketReadied { ticket_id }
             | Self::TicketDispatched { ticket_id, .. }
             | Self::TicketPrepared { ticket_id, .. }
+            | Self::ApprovalRequested { ticket_id, .. }
+            | Self::ApprovalDecided { ticket_id, .. }
             | Self::TicketReported { ticket_id, .. }
             | Self::TicketAsked { ticket_id, .. }
             | Self::TicketAnswered { ticket_id, .. }
@@ -324,6 +343,8 @@ pub struct Ticket {
     pub progress: Option<u8>,
     pub next: Option<String>,
     pub question: Option<String>,
+    #[serde(default)]
+    pub pending_approval: Option<ApprovalRequest>,
     pub priority: i64,
     pub playbook: Option<String>,
     pub blocked_by: Vec<String>,
@@ -333,6 +354,13 @@ pub struct Ticket {
     pub coordinator_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRequest {
+    pub kind: String,
+    pub summary: String,
+    pub artifacts: Vec<String>,
 }
 
 /// The current view of an Agent, projected from events.

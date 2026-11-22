@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::domain::{Agent, Event as StoreEvent, Ticket, TicketState};
+use crate::domain::{Agent, ApprovalRequest, Event as StoreEvent, Ticket, TicketState};
 use crate::history::{self, Entry};
 use crate::paths::Paths;
 use crate::store::Store;
@@ -50,6 +50,7 @@ pub struct TicketRow {
     /// The question while waiting, else the summary, else the title.
     pub text: String,
     pub needs_you: bool,
+    pub pending_approval: Option<ApprovalRequest>,
     pub target: Option<JumpTarget>,
 }
 
@@ -133,8 +134,9 @@ pub fn build_rows(
                     && (a.activity.as_deref() == Some("blocked") || is_silent(t, a, now))
             });
             let closed = t.unacknowledged_closes().next().filter(|_| t.state.is_active());
-            let text = match (&t.question, &t.summary) {
-                (Some(q), _) if t.state == TicketState::Waiting => format!("? {q}"),
+            let text = match (&t.pending_approval, &t.question, &t.summary) {
+                (Some(a), _, _) if t.state == TicketState::Waiting => format!("Approve {}: {}", a.kind, a.summary),
+                (_, Some(q), _) if t.state == TicketState::Waiting => format!("? {q}"),
                 _ if let Some(r) = closed => format!(
                     "{} {} was closed as {} outside rex-projects; cancel the Ticket or tell the Coordinator to continue",
                     r.tracker,
@@ -147,7 +149,7 @@ pub fn build_rows(
                     (Some(a), None) if a == "blocked" => format!("{} is blocked; check its pane", h.id),
                     _ => format!("No status from {}; check its pane", h.id),
                 },
-                (_, Some(s)) => s.clone(),
+                (_, _, Some(s)) => s.clone(),
                 _ => t.title.clone(),
             };
             // Jump to the helper that needs attention, else the Coordinator.
@@ -172,6 +174,7 @@ pub fn build_rows(
                 activity,
                 text: text.replace('\n', " "),
                 needs_you: needs || stuck_helper.is_some(),
+                pending_approval: t.pending_approval.clone(),
                 target,
             }
         })
@@ -219,6 +222,7 @@ enum Action {
     Quit,
     Jump,
     Ready,
+    Approve,
 }
 
 #[derive(Default)]
@@ -256,6 +260,13 @@ impl App {
             KeyCode::Char('a') => self.show_all = !self.show_all,
             KeyCode::Enter => return Action::Jump,
             KeyCode::Char('r') => return Action::Ready,
+            KeyCode::Char('y')
+                if self
+                    .selected_row()
+                    .is_some_and(|row| row.pending_approval.is_some()) =>
+            {
+                return Action::Approve;
+            }
             _ => {}
         }
         Action::None
@@ -375,6 +386,27 @@ fn event_loop(terminal: &mut DefaultTerminal, store: &mut Store, popup: bool) ->
                     Ok(_) => format!("{id} is ready"),
                     Err(err) => format!("cannot ready {id}: {err:#}"),
                 });
+            }
+            Action::Approve => {
+                if let Err(err) = crate::cli::require_human_cli() {
+                    app.status = Some(format!("cannot approve: {err:#}"));
+                    continue;
+                }
+                let Some(row) = app.selected_row() else {
+                    continue;
+                };
+                let id = row.ticket_id.clone();
+                let kind = row
+                    .pending_approval
+                    .as_ref()
+                    .map(|a| a.kind.clone())
+                    .unwrap_or_default();
+                app.status = Some(
+                    match store.decide_approval("human", &id, &kind, true, None) {
+                        Ok(()) => format!("{id} approved {kind}"),
+                        Err(err) => format!("cannot approve {id}: {err:#}"),
+                    },
+                );
             }
         }
     }
@@ -536,7 +568,7 @@ fn draw(frame: &mut Frame, app: &App) {
         frame.render_widget(Paragraph::new(text), area);
     }
 
-    let keys = "j/k move  enter jump  r ready  a all  q quit";
+    let keys = "j/k move  enter jump  r ready  y approve  a all  q quit";
     let footer_text = match &app.status {
         Some(status) => format!("{status}  |  {keys}"),
         None => keys.to_owned(),
@@ -564,6 +596,7 @@ mod tests {
             progress: None,
             next: None,
             question: None,
+            pending_approval: None,
             priority: 0,
             playbook: None,
             blocked_by: Vec::new(),
@@ -636,6 +669,24 @@ mod tests {
                 block: "block:1".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn pending_approval_is_shown_and_y_requests_approval() {
+        let mut t = ticket("demo", 1, TicketState::Waiting);
+        t.pending_approval = Some(ApprovalRequest {
+            kind: "plan".into(),
+            summary: "Review the plan".into(),
+            artifacts: vec![],
+        });
+        let rows = build_rows(std::slice::from_ref(&t), &HashMap::new(), now(), false);
+        assert_eq!(rows[0].text, "Approve plan: Review the plan");
+        assert_eq!(rows[0].section(), NEEDS_YOU);
+        let mut app = App {
+            rows,
+            ..Default::default()
+        };
+        assert_eq!(app.key(KeyCode::Char('y')), Action::Approve);
     }
 
     #[test]

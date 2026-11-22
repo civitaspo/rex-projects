@@ -52,6 +52,36 @@ rex-projects ticket answer demo-1 --text "Use the v2 API"
 
 `--text` types the answer into the Coordinator's pane and presses Return, and only does so while the Coordinator is idle. If you already replied in the pane and the Ticket still shows waiting, run `ticket answer demo-1` without `--text`.
 
+Playbooks can place Approval Gates on Stages. A Coordinator calls `request_approval` with the kind, summary, and artifacts, then waits for the decision. The dashboard shows the request under "Needs you"; press `y` to approve it. Use the CLI to reject with a reason:
+
+For a gated Stage, the Coordinator requests and waits for approval first, then reports entry into that Stage before starting or delegating its work. Stage Gates check reported Stage transitions. They do not sandbox filesystem access, so they cannot prevent an Agent or another process from editing files before approval; enforce stronger boundaries with isolated workspaces and credentials.
+
+```sh
+rex-projects ticket reject demo-1 --note "Add a rollback plan"
+rex-projects ticket approve demo-1 --kind plan
+```
+
+Human-owned policy lives in `policy.toml` beside `config.toml`. rex-projects reads and snapshots each Project's policy when dispatching a Ticket. It does not write this file. A project can require plan approval before delivery and allow Policy to decide non-plan approvals automatically at A1:
+
+```toml
+[projects.demo]
+autonomy = "A1"
+required_approvals = ["plan"]
+verification_attempts = 3
+
+[projects.demo.approvers]
+plan = "human"
+release = "nobody"
+
+[projects.demo.budgets]
+helpers = 8
+minutes = 480
+```
+
+Projects accept A0 and A1. A0 requires human approvers; A1 always requires a human for `plan`. Unlisted approval kinds default to `human`. Policy is protected by convention and the dispatch snapshot, not by file permissions. A prompt typed into a Coordinator's pane can answer an ordinary question, but it never approves a Gate.
+
+**Approval identity is convention, not a security boundary.** The CLI and dashboard reject approval while `REX_PROJECTS_AGENT_ID` is set, and the UI records the decision actor as `human`. An Agent with shell access can unset that variable, invoke the CLI, or write the state database directly. Do not use these approvals to enforce separation between an Agent and a human; that requires isolated credentials and process/database access.
+
 To tell a Coordinator something without interrupting it, leave a message in its inbox. It reaches the Coordinator when its current turn ends. If the Coordinator is idle, `serve` wakes it once it has been idle for 30 seconds, the oldest unread message is 30 seconds old, and its input box is empty, by typing one fixed line that says it has new messages; the messages themselves never go through the terminal. A Coordinator waiting on your answer is not woken: answer it, in its pane or with `ticket answer`, and the messages arrive with your answer:
 
 ```sh

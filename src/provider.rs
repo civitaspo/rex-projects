@@ -564,6 +564,7 @@ mod tests {
                     ticket_id: ticket.id.clone(),
                     base_commit: "abc123".into(),
                     playbook: Some(snapshot),
+                    policy: None,
                 },
             )
             .unwrap();

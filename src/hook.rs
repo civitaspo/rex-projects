@@ -115,7 +115,11 @@ pub fn handle(
         .with_context(|| format!("ticket {} does not exist", agent.ticket_id))?;
     // The wake token typed by `serve` is not a human's answer.
     let woken = payload.prompt.as_deref().map(str::trim) == Some(crate::inbox::WAKE_TOKEN);
-    if agent.role == "coordinator" && ticket.state == TicketState::Waiting && !woken {
+    if agent.role == "coordinator"
+        && ticket.state == TicketState::Waiting
+        && ticket.pending_approval.is_none()
+        && !woken
+    {
         store.append(
             "human",
             Event::TicketAnswered {
@@ -225,6 +229,40 @@ mod tests {
                 answer: Some("Use v2".into()),
                 question: Some("Which API?".into()),
             }
+        );
+    }
+
+    #[test]
+    fn typed_prompt_does_not_decide_or_clear_pending_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = dispatched(dir.path());
+        let mut store = Store::open(&paths.db_file()).unwrap();
+        store
+            .append(
+                "demo-1-coordinator",
+                Event::ApprovalRequested {
+                    ticket_id: "demo-1".into(),
+                    approval_kind: "plan".into(),
+                    summary: "Review plan".into(),
+                    artifacts: vec![],
+                },
+            )
+            .unwrap();
+        prompt(&paths, "demo-1-coordinator", None).unwrap();
+        let ticket = Store::open(&paths.db_file())
+            .unwrap()
+            .ticket("demo-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ticket.state, TicketState::Waiting);
+        assert_eq!(ticket.pending_approval.unwrap().kind, "plan");
+        assert!(
+            !Store::open(&paths.db_file())
+                .unwrap()
+                .ticket_events("demo-1")
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event.event, Event::TicketAnswered { .. }))
         );
     }
 
