@@ -82,6 +82,14 @@ Projects accept A0 and A1. A0 requires human approvers; A1 always requires a hum
 
 **Approval identity is convention, not a security boundary.** The CLI and dashboard reject approval while `REX_PROJECTS_AGENT_ID` is set, and the UI records the decision actor as `human`. An Agent with shell access can unset that variable, invoke the CLI, or write the state database directly. Do not use these approvals to enforce separation between an Agent and a human; that requires isolated credentials and process/database access.
 
+### Verification and budgets
+
+Projects can configure a default Playbook in the repository at `.rex-projects/playbooks/<name>/SKILL.md`. A Playbook can define Stages, allowed helper Roles, Approval Gates, verification checks, an optional independent Verifier, and helper or time budgets. When a Coordinator reports `complete(delivered)`, a Ticket with verification configured moves to `verifying`. `serve` runs the checks in the Ticket worktree; if they pass, it starts the declared Verifier. Passing verification completes the Ticket. A failed check or Verifier report returns findings to the Coordinator for another attempt. After the configured attempt limit (three by default), rex-projects asks the human.
+
+The effective helper and time limits are the stricter values from the Playbook and the Project's `policy.toml`. `ticket show <id>` and the `ticket_get` MCP result include the remaining budget. When the time limit expires, rex-projects asks whether to continue. A human answer extends the original time allowance once for that question. Verification commands may run again after `serve` exits before it records their result, so configure checks that are safe to repeat.
+
+This repository includes a [default Playbook](.rex-projects/playbooks/default/SKILL.md) and a [user-facing verification guide](.rex-projects/verification/SKILL.md). The Playbook requires plan approval before implementation and checks lint, tests, and required pull request checks. Those checks need a pull request and authenticated `gh` CLI to run successfully.
+
 To tell a Coordinator something without interrupting it, leave a message in its inbox. It reaches the Coordinator when its current turn ends. If the Coordinator is idle, `serve` wakes it once it has been idle for 30 seconds, the oldest unread message is 30 seconds old, and its input box is empty, by typing one fixed line that says it has new messages; the messages themselves never go through the terminal. A Coordinator waiting on your answer is not woken: answer it, in its pane or with `ticket answer`, and the messages arrive with your answer:
 
 ```sh
