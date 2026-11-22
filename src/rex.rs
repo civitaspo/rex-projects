@@ -275,6 +275,9 @@ impl Rex for RexCli {
     fn submit(&mut self, session_id: &str, block_id: &str, text: &str) -> Result<()> {
         // The text goes through stdin so that a leading `-` is not a flag.
         self.run(&["send", "-s", session_id, "-b", block_id], text)?;
+        // Codex groups rapid terminal input as a paste. An immediate Return
+        // can be absorbed into a long paste instead of submitting the prompt.
+        std::thread::sleep(std::time::Duration::from_millis(300));
         self.run(&["send-key", "-s", session_id, "-b", block_id, "enter"], "")
     }
 }
