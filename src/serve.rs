@@ -346,6 +346,7 @@ impl<R: Rex> Serve<R> {
     /// after a process restart; check commands therefore have at-least-once
     /// execution across the narrow process-death window before event commit.
     fn advance_verification_checks(&mut self) -> Result<()> {
+        let helper_close_failures = self.close_verification_helpers()?;
         let finished: Vec<_> = self
             .verification_checks
             .iter()
@@ -423,6 +424,9 @@ impl<R: Rex> Serve<R> {
             .into_iter()
             .filter(|t| t.state == TicketState::Verifying)
         {
+            if helper_close_failures.contains(&ticket.id) {
+                continue;
+            }
             let Some(prep) = self.store.preparation(&ticket.id)? else {
                 continue;
             };
@@ -478,14 +482,78 @@ impl<R: Rex> Serve<R> {
         Ok(())
     }
 
+    /// A delivered Ticket may be completed between the tick's reconciliation
+    /// pass and this method. Close every helper pane synchronously before a
+    /// check or verifier can inspect the shared worktree.
+    fn close_verification_helpers(&mut self) -> Result<std::collections::HashSet<String>> {
+        let mut blocked = std::collections::HashSet::new();
+        let verifying: Vec<_> = self
+            .store
+            .tickets(None)?
+            .into_iter()
+            .filter(|ticket| ticket.state == TicketState::Verifying)
+            .collect();
+        for ticket in verifying {
+            let assigned_verifiers: std::collections::HashSet<String> = self
+                .store
+                .ticket_events(&ticket.id)?
+                .into_iter()
+                .filter_map(|stored| match stored.event {
+                    Event::VerificationVerifierAssigned { agent_id, .. } => Some(agent_id),
+                    _ => None,
+                })
+                .collect();
+            for helper in self
+                .store
+                .agents_for_ticket(&ticket.id)?
+                .into_iter()
+                .filter(|agent| {
+                    agent.role != "coordinator"
+                        && agent.state != "exited"
+                        && !assigned_verifiers.contains(&agent.id)
+                })
+            {
+                let result = (|| -> Result<()> {
+                    if let (Some(session), Some(block)) =
+                        (&helper.rex_session_id, &helper.rex_block_id)
+                        && self
+                            .rex
+                            .block_ids(session)?
+                            .iter()
+                            .any(|candidate| candidate == block)
+                    {
+                        self.rex.close_block(session, block)?;
+                    }
+                    self.append(Event::AgentExited {
+                        agent_id: helper.id.clone(),
+                        reason: "verification started".into(),
+                    })?;
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    blocked.insert(ticket.id.clone());
+                    println!(
+                        "{}: helper pane must close before verification: {error:#}",
+                        helper.id
+                    );
+                }
+            }
+        }
+        Ok(blocked)
+    }
+
     /// Creates and starts the Playbook's verifier after all declared checks pass.
     fn ensure_verifiers(&mut self) -> Result<()> {
+        let helper_close_failures = self.close_verification_helpers()?;
         for ticket in self
             .store
             .tickets(None)?
             .into_iter()
             .filter(|t| t.state == TicketState::Verifying)
         {
+            if helper_close_failures.contains(&ticket.id) {
+                continue;
+            }
             let Some(prep) = self.store.preparation(&ticket.id)? else {
                 continue;
             };
@@ -660,6 +728,17 @@ impl<R: Rex> Serve<R> {
         ) else {
             return self.launch(agent, ticket, false);
         };
+        // Rex split can hang on an anchor that was closed after the last
+        // reconciliation. Validate the block before asking Rex to split it.
+        if coordinator.state != "running"
+            || !self
+                .rex
+                .block_ids(&session)?
+                .iter()
+                .any(|block| block == &anchor)
+        {
+            return self.launch(agent, ticket, false);
+        }
         let command = self.agent_command(agent);
         let block = self
             .rex
@@ -1262,6 +1341,227 @@ mod tests {
         fn events(&self) -> usize {
             self.serve.store.events_since(0, 1000).unwrap().len()
         }
+    }
+
+    #[test]
+    fn verifier_falls_back_to_new_window_when_coordinator_anchor_closed() {
+        let mut f = fixture();
+        let id = "demo-1";
+        let cwd = f.serve.paths.worktree_dir("demo", id);
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&f.serve.paths.config_dir).unwrap();
+        std::fs::write(
+            f.serve.paths.config_file(),
+            format!("[[projects]]\nid = 'demo'\nrepo = {:?}\n", f._dirs.0.path()),
+        )
+        .unwrap();
+        let session = f
+            .serve
+            .rex
+            .ensure_session("rex-projects:demo", None)
+            .unwrap();
+        let coordinator_window = f
+            .serve
+            .rex
+            .new_window(&session, "Coordinator", &["true".into()], &cwd)
+            .unwrap();
+        f.serve
+            .store
+            .append_all(
+                "serve",
+                &[
+                    Event::AgentCreated {
+                        agent_id: "demo-1-coordinator".into(),
+                        ticket_id: id.into(),
+                        project_id: "demo".into(),
+                        role: "coordinator".into(),
+                        provider: "claude".into(),
+                        cwd: cwd.display().to_string(),
+                    },
+                    Event::TicketDispatched {
+                        ticket_id: id.into(),
+                        agent_id: "demo-1-coordinator".into(),
+                    },
+                    Event::TicketPrepared {
+                        ticket_id: id.into(),
+                        base_commit: "abc123".into(),
+                        playbook: Some(crate::playbook::PlaybookSnapshot {
+                            name: "feature".into(),
+                            sha256: "a".repeat(64),
+                            body: String::new(),
+                            spec: Some(crate::playbook::PlaybookSpec {
+                                stages: vec![],
+                                roles: Some(vec!["reviewer".into()]),
+                                gates: Default::default(),
+                                budgets: None,
+                                verification: Some(crate::playbook::VerificationSpec {
+                                    checks: vec![],
+                                    verifier: Some(crate::playbook::VerifierSpec {
+                                        role: "reviewer".into(),
+                                    }),
+                                }),
+                            }),
+                        }),
+                        policy: None,
+                    },
+                    Event::AgentLaunched {
+                        agent_id: "demo-1-coordinator".into(),
+                        rex_session_id: session.clone(),
+                        rex_window_id: coordinator_window.window_id.clone(),
+                        rex_block_id: coordinator_window.block_id.clone(),
+                        resume: false,
+                    },
+                    Event::TicketCompleted {
+                        ticket_id: id.into(),
+                        outcome: Outcome::Delivered,
+                        summary: "Ready to verify".into(),
+                        artifacts: vec![],
+                    },
+                ],
+            )
+            .unwrap();
+
+        // First tick creates and assigns the verifier. Then remove the anchor
+        // without updating the database, as when a pane closes between ticks.
+        f.serve.ensure_verifiers().unwrap();
+        f.serve.rex.blocks.remove(&coordinator_window.block_id);
+        f.serve.ensure_verifiers().unwrap();
+        // A later verifier-management tick must preserve the assigned verifier
+        // rather than treating it as a pre-existing helper to stop.
+        f.serve.ensure_verifiers().unwrap();
+
+        let verifier = f.serve.store.agent("demo-1-reviewer-1").unwrap().unwrap();
+        assert_eq!(verifier.state, "running");
+        let block = verifier.rex_block_id.unwrap();
+        let block = f.serve.rex.blocks.get(&block).unwrap();
+        assert!(block.split_from.is_none(), "stale anchor uses a new window");
+        assert_eq!(block.session_id, session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closes_helper_pane_before_starting_a_check() {
+        let mut f = fixture();
+        let id = "demo-1";
+        let cwd = f.serve.paths.worktree_dir("demo", id);
+        std::fs::create_dir_all(&cwd).unwrap();
+        let marker = f._dirs.1.path().join("helper-closed");
+        f.serve.rex.close_marker = Some(marker.clone());
+        let session = f
+            .serve
+            .rex
+            .ensure_session("rex-projects:demo", None)
+            .unwrap();
+        let coordinator_window = f
+            .serve
+            .rex
+            .new_window(&session, "Coordinator", &["true".into()], &cwd)
+            .unwrap();
+        let helper_window = f
+            .serve
+            .rex
+            .new_window(&session, "Helper", &["true".into()], &cwd)
+            .unwrap();
+        f.serve
+            .store
+            .append_all(
+                "serve",
+                &[
+                    Event::AgentCreated {
+                        agent_id: "demo-1-coordinator".into(),
+                        ticket_id: id.into(),
+                        project_id: "demo".into(),
+                        role: "coordinator".into(),
+                        provider: "claude".into(),
+                        cwd: cwd.display().to_string(),
+                    },
+                    Event::TicketDispatched {
+                        ticket_id: id.into(),
+                        agent_id: "demo-1-coordinator".into(),
+                    },
+                    Event::TicketPrepared {
+                        ticket_id: id.into(),
+                        base_commit: "abc123".into(),
+                        playbook: Some(crate::playbook::PlaybookSnapshot {
+                            name: "feature".into(),
+                            sha256: "a".repeat(64),
+                            body: String::new(),
+                            spec: Some(crate::playbook::PlaybookSpec {
+                                stages: vec![],
+                                roles: None,
+                                gates: Default::default(),
+                                budgets: None,
+                                verification: Some(crate::playbook::VerificationSpec {
+                                    checks: vec![crate::playbook::CheckSpec {
+                                        name: "pane-closed-first".into(),
+                                        argv: vec![
+                                            "sh".into(),
+                                            "-c".into(),
+                                            format!("test -s {:?}", marker),
+                                        ],
+                                        timeout_minutes: Some(1),
+                                    }],
+                                    verifier: None,
+                                }),
+                            }),
+                        }),
+                        policy: None,
+                    },
+                    Event::AgentLaunched {
+                        agent_id: "demo-1-coordinator".into(),
+                        rex_session_id: session.clone(),
+                        rex_window_id: coordinator_window.window_id,
+                        rex_block_id: coordinator_window.block_id,
+                        resume: false,
+                    },
+                    Event::AgentCreated {
+                        agent_id: "demo-1-worker-1".into(),
+                        ticket_id: id.into(),
+                        project_id: "demo".into(),
+                        role: "worker".into(),
+                        provider: "claude".into(),
+                        cwd: cwd.display().to_string(),
+                    },
+                    Event::AgentLaunched {
+                        agent_id: "demo-1-worker-1".into(),
+                        rex_session_id: session,
+                        rex_window_id: helper_window.window_id,
+                        rex_block_id: helper_window.block_id.clone(),
+                        resume: false,
+                    },
+                    Event::TicketCompleted {
+                        ticket_id: id.into(),
+                        outcome: Outcome::Delivered,
+                        summary: "Ready to verify".into(),
+                        artifacts: vec![],
+                    },
+                ],
+            )
+            .unwrap();
+
+        f.serve.advance_verification_checks().unwrap();
+        assert!(!f.serve.rex.blocks.contains_key(&helper_window.block_id));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while f.state() == TicketState::Verifying && Instant::now() < deadline {
+            f.serve.advance_verification_checks().unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            f.state(),
+            TicketState::Done,
+            "check observed the close marker before running"
+        );
+        let events = f.serve.store.ticket_events(id).unwrap();
+        let exit_seq = events.iter().find(|e| matches!(&e.event, Event::AgentExited { agent_id, .. } if agent_id == "demo-1-worker-1")).unwrap().seq;
+        let check_seq = events
+            .iter()
+            .find(|e| matches!(&e.event, Event::VerificationCheckStarted { .. }))
+            .unwrap()
+            .seq;
+        assert!(
+            exit_seq < check_seq,
+            "helper exit must be recorded before check start"
+        );
     }
 
     #[cfg(unix)]

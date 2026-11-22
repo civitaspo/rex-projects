@@ -1433,10 +1433,10 @@ fn project(
             ..
         } => {
             require_agent(tx, agent_id)?;
-            let (state, ticket_id): (String, String) = tx.query_row(
-                "SELECT state, ticket_id FROM agents WHERE id = ?1",
+            let (state, ticket_id, role): (String, String, String) = tx.query_row(
+                "SELECT state, ticket_id, role FROM agents WHERE id = ?1",
                 params![agent_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
             if admit && state == "finished" {
                 bail!("agent {agent_id} was stopped before it launched");
@@ -1444,6 +1444,18 @@ fn project(
             let ticket = ticket_state(tx, &ticket_id)?;
             if admit && ticket.is_terminal() {
                 bail!("ticket {ticket_id} is {ticket}; agent {agent_id} cannot launch");
+            }
+            if admit && ticket == Verifying && role != "coordinator" {
+                let failures: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM events WHERE ticket_id = ?1 AND kind = 'verification_failed'",
+                    params![ticket_id],
+                    |r| r.get(0),
+                )?;
+                if assigned_verifier_in(tx, &ticket_id, failures as u32 + 1)?.as_deref()
+                    != Some(agent_id)
+                {
+                    bail!("Verification is running; only the assigned verifier may launch");
+                }
             }
             tx.execute(
                 "UPDATE agents SET state = 'running', rex_session_id = ?2, rex_window_id = ?3,
@@ -2086,12 +2098,12 @@ mod tests {
                         provider: "claude".into(),
                         cwd: "/tmp".into(),
                     },
-                    launched(&verifier_id),
                     Event::VerificationVerifierAssigned {
                         ticket_id: id.clone(),
                         attempt: 1,
                         agent_id: verifier_id.clone(),
                     },
+                    launched(&verifier_id),
                     Event::AgentCreated {
                         agent_id: replacement_id.clone(),
                         ticket_id: id.clone(),
@@ -2100,12 +2112,12 @@ mod tests {
                         provider: "claude".into(),
                         cwd: "/tmp".into(),
                     },
-                    launched(&replacement_id),
                     Event::VerificationVerifierAssigned {
                         ticket_id: id.clone(),
                         attempt: 1,
                         agent_id: replacement_id.clone(),
                     },
+                    launched(&replacement_id),
                 ],
             )
             .unwrap();
