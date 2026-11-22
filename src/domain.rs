@@ -194,6 +194,20 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         question: Option<String>,
     },
+    BudgetExceeded {
+        ticket_id: String,
+        budget: BudgetKind,
+        limit: u32,
+        round: u32,
+        resume_state: TicketState,
+        question: String,
+    },
+    BudgetExtended {
+        ticket_id: String,
+        budget: BudgetKind,
+        resume_state: TicketState,
+        question: String,
+    },
     TicketCompleted {
         ticket_id: String,
         outcome: Outcome,
@@ -295,6 +309,20 @@ pub enum Event {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetKind {
+    Minutes,
+}
+
+impl BudgetKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Minutes => "minutes",
+        }
+    }
+}
+
 impl Event {
     pub fn kind(&self) -> &'static str {
         match self {
@@ -307,6 +335,8 @@ impl Event {
             Self::TicketReported { .. } => "ticket_reported",
             Self::TicketAsked { .. } => "ticket_asked",
             Self::TicketAnswered { .. } => "ticket_answered",
+            Self::BudgetExceeded { .. } => "budget_exceeded",
+            Self::BudgetExtended { .. } => "budget_extended",
             Self::TicketCompleted { .. } => "ticket_completed",
             Self::VerificationCheckStarted { .. } => "verification_check_started",
             Self::VerificationCheckFinished { .. } => "verification_check_finished",
@@ -338,6 +368,8 @@ impl Event {
             | Self::TicketReported { ticket_id, .. }
             | Self::TicketAsked { ticket_id, .. }
             | Self::TicketAnswered { ticket_id, .. }
+            | Self::BudgetExceeded { ticket_id, .. }
+            | Self::BudgetExtended { ticket_id, .. }
             | Self::TicketCompleted { ticket_id, .. }
             | Self::VerificationCheckStarted { ticket_id, .. }
             | Self::VerificationCheckFinished { ticket_id, .. }

@@ -120,13 +120,11 @@ pub fn handle(
         && ticket.pending_approval.is_none()
         && !woken
     {
-        store.append(
+        store.answer(
             "human",
-            Event::TicketAnswered {
-                ticket_id: ticket.id,
-                answer: payload.prompt.map(|p| truncate(&p)),
-                question: ticket.question,
-            },
+            &ticket.id,
+            payload.prompt.map(|p| truncate(&p)),
+            ticket.question,
         )?;
     }
     // Unread messages ride along with the human's prompt.
@@ -230,6 +228,66 @@ mod tests {
                 question: Some("Which API?".into()),
             }
         );
+    }
+
+    #[test]
+    fn typed_prompt_extends_an_answered_time_budget_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = dispatched(dir.path());
+        let mut store = Store::open(&paths.db_file()).unwrap();
+        store
+            .append(
+                "serve",
+                Event::TicketPrepared {
+                    ticket_id: "demo-1".into(),
+                    base_commit: "abc123".into(),
+                    playbook: None,
+                    policy: Some(crate::policy::Policy {
+                        autonomy: crate::policy::Autonomy::A1,
+                        required_approvals: vec![],
+                        verification_attempts: 3,
+                        approvers: Default::default(),
+                        budgets: crate::policy::PolicyBudgets {
+                            helpers: None,
+                            minutes: Some(5),
+                        },
+                    }),
+                },
+            )
+            .unwrap();
+        let question = crate::budget::exceeded_question(5, 1);
+        store
+            .append_all(
+                "serve",
+                &[
+                    Event::BudgetExceeded {
+                        ticket_id: "demo-1".into(),
+                        budget: crate::domain::BudgetKind::Minutes,
+                        limit: 5,
+                        round: 1,
+                        resume_state: TicketState::Running,
+                        question: question.clone(),
+                    },
+                    Event::TicketAsked {
+                        ticket_id: "demo-1".into(),
+                        question,
+                    },
+                ],
+            )
+            .unwrap();
+        prompt(&paths, "demo-1-coordinator", None).unwrap();
+        let events = Store::open(&paths.db_file())
+            .unwrap()
+            .ticket_events("demo-1")
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e.event, Event::BudgetExtended { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(events.last().unwrap().event.kind(), "budget_extended");
     }
 
     #[test]

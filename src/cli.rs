@@ -397,8 +397,10 @@ fn ticket(paths: &Paths, command: TicketCommand) -> Result<()> {
                 .ticket(&id)?
                 .with_context(|| format!("ticket {id} does not exist"))?;
             let playbook = store.preparation(&id)?.and_then(|p| p.playbook);
+            let budget = store.budget_remaining(&id)?;
             if json {
                 let mut value = serde_json::to_value(&ticket)?;
+                value["budget_remaining"] = serde_json::to_value(budget)?;
                 if let Some(playbook) = playbook {
                     value["playbook_snapshot"] = serde_json::json!({
                         "name": playbook.name,
@@ -409,6 +411,18 @@ fn ticket(paths: &Paths, command: TicketCommand) -> Result<()> {
             } else {
                 let mut out = std::io::stdout().lock();
                 print_ticket(&mut out, &ticket)?;
+                if let Some(budget) = budget {
+                    let helpers = budget
+                        .helpers
+                        .map_or_else(|| "unbounded".into(), |n| n.to_string());
+                    let minutes = budget
+                        .minutes
+                        .map_or_else(|| "unbounded".into(), |n| n.to_string());
+                    writeln!(
+                        out,
+                        "budget remaining: {helpers} helpers, {minutes} minutes"
+                    )?;
+                }
                 if let Some(playbook) = playbook {
                     writeln!(
                         out,
@@ -723,14 +737,7 @@ fn answer(
         rex.submit(&session, &block, text)?;
     }
     let sent = text.is_some();
-    let answered = store.append(
-        actor,
-        Event::TicketAnswered {
-            ticket_id: id.to_owned(),
-            answer: text,
-            question: Some(question.clone()),
-        },
-    );
+    let answered = store.answer(actor, id, text, Some(question.clone()));
     match answered {
         Ok(_) => Ok(()),
         // The harness's prompt hook recorded the answer first, and the

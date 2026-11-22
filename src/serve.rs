@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 
 use crate::config::{Config, ProviderKind};
-use crate::domain::{Agent, Event, Ticket, TicketState};
+use crate::domain::{Agent, BudgetKind, Event, Ticket, TicketState};
 use crate::paths::Paths;
 use crate::provider;
 use crate::rex::{Rex, RexCli};
@@ -139,12 +139,112 @@ impl<R: Rex> Serve<R> {
         }
         self.release_done_panes = false;
         self.advance_verification_checks()?;
+        self.enforce_time_budgets()?;
         self.ensure_coordinators()?;
         self.dispatch(config)?;
         self.ensure_coordinators()?;
         self.launch_helpers()?;
         self.ensure_verifiers()?;
         self.wake_idle_agents()
+    }
+
+    fn enforce_time_budgets(&mut self) -> Result<()> {
+        for ticket in self
+            .store
+            .tickets(None)?
+            .into_iter()
+            .filter(|t| matches!(t.state, TicketState::Running | TicketState::Verifying))
+        {
+            if ticket.question.is_some() || ticket.pending_approval.is_some() {
+                continue;
+            }
+            let Some(preparation) = self.store.preparation(&ticket.id)? else {
+                continue;
+            };
+            let events = self.store.ticket_events(&ticket.id)?;
+            let spec = preparation.playbook.as_ref().and_then(|p| p.spec.as_ref());
+            let limits = crate::budget::effective(
+                spec.and_then(|s| s.budgets.as_ref()),
+                preparation.policy.as_ref().map(|p| &p.budgets),
+            );
+            let Some(limit) = limits.minutes else {
+                continue;
+            };
+            let exceedances = events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e.event,
+                        Event::BudgetExceeded {
+                            budget: BudgetKind::Minutes,
+                            ..
+                        }
+                    )
+                })
+                .count();
+            let extensions = events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e.event,
+                        Event::BudgetExtended {
+                            budget: BudgetKind::Minutes,
+                            ..
+                        }
+                    )
+                })
+                .count();
+            if exceedances > extensions {
+                continue;
+            }
+            let Some(dispatch) = events
+                .iter()
+                .find(|e| matches!(e.event, Event::TicketDispatched { .. }))
+                .and_then(|e| chrono::DateTime::parse_from_rfc3339(&e.at).ok())
+            else {
+                continue;
+            };
+            let elapsed = chrono::Utc::now()
+                .signed_duration_since(dispatch)
+                .to_std()
+                .unwrap_or_default();
+            if !crate::budget::time_exceeded(Some(limit), extensions as u32, elapsed)? {
+                continue;
+            }
+            let round = u32::try_from(exceedances + 1).unwrap_or(u32::MAX);
+            let question = crate::budget::exceeded_question(limit, round);
+            let mut pending = vec![
+                Event::BudgetExceeded {
+                    ticket_id: ticket.id.clone(),
+                    budget: BudgetKind::Minutes,
+                    limit,
+                    round,
+                    resume_state: ticket.state,
+                    question: question.clone(),
+                },
+                Event::TicketAsked {
+                    ticket_id: ticket.id.clone(),
+                    question: question.clone(),
+                },
+            ];
+            if let Some(coordinator) = ticket.coordinator_id {
+                pending.push(Event::MessageSent {
+                    ticket_id: ticket.id.clone(),
+                    from: "rex-projects".into(),
+                    to: coordinator,
+                    body: question,
+                });
+            }
+            if let Err(err) = self.store.append_all(ACTOR, &pending) {
+                // Another serve loop may have asked or an Agent may have asked
+                // a question between the read and this atomic write.
+                println!(
+                    "{}: budget check raced with another state change: {err:#}",
+                    ticket.id
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Types the wake token into Agents that sit idle with unread messages,
@@ -1561,6 +1661,204 @@ mod tests {
         assert!(
             exit_seq < check_seq,
             "helper exit must be recorded before check start"
+        );
+    }
+
+    #[test]
+    fn asks_once_per_time_budget_overrun_and_extends_on_each_answer() {
+        let mut f = fixture();
+        let id = "demo-1";
+        f.serve
+            .store
+            .append_all(
+                "serve",
+                &[
+                    Event::AgentCreated {
+                        agent_id: "demo-1-coordinator".into(),
+                        ticket_id: id.into(),
+                        project_id: "demo".into(),
+                        role: "coordinator".into(),
+                        provider: "claude".into(),
+                        cwd: "/tmp".into(),
+                    },
+                    Event::TicketDispatched {
+                        ticket_id: id.into(),
+                        agent_id: "demo-1-coordinator".into(),
+                    },
+                    Event::TicketPrepared {
+                        ticket_id: id.into(),
+                        base_commit: "abc123".into(),
+                        playbook: None,
+                        policy: Some(crate::policy::Policy {
+                            autonomy: crate::policy::Autonomy::A1,
+                            required_approvals: vec![],
+                            verification_attempts: 3,
+                            approvers: Default::default(),
+                            budgets: crate::policy::PolicyBudgets {
+                                helpers: None,
+                                minutes: Some(1),
+                            },
+                        }),
+                    },
+                ],
+            )
+            .unwrap();
+        let old = (chrono::Utc::now() - chrono::Duration::minutes(2)).to_rfc3339();
+        f.serve
+            .store
+            .conn()
+            .execute(
+                "UPDATE events SET at = ?1 WHERE kind = 'ticket_dispatched' AND ticket_id = ?2",
+                rusqlite::params![old, id],
+            )
+            .unwrap();
+        f.serve.enforce_time_budgets().unwrap();
+        f.serve.enforce_time_budgets().unwrap();
+        assert_eq!(
+            f.serve.store.ticket(id).unwrap().unwrap().state,
+            TicketState::Waiting
+        );
+        assert_eq!(
+            f.serve
+                .store
+                .ticket_events(id)
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(e.event, Event::BudgetExceeded { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(f.serve.store.unread("demo-1-coordinator").unwrap().len(), 1);
+        let first = f.serve.store.ticket(id).unwrap().unwrap().question.unwrap();
+        f.serve
+            .store
+            .answer("human", id, Some("Continue".into()), Some(first))
+            .unwrap();
+
+        let old = (chrono::Utc::now() - chrono::Duration::minutes(3)).to_rfc3339();
+        f.serve
+            .store
+            .conn()
+            .execute(
+                "UPDATE events SET at = ?1 WHERE kind = 'ticket_dispatched' AND ticket_id = ?2",
+                rusqlite::params![old, id],
+            )
+            .unwrap();
+        f.serve.enforce_time_budgets().unwrap();
+        let second = f.serve.store.ticket(id).unwrap().unwrap().question.unwrap();
+        assert!(second.contains("extension 2"), "{second}");
+        f.serve
+            .store
+            .answer("human", id, Some("Continue again".into()), Some(second))
+            .unwrap();
+        assert_eq!(
+            f.serve
+                .store
+                .ticket_events(id)
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(e.event, Event::BudgetExtended { .. }))
+                .count(),
+            2
+        );
+        f.serve.store.rebuild().unwrap();
+        assert_eq!(
+            f.serve.store.ticket(id).unwrap().unwrap().state,
+            TicketState::Running
+        );
+    }
+
+    #[test]
+    fn a_time_budget_answer_resumes_the_verification_state() {
+        let mut f = fixture();
+        let id = "demo-1";
+        f.serve
+            .store
+            .append_all(
+                "serve",
+                &[
+                    Event::AgentCreated {
+                        agent_id: "demo-1-coordinator".into(),
+                        ticket_id: id.into(),
+                        project_id: "demo".into(),
+                        role: "coordinator".into(),
+                        provider: "claude".into(),
+                        cwd: "/tmp".into(),
+                    },
+                    Event::TicketDispatched {
+                        ticket_id: id.into(),
+                        agent_id: "demo-1-coordinator".into(),
+                    },
+                    Event::TicketPrepared {
+                        ticket_id: id.into(),
+                        base_commit: "abc123".into(),
+                        playbook: Some(crate::playbook::PlaybookSnapshot {
+                            name: "feature".into(),
+                            sha256: "a".repeat(64),
+                            body: String::new(),
+                            spec: Some(crate::playbook::PlaybookSpec {
+                                stages: vec![],
+                                roles: None,
+                                gates: Default::default(),
+                                budgets: None,
+                                verification: Some(crate::playbook::VerificationSpec {
+                                    checks: vec![],
+                                    verifier: None,
+                                }),
+                            }),
+                        }),
+                        policy: Some(crate::policy::Policy {
+                            autonomy: crate::policy::Autonomy::A1,
+                            required_approvals: vec![],
+                            verification_attempts: 3,
+                            approvers: Default::default(),
+                            budgets: crate::policy::PolicyBudgets {
+                                helpers: None,
+                                minutes: Some(1),
+                            },
+                        }),
+                    },
+                ],
+            )
+            .unwrap();
+        f.serve
+            .store
+            .append(
+                "demo-1-coordinator",
+                Event::TicketCompleted {
+                    ticket_id: id.into(),
+                    outcome: Outcome::Delivered,
+                    summary: "ready to verify".into(),
+                    artifacts: vec![],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            f.serve.store.ticket(id).unwrap().unwrap().state,
+            TicketState::Verifying
+        );
+        let old = (chrono::Utc::now() - chrono::Duration::minutes(2)).to_rfc3339();
+        f.serve
+            .store
+            .conn()
+            .execute(
+                "UPDATE events SET at = ?1 WHERE kind = 'ticket_dispatched' AND ticket_id = ?2",
+                rusqlite::params![old, id],
+            )
+            .unwrap();
+        f.serve.enforce_time_budgets().unwrap();
+        assert_eq!(
+            f.serve.store.ticket(id).unwrap().unwrap().state,
+            TicketState::Waiting
+        );
+        let question = f.serve.store.ticket(id).unwrap().unwrap().question.unwrap();
+        f.serve
+            .store
+            .answer("human", id, Some("Continue".into()), Some(question))
+            .unwrap();
+        assert_eq!(
+            f.serve.store.ticket(id).unwrap().unwrap().state,
+            TicketState::Verifying
         );
     }
 
