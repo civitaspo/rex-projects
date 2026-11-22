@@ -1067,9 +1067,10 @@ fn project(
             resume_state,
             question,
         } => {
+            let state = ticket_state(tx, ticket_id)?;
             require(
                 ticket_id,
-                ticket_state(tx, ticket_id)?,
+                state,
                 &[Running, Waiting, Verifying],
                 "record budget overrun",
             )?;
@@ -1083,6 +1084,11 @@ fn project(
                 || question.trim().is_empty()
             {
                 bail!("invalid budget overrun");
+            }
+            if admit && state != *resume_state {
+                bail!(
+                    "ticket {ticket_id} changed state before the budget question could be recorded"
+                );
             }
             if pending_approval_in(tx, ticket_id)?.is_some() {
                 bail!("ticket {ticket_id} is waiting for an Approval");
@@ -1964,6 +1970,84 @@ mod tests {
                 .filter(|e| matches!(e.event, Event::BudgetExtended { .. }))
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn stale_budget_snapshot_cannot_pause_a_ticket_after_it_enters_verification() {
+        let mut store = Store::open_in_memory().unwrap();
+        let ticket = new_ticket(&mut store, true);
+        let id = ticket.id.clone();
+        let coordinator = agent(&mut store, &id);
+        store
+            .append(
+                "serve",
+                Event::TicketDispatched {
+                    ticket_id: id.clone(),
+                    agent_id: coordinator.clone(),
+                },
+            )
+            .unwrap();
+        store
+            .append(
+                "serve",
+                Event::TicketPrepared {
+                    ticket_id: id.clone(),
+                    base_commit: "abc123".into(),
+                    playbook: Some(crate::playbook::PlaybookSnapshot {
+                        name: "feature".into(),
+                        sha256: "a".repeat(64),
+                        body: String::new(),
+                        spec: Some(crate::playbook::PlaybookSpec {
+                            stages: vec![],
+                            roles: None,
+                            gates: Default::default(),
+                            budgets: None,
+                            verification: Some(crate::playbook::VerificationSpec {
+                                checks: vec![],
+                                verifier: None,
+                            }),
+                        }),
+                    }),
+                    policy: None,
+                },
+            )
+            .unwrap();
+        store
+            .append(
+                &coordinator,
+                Event::TicketCompleted {
+                    ticket_id: id.clone(),
+                    outcome: Outcome::Delivered,
+                    summary: "delivered".into(),
+                    artifacts: vec![],
+                },
+            )
+            .unwrap();
+        let err = store
+            .append(
+                "serve",
+                Event::BudgetExceeded {
+                    ticket_id: id.clone(),
+                    budget: crate::domain::BudgetKind::Minutes,
+                    limit: 1,
+                    round: 1,
+                    resume_state: TicketState::Running,
+                    question: crate::budget::exceeded_question(1, 1),
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("changed state"), "{err:#}");
+        assert_eq!(
+            store.ticket(&id).unwrap().unwrap().state,
+            TicketState::Verifying
+        );
+        assert!(
+            !store
+                .ticket_events(&id)
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e.event, Event::BudgetExceeded { .. }))
         );
     }
 
