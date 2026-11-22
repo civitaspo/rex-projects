@@ -126,6 +126,22 @@ pub enum TicketCommand {
         #[arg(long)]
         text: Option<String>,
     },
+    /// Approve a pending Ticket decision.
+    Approve {
+        id: String,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Reject a pending Ticket decision with a reason.
+    Reject {
+        id: String,
+        #[arg(long, required = true)]
+        note: String,
+        #[arg(long)]
+        kind: Option<String>,
+    },
     /// Leave a message in an Agent's inbox.
     ///
     /// The message goes to the Ticket's Coordinator, or to `--agent`. It
@@ -429,6 +445,24 @@ fn ticket(paths: &Paths, command: TicketCommand) -> Result<()> {
             )?;
             println!("{id} is running");
         }
+        TicketCommand::Approve { id, kind, note } => {
+            require_human_cli()?;
+            let pending = store
+                .pending_approval(&id)?
+                .with_context(|| format!("ticket {id} has no pending Approval"))?;
+            let kind = kind.unwrap_or(pending.kind);
+            store.decide_approval("human", &id, &kind, true, note)?;
+            println!("{id} approved {kind}");
+        }
+        TicketCommand::Reject { id, kind, note } => {
+            require_human_cli()?;
+            let pending = store
+                .pending_approval(&id)?
+                .with_context(|| format!("ticket {id} has no pending Approval"))?;
+            let kind = kind.unwrap_or(pending.kind);
+            store.decide_approval("human", &id, &kind, false, Some(note))?;
+            println!("{id} rejected {kind}");
+        }
         TicketCommand::Message { id, text, agent } => {
             let ticket = store
                 .ticket(&id)?
@@ -495,6 +529,13 @@ fn ticket(paths: &Paths, command: TicketCommand) -> Result<()> {
             crate::worktree::cleanup_ticket(paths, &config, &store, &id, discard_ignored)?;
             println!("removed the worktree of {id}");
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn require_human_cli() -> Result<()> {
+    if std::env::var_os("REX_PROJECTS_AGENT_ID").is_some() {
+        bail!("Approvals can only be decided from a human CLI session");
     }
     Ok(())
 }
@@ -653,6 +694,11 @@ fn answer(
             .filter(|_| ticket.state == TicketState::Waiting))
     };
     let Some(question) = open_question(store)? else {
+        if store.pending_approval(id)?.is_some() {
+            bail!(
+                "ticket {id} is waiting for an Approval; use `ticket approve` or `ticket reject`"
+            );
+        }
         bail!("ticket {id} is not waiting for an answer");
     };
     if let Some(text) = &text {

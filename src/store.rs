@@ -67,6 +67,21 @@ CREATE TABLE IF NOT EXISTS ticket_preparations (
   ticket_id TEXT PRIMARY KEY REFERENCES tickets(id),
   payload TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS pending_approvals (
+  ticket_id TEXT PRIMARY KEY REFERENCES tickets(id),
+  kind TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  artifacts TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS approval_decisions (
+  ticket_id TEXT NOT NULL REFERENCES tickets(id),
+  kind TEXT NOT NULL,
+  approved INTEGER NOT NULL,
+  note TEXT,
+  actor TEXT NOT NULL,
+  at TEXT NOT NULL,
+  PRIMARY KEY (ticket_id, kind)
+);
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY,
   ticket_id TEXT NOT NULL,
@@ -223,14 +238,18 @@ impl Store {
     }
 
     pub fn ticket(&self, id: &str) -> Result<Option<Ticket>> {
-        Ok(self
+        let mut ticket = self
             .conn
             .query_row(
                 &format!("SELECT {TICKET_COLUMNS} FROM tickets WHERE id = ?1"),
                 params![id],
                 ticket_from_row,
             )
-            .optional()?)
+            .optional()?;
+        if let Some(ticket) = &mut ticket {
+            ticket.pending_approval = pending_approval_in(&self.conn, id)?;
+        }
+        Ok(ticket)
     }
 
     /// Lists Tickets, optionally for one Project, ordered by Project and number.
@@ -241,7 +260,11 @@ impl Store {
              ORDER BY project_id, number"
         ))?;
         let rows = stmt.query_map(params![project_id], ticket_from_row)?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let mut tickets = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        for ticket in &mut tickets {
+            ticket.pending_approval = pending_approval_in(&self.conn, &ticket.id)?;
+        }
+        Ok(tickets)
     }
 
     pub fn agent(&self, id: &str) -> Result<Option<Agent>> {
@@ -359,20 +382,53 @@ impl Store {
             .transpose()
     }
 
+    pub fn pending_approval(
+        &self,
+        ticket_id: &str,
+    ) -> Result<Option<crate::domain::ApprovalRequest>> {
+        pending_approval_in(&self.conn, ticket_id)
+    }
+
+    pub fn decide_approval(
+        &mut self,
+        actor: &str,
+        ticket_id: &str,
+        kind: &str,
+        approved: bool,
+        note: Option<String>,
+    ) -> Result<()> {
+        if actor != "human" {
+            bail!("only a human may decide an Approval");
+        }
+        if !approved && note.as_deref().is_none_or(|note| note.trim().is_empty()) {
+            bail!("a rejection needs a note");
+        }
+        self.append(
+            actor,
+            Event::ApprovalDecided {
+                ticket_id: ticket_id.to_owned(),
+                approval_kind: kind.to_owned(),
+                approved,
+                note,
+            },
+        )?;
+        Ok(())
+    }
+
     /// Drops the projections and rebuilds them by replaying every event.
     pub fn rebuild(&mut self) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch("DELETE FROM ticket_preparations; DELETE FROM tickets; DELETE FROM agents; DELETE FROM messages;")?;
-        let events: Vec<(String, String)> = {
-            let mut stmt = tx.prepare("SELECT at, payload FROM events ORDER BY seq")?;
-            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        tx.execute_batch("DELETE FROM pending_approvals; DELETE FROM approval_decisions; DELETE FROM ticket_preparations; DELETE FROM tickets; DELETE FROM agents; DELETE FROM messages;")?;
+        let events: Vec<(String, String, String)> = {
+            let mut stmt = tx.prepare("SELECT at, payload, actor FROM events ORDER BY seq")?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
-        for (at, payload) in events {
+        for (at, payload, actor) in events {
             let event: Event = serde_json::from_str(&payload)?;
-            project(&tx, &at, &event, Replay::Yes)?;
+            project(&tx, &at, &actor, &event, Replay::Yes)?;
         }
         tx.commit()?;
         Ok(())
@@ -385,7 +441,7 @@ fn now() -> String {
 
 pub(crate) fn append_in(tx: &Transaction<'_>, actor: &str, event: &Event) -> Result<i64> {
     let at = now();
-    project(tx, &at, event, Replay::No)?;
+    project(tx, &at, actor, event, Replay::No)?;
     let project_id = match event {
         Event::TicketCreated { project_id, .. } | Event::AgentCreated { project_id, .. } => {
             Some(project_id.clone())
@@ -567,6 +623,61 @@ fn update_refs(
     Ok(())
 }
 
+fn pending_approval_in(
+    conn: &Connection,
+    ticket_id: &str,
+) -> Result<Option<crate::domain::ApprovalRequest>> {
+    let value = conn
+        .query_row(
+            "SELECT kind, summary, artifacts FROM pending_approvals WHERE ticket_id = ?1",
+            params![ticket_id],
+            |row| {
+                let artifacts: String = row.get(2)?;
+                Ok(crate::domain::ApprovalRequest {
+                    kind: row.get(0)?,
+                    summary: row.get(1)?,
+                    artifacts: serde_json::from_str(&artifacts).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(value)
+}
+
+fn preparation_in(
+    conn: &Connection,
+    ticket_id: &str,
+) -> Result<Option<crate::playbook::TicketPreparation>> {
+    let payload: Option<String> = conn
+        .query_row(
+            "SELECT payload FROM ticket_preparations WHERE ticket_id = ?1",
+            params![ticket_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    payload
+        .map(|text| serde_json::from_str(&text).context("invalid Ticket preparation snapshot"))
+        .transpose()
+}
+
+fn require_approval(conn: &Connection, ticket_id: &str, kind: &str) -> Result<()> {
+    let approved: bool = conn.query_row(
+        "SELECT COALESCE((SELECT approved FROM approval_decisions WHERE ticket_id = ?1 AND kind = ?2), 0)",
+        params![ticket_id, kind],
+        |row| row.get(0),
+    )?;
+    if !approved {
+        bail!("Approval {kind:?} is required; call request_approval for this Gate first");
+    }
+    Ok(())
+}
+
 /// Whether `project` replays a stored event or admits a new one. Checks
 /// added after events were first stored apply only to new events, so a
 /// rebuild still accepts the history an earlier version committed.
@@ -576,7 +687,13 @@ enum Replay {
     No,
 }
 
-fn project(tx: &Transaction<'_>, at: &str, event: &Event, replay: Replay) -> Result<()> {
+fn project(
+    tx: &Transaction<'_>,
+    at: &str,
+    actor: &str,
+    event: &Event,
+    replay: Replay,
+) -> Result<()> {
     let admit = replay == Replay::No;
     use TicketState::*;
     match event {
@@ -638,6 +755,7 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event, replay: Replay) -> Res
             ticket_id,
             base_commit,
             playbook,
+            policy,
         } => {
             let state = ticket_state(tx, ticket_id)?;
             require(ticket_id, state, &[Running], "prepare")?;
@@ -656,6 +774,7 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event, replay: Replay) -> Res
             let preparation = crate::playbook::TicketPreparation {
                 base_commit: base_commit.clone(),
                 playbook: playbook.clone(),
+                policy: policy.clone(),
             };
             tx.execute(
                 "INSERT INTO ticket_preparations (ticket_id, payload) VALUES (?1, ?2)",
@@ -672,6 +791,19 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event, replay: Replay) -> Res
         } => {
             let state = ticket_state(tx, ticket_id)?;
             require(ticket_id, state, &[Running, Waiting], "report on")?;
+            if pending_approval_in(tx, ticket_id)?.is_some() {
+                bail!("ticket {ticket_id} is waiting for an Approval");
+            }
+            if admit && let Some(stage) = stage {
+                let preparation = preparation_in(tx, ticket_id)?;
+                if let Some(kind) = preparation
+                    .and_then(|p| p.playbook)
+                    .and_then(|p| p.spec)
+                    .and_then(|spec| spec.gates.get(stage).cloned())
+                {
+                    require_approval(tx, ticket_id, &kind)?;
+                }
+            }
             set_ticket_state(tx, ticket_id, Running, at)?;
             tx.execute(
                 "UPDATE tickets SET stage = COALESCE(?2, stage), summary = COALESCE(?3, summary),
@@ -687,6 +819,9 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event, replay: Replay) -> Res
         } => {
             let state = ticket_state(tx, ticket_id)?;
             require(ticket_id, state, &[Running, Waiting], "ask on")?;
+            if pending_approval_in(tx, ticket_id)?.is_some() {
+                bail!("ticket {ticket_id} is waiting for an Approval");
+            }
             set_ticket_state(tx, ticket_id, Waiting, at)?;
             tx.execute(
                 "UPDATE tickets SET question = ?2 WHERE id = ?1",
@@ -700,6 +835,9 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event, replay: Replay) -> Res
         } => {
             let state = ticket_state(tx, ticket_id)?;
             require(ticket_id, state, &[Waiting], "answer")?;
+            if pending_approval_in(tx, ticket_id)?.is_some() {
+                bail!("ticket {ticket_id} is waiting for an Approval, not an answer");
+            }
             if let Some(question) = question {
                 let open: Option<String> = tx.query_row(
                     "SELECT question FROM tickets WHERE id = ?1",
@@ -722,6 +860,89 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event, replay: Replay) -> Res
                 }
             })?;
         }
+        Event::ApprovalRequested {
+            ticket_id,
+            approval_kind,
+            summary,
+            artifacts,
+        } => {
+            let state = ticket_state(tx, ticket_id)?;
+            require(
+                ticket_id,
+                state,
+                &[Running, Waiting],
+                "request an Approval on",
+            )?;
+            if approval_kind.trim().is_empty() || summary.trim().is_empty() {
+                bail!("Approval kind and summary must not be empty");
+            }
+            if pending_approval_in(tx, ticket_id)?.is_some() {
+                bail!("ticket {ticket_id} already has a pending Approval");
+            }
+            let question: Option<String> = tx.query_row(
+                "SELECT question FROM tickets WHERE id = ?1",
+                params![ticket_id],
+                |row| row.get(0),
+            )?;
+            if question.is_some() {
+                bail!("ticket {ticket_id} already has an open question");
+            }
+            set_ticket_state(tx, ticket_id, Waiting, at)?;
+            tx.execute(
+                "UPDATE tickets SET question = NULL WHERE id = ?1",
+                params![ticket_id],
+            )?;
+            tx.execute(
+                "INSERT INTO pending_approvals (ticket_id, kind, summary, artifacts) VALUES (?1, ?2, ?3, ?4)",
+                params![ticket_id, approval_kind, summary, serde_json::to_string(artifacts)?],
+            )?;
+        }
+        Event::ApprovalDecided {
+            ticket_id,
+            approval_kind,
+            approved,
+            note,
+        } => {
+            let state = ticket_state(tx, ticket_id)?;
+            require(ticket_id, state, &[Waiting], "decide an Approval on")?;
+            let pending = pending_approval_in(tx, ticket_id)?
+                .with_context(|| format!("ticket {ticket_id} has no pending Approval"))?;
+            if pending.kind != *approval_kind {
+                bail!(
+                    "ticket {ticket_id} is waiting for {:?}, not {approval_kind:?}",
+                    pending.kind
+                );
+            }
+            if !approved && note.as_deref().is_none_or(|note| note.trim().is_empty()) {
+                bail!("a rejection needs a note");
+            }
+            tx.execute(
+                "DELETE FROM pending_approvals WHERE ticket_id = ?1",
+                params![ticket_id],
+            )?;
+            tx.execute(
+                "INSERT INTO approval_decisions (ticket_id, kind, approved, note, actor, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(ticket_id, kind) DO UPDATE SET approved=excluded.approved, note=excluded.note, actor=excluded.actor, at=excluded.at",
+                params![ticket_id, approval_kind, approved, note, actor, at],
+            )?;
+            set_ticket_state(tx, ticket_id, Running, at)?;
+            if let Some(coordinator_id) = tx.query_row(
+                "SELECT coordinator_id FROM tickets WHERE id = ?1",
+                params![ticket_id],
+                |row| row.get::<_, Option<String>>(0),
+            )? {
+                let decision = if *approved { "approved" } else { "rejected" };
+                let decider = if actor == "policy" { "Policy" } else { "Human" };
+                let mut body = format!("{decider} {decision} the {approval_kind} Approval.");
+                if let Some(note) = note {
+                    body.push_str(&format!(" Note: {note}"));
+                }
+                tx.execute(
+                    "INSERT INTO messages (ticket_id, sender, recipient, body, sent_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![ticket_id, actor, coordinator_id, body, at],
+                )?;
+            }
+        }
         Event::TicketCompleted {
             ticket_id,
             outcome,
@@ -730,6 +951,18 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event, replay: Replay) -> Res
         } => {
             let state = ticket_state(tx, ticket_id)?;
             require(ticket_id, state, &[Running, Waiting], "complete")?;
+            if admit && *outcome == Outcome::Delivered {
+                if pending_approval_in(tx, ticket_id)?.is_some() {
+                    bail!("ticket {ticket_id} is waiting for an Approval");
+                }
+                let required = preparation_in(tx, ticket_id)?
+                    .and_then(|p| p.policy)
+                    .map(|policy| policy.required_approvals)
+                    .unwrap_or_default();
+                for kind in required {
+                    require_approval(tx, ticket_id, &kind)?;
+                }
+            }
             let next = match outcome {
                 Outcome::Delivered => Done,
                 Outcome::Abandoned => Abandoned,
@@ -742,6 +975,10 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event, replay: Replay) -> Res
                    progress = CASE WHEN ?3 = 'delivered' THEN 100 ELSE progress END
                  WHERE id = ?1",
                 params![ticket_id, summary, serde_json::to_value(outcome)?.as_str()],
+            )?;
+            tx.execute(
+                "DELETE FROM pending_approvals WHERE ticket_id = ?1",
+                params![ticket_id],
             )?;
             merge_artifacts(tx, ticket_id, artifacts)?;
         }
@@ -760,6 +997,10 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event, replay: Replay) -> Res
                 "UPDATE tickets SET summary = ?2, outcome = ?3, question = NULL, next = NULL
                  WHERE id = ?1",
                 params![ticket_id, reason, serde_json::to_value(outcome)?.as_str()],
+            )?;
+            tx.execute(
+                "DELETE FROM pending_approvals WHERE ticket_id = ?1",
+                params![ticket_id],
             )?;
         }
         Event::ExternalChanged {
@@ -848,6 +1089,9 @@ fn project(tx: &Transaction<'_>, at: &str, event: &Event, replay: Replay) -> Res
             // A helper joins only a Ticket that is still being worked on.
             if admit && role != "coordinator" && !matches!(state, Running | Waiting) {
                 bail!("ticket {ticket_id} is {state}; helpers run only on a running Ticket");
+            }
+            if admit && role != "coordinator" && pending_approval_in(tx, ticket_id)?.is_some() {
+                bail!("ticket {ticket_id} is waiting for Approval; helpers cannot be spawned");
             }
             tx.execute(
                 "INSERT INTO agents (id, ticket_id, project_id, role, provider, cwd, state,
@@ -964,6 +1208,7 @@ fn ticket_from_row(row: &Row<'_>) -> rusqlite::Result<Ticket> {
         progress: row.get(8)?,
         next: row.get(9)?,
         question: row.get(10)?,
+        pending_approval: None,
         priority: row.get(11)?,
         playbook: row.get(12)?,
         blocked_by: json_column(row, 13)?,
@@ -1039,6 +1284,206 @@ mod tests {
             )
             .unwrap();
         agent_id
+    }
+
+    #[test]
+    fn approval_gates_reject_reopen_and_replay_with_inbox() {
+        let mut store = Store::open_in_memory().unwrap();
+        let ticket = new_ticket(&mut store, true);
+        let id = ticket.id.clone();
+        let coordinator = agent(&mut store, &id);
+        store
+            .append(
+                "serve",
+                Event::TicketDispatched {
+                    ticket_id: id.clone(),
+                    agent_id: coordinator.clone(),
+                },
+            )
+            .unwrap();
+        store
+            .append(
+                "serve",
+                Event::TicketPrepared {
+                    ticket_id: id.clone(),
+                    base_commit: "abc123".into(),
+                    playbook: Some(crate::playbook::PlaybookSnapshot {
+                        name: "feature".into(),
+                        sha256: "a".repeat(64),
+                        body: String::new(),
+                        spec: Some(crate::playbook::PlaybookSpec {
+                            stages: vec!["plan".into(), "implement".into()],
+                            roles: None,
+                            gates: [("implement".into(), "plan".into())].into(),
+                            verification: None,
+                            budgets: None,
+                        }),
+                    }),
+                    policy: Some(crate::policy::Policy {
+                        autonomy: crate::policy::Autonomy::A1,
+                        required_approvals: vec!["plan".into()],
+                        verification_attempts: 3,
+                        approvers: Default::default(),
+                        budgets: Default::default(),
+                    }),
+                },
+            )
+            .unwrap();
+        let report = Event::TicketReported {
+            ticket_id: id.clone(),
+            stage: Some("implement".into()),
+            summary: None,
+            progress: None,
+            next: None,
+            artifacts: vec![],
+        };
+        assert!(
+            store
+                .append(&coordinator, report.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("Approval")
+        );
+        store
+            .append(
+                &coordinator,
+                Event::ApprovalRequested {
+                    ticket_id: id.clone(),
+                    approval_kind: "plan".into(),
+                    summary: "Review the plan".into(),
+                    artifacts: vec!["plan.md".into()],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .ticket(&id)
+                .unwrap()
+                .unwrap()
+                .pending_approval
+                .unwrap()
+                .summary,
+            "Review the plan"
+        );
+        let spawn_error = store
+            .append(
+                &coordinator,
+                Event::AgentCreated {
+                    agent_id: format!("{id}-worker-1"),
+                    ticket_id: id.clone(),
+                    project_id: "demo".into(),
+                    role: "worker".into(),
+                    provider: "codex".into(),
+                    cwd: "/tmp".into(),
+                },
+            )
+            .unwrap_err();
+        assert!(spawn_error.to_string().contains("waiting for Approval"));
+        assert!(
+            store
+                .append(
+                    "human",
+                    Event::TicketAnswered {
+                        ticket_id: id.clone(),
+                        answer: Some("yes".into()),
+                        question: None
+                    }
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("Approval")
+        );
+        assert!(
+            store
+                .append(&coordinator, report.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("Approval")
+        );
+        assert!(
+            store
+                .append(
+                    &coordinator,
+                    Event::TicketCompleted {
+                        ticket_id: id.clone(),
+                        outcome: Outcome::Delivered,
+                        summary: "done".into(),
+                        artifacts: vec![]
+                    }
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("Approval")
+        );
+        store
+            .decide_approval(
+                "human",
+                &id,
+                "plan",
+                false,
+                Some("Add a migration plan".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            store.ticket(&id).unwrap().unwrap().state,
+            TicketState::Running
+        );
+        assert!(
+            store.unread(&coordinator).unwrap()[0]
+                .body
+                .contains("rejected")
+        );
+        let rejected_message = store.unread(&coordinator).unwrap()[0].id;
+        store
+            .append(
+                &coordinator,
+                Event::MessagesRead {
+                    agent_id: coordinator.clone(),
+                    through: rejected_message,
+                },
+            )
+            .unwrap();
+        assert!(
+            store
+                .append(&coordinator, report.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("Approval")
+        );
+        store
+            .append(
+                &coordinator,
+                Event::ApprovalRequested {
+                    ticket_id: id.clone(),
+                    approval_kind: "plan".into(),
+                    summary: "Updated plan".into(),
+                    artifacts: vec![],
+                },
+            )
+            .unwrap();
+        store
+            .decide_approval("human", &id, "plan", true, Some("Approved".into()))
+            .unwrap();
+        store.append(&coordinator, report).unwrap();
+        store
+            .append(
+                &coordinator,
+                Event::TicketCompleted {
+                    ticket_id: id.clone(),
+                    outcome: Outcome::Delivered,
+                    summary: "done".into(),
+                    artifacts: vec![],
+                },
+            )
+            .unwrap();
+        store.rebuild().unwrap();
+        assert_eq!(store.ticket(&id).unwrap().unwrap().state, TicketState::Done);
+        assert_eq!(store.unread(&coordinator).unwrap().len(), 1);
+        assert!(
+            store.unread(&coordinator).unwrap()[0]
+                .body
+                .contains("approved")
+        );
     }
 
     #[test]
@@ -1170,6 +1615,7 @@ mod tests {
                             body: "old body".into(),
                             spec: None,
                         }),
+                        policy: None,
                     },
                 ],
             )

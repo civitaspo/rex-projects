@@ -20,6 +20,8 @@ pub struct PlaybookSnapshot {
 pub struct TicketPreparation {
     pub base_commit: String,
     pub playbook: Option<PlaybookSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<crate::policy::Policy>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]

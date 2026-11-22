@@ -217,6 +217,11 @@ impl<R: Rex> Serve<R> {
                 })?;
                 continue;
             }
+            // A helper created just before an Approval request must stay
+            // queued until the human or policy decision clears the request.
+            if ticket.pending_approval.is_some() {
+                continue;
+            }
             let Some(coordinator) = ticket
                 .coordinator_id
                 .as_deref()
@@ -649,6 +654,7 @@ impl<R: Rex> Serve<R> {
             .with_context(|| format!("failed to read starting commit from {}", dir.display()))?;
         let playbook =
             crate::playbook::resolve_for_ticket(&self.paths, project, ticket.playbook.as_deref())?;
+        let policy = crate::policy::load(&self.paths.config_dir, &project.id)?;
         let agent_id = coordinator_id(&ticket.id);
         let mut events = Vec::new();
         if self.store.agent(&agent_id)?.is_none() {
@@ -669,6 +675,7 @@ impl<R: Rex> Serve<R> {
             ticket_id: ticket.id.clone(),
             base_commit,
             playbook,
+            policy,
         });
         // A helper may have taken the slot while the worktree was prepared.
         let max = config.limits.max_agents as usize;
@@ -766,6 +773,7 @@ mod tests {
             progress: None,
             next: None,
             question: None,
+            pending_approval: None,
             priority: 0,
             playbook: None,
             blocked_by: Vec::new(),
@@ -982,6 +990,35 @@ mod tests {
             unread[0].body
         );
         assert_eq!(f.state(), TicketState::Running);
+    }
+
+    #[test]
+    fn helper_waits_until_pending_approval_is_decided() {
+        let mut f = fixture();
+        f.tick();
+        let worker = spawn(&mut f, "worker");
+        f.serve
+            .store
+            .append(
+                "demo-1-coordinator",
+                Event::ApprovalRequested {
+                    ticket_id: "demo-1".into(),
+                    approval_kind: "plan".into(),
+                    summary: "Review the plan".into(),
+                    artifacts: vec![],
+                },
+            )
+            .unwrap();
+
+        f.tick();
+        assert_eq!(helper(&f, &worker).state, "created");
+
+        f.serve
+            .store
+            .decide_approval("human", "demo-1", "plan", true, None)
+            .unwrap();
+        f.tick();
+        assert_eq!(helper(&f, &worker).state, "running");
     }
 
     #[test]

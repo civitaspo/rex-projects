@@ -108,6 +108,29 @@ fn describe(actor: &str, event: &Event) -> Option<String> {
             format!("report {}", parts.join("  "))
         }
         Event::TicketAsked { question, .. } => format!("asked: {question}"),
+        Event::ApprovalRequested {
+            approval_kind,
+            summary,
+            ..
+        } => {
+            format!(
+                "requested {approval_kind} Approval by {}: {summary}",
+                who(actor)
+            )
+        }
+        Event::ApprovalDecided {
+            approval_kind,
+            approved,
+            note,
+            ..
+        } => {
+            let decision = if *approved { "approved" } else { "rejected" };
+            let mut text = format!("{decision} {approval_kind} Approval by {actor}");
+            if let Some(note) = note {
+                text.push_str(&format!(": {note}"));
+            }
+            text
+        }
         Event::TicketAnswered { answer, .. } => match answer {
             Some(answer) => format!("answered by {actor}: {answer}"),
             None => format!("answered by {actor}"),
@@ -253,6 +276,38 @@ mod tests {
                 "asked: Which API?",
                 "answered by human: v2",
                 "delivered: Merged",
+            ]
+        );
+    }
+
+    #[test]
+    fn approval_history_names_requester_and_decision_maker() {
+        let events = [
+            stored(
+                "demo-1-coordinator",
+                Event::ApprovalRequested {
+                    ticket_id: "demo-1".into(),
+                    approval_kind: "plan".into(),
+                    summary: "Review the plan".into(),
+                    artifacts: vec![],
+                },
+            ),
+            stored(
+                "policy",
+                Event::ApprovalDecided {
+                    ticket_id: "demo-1".into(),
+                    approval_kind: "release".into(),
+                    approved: true,
+                    note: None,
+                },
+            ),
+        ];
+        let texts: Vec<String> = entries(&events).into_iter().map(|e| e.text).collect();
+        assert_eq!(
+            texts,
+            [
+                "requested plan Approval by Coordinator: Review the plan",
+                "approved release Approval by policy",
             ]
         );
     }

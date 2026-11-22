@@ -10,6 +10,7 @@ pub mod inbox;
 pub mod mcp;
 pub mod paths;
 pub mod playbook;
+pub mod policy;
 pub mod provider;
 pub mod rex;
 pub mod serve;
