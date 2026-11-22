@@ -18,10 +18,11 @@ use crate::store::Store;
 
 /// The Roles rex-projects ships. `<config dir>/roles/<role>.md` overrides one,
 /// or adds a new Role.
-const BUILTIN_ROLES: [(&str, &str); 3] = [
+const BUILTIN_ROLES: [(&str, &str); 4] = [
     ("coordinator", include_str!("roles/coordinator.md")),
     ("worker", include_str!("roles/worker.md")),
     ("reviewer", include_str!("roles/reviewer.md")),
+    ("verifier", include_str!("roles/verifier.md")),
 ];
 
 /// How a harness session starts.
@@ -246,8 +247,28 @@ pub fn role_text_with_store(
     project: &ProjectConfig,
     ticket: &Ticket,
     role: &str,
+    agent_id: &str,
     store: &Store,
 ) -> Result<String> {
+    let is_verifier = store.ticket_events(&ticket.id)?.iter().any(|event| {
+        matches!(
+            &event.event,
+            Event::VerificationVerifierAssigned { agent_id: assigned, .. } if assigned == agent_id
+        )
+    });
+    if is_verifier {
+        let mut text = role_base_text(paths, "verifier")?;
+        if role != "verifier" {
+            let custom = paths.config_dir.join("roles").join(format!("{role}.md"));
+            if custom.is_file() {
+                text.push_str(&format!(
+                    "\n\n# Additional Role guidance\n\n{}",
+                    std::fs::read_to_string(&custom)?
+                ));
+            }
+        }
+        return Ok(text);
+    }
     let mut text = role_base_text(paths, role)?;
     if role != "coordinator" {
         return Ok(text);
@@ -281,6 +302,14 @@ pub fn helper_prompt(agent: &Agent, ticket: &Ticket, task: &str) -> String {
         "You are {}, the {} for Ticket {}: {}. Your task from the Coordinator:\n\n{task}\n\n\
          Call ticket_get if you need the Ticket's Brief. When you are finished, call done.",
         agent.id, agent.role, ticket.id, ticket.title
+    )
+}
+
+fn verifier_prompt(agent: &Agent, ticket: &Ticket, task: &str) -> String {
+    format!(
+        "You are {}, the independent Verifier for Ticket {}: {}. Your task from rex-projects:\n\n{task}\n\n\
+         Call ticket_get if you need the Ticket's Brief. Report only with the verify tool; do not call done.",
+        agent.id, ticket.id, ticket.title
     )
 }
 
@@ -344,7 +373,7 @@ pub fn exec(paths: &Paths, agent_id: &str) -> Result<()> {
     ]
     .map(|(k, v)| (k.to_owned(), v))
     .into();
-    let role = role_text_with_store(paths, project, &ticket, &agent.role, &store)?;
+    let role = role_text_with_store(paths, project, &ticket, &agent.role, &agent.id, &store)?;
     let write = |name: &str, text: String| {
         let path = dir.join(name);
         std::fs::write(&path, text).with_context(|| format!("failed to write {}", path.display()))
@@ -366,12 +395,22 @@ pub fn exec(paths: &Paths, agent_id: &str) -> Result<()> {
             session_id: &new_id,
         },
     };
+    let verifier = store.ticket_events(&ticket.id)?.iter().rev().any(|event| {
+        matches!(
+            &event.event,
+            Event::VerificationVerifierAssigned { agent_id, .. } if agent_id == &agent.id
+        )
+    });
     let prompt = match start {
         Start::New { .. } if agent.role != "coordinator" => {
             // The task waits in the helper's inbox; take it into the prompt.
             let (messages, _) = crate::inbox::take(&mut store, agent_id)?;
             let task: Vec<&str> = messages.iter().map(|m| m.body.as_str()).collect();
-            helper_prompt(&agent, &ticket, &task.join("\n\n"))
+            if verifier {
+                verifier_prompt(&agent, &ticket, &task.join("\n\n"))
+            } else {
+                helper_prompt(&agent, &ticket, &task.join("\n\n"))
+            }
         }
         Start::New { .. } => initial_prompt(&ticket),
         Start::Resume { .. } => resume_prompt(&ticket),
@@ -499,6 +538,67 @@ mod tests {
     }
 
     #[test]
+    fn verifier_builtin_and_prompt_require_verify_instead_of_done() {
+        assert!(
+            role_base_text(
+                &Paths {
+                    config_dir: PathBuf::from("/nonexistent"),
+                    state_dir: PathBuf::from("/tmp")
+                },
+                "verifier"
+            )
+            .unwrap()
+            .contains("must not edit")
+        );
+        let ticket = crate::domain::Ticket {
+            id: "demo-1".into(),
+            project_id: "demo".into(),
+            number: 1,
+            title: "T".into(),
+            body: "Brief".into(),
+            state: crate::domain::TicketState::Verifying,
+            stage: None,
+            summary: Some("summary".into()),
+            progress: None,
+            next: None,
+            question: None,
+            pending_approval: None,
+            priority: 0,
+            playbook: None,
+            blocked_by: vec![],
+            external_refs: vec![],
+            artifacts: vec![],
+            outcome: None,
+            coordinator_id: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let agent = crate::domain::Agent {
+            id: "demo-1-verifier-1".into(),
+            ticket_id: ticket.id.clone(),
+            project_id: ticket.project_id.clone(),
+            role: "verifier".into(),
+            provider: "claude".into(),
+            cwd: "/tmp".into(),
+            state: "created".into(),
+            harness_session_id: None,
+            rex_session_id: None,
+            rex_window_id: None,
+            rex_block_id: None,
+            launches: 0,
+            activity: None,
+            activity_message: None,
+            exit_reason: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let prompt = verifier_prompt(&agent, &ticket, "Compare against base abc");
+        assert!(prompt.contains("Compare against base abc"));
+        assert!(prompt.contains("verify tool"));
+        assert!(!prompt.contains("When you are finished, call done"));
+    }
+
+    #[test]
     fn coordinator_resume_uses_the_dispatch_snapshot_after_playbook_edit() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
@@ -574,7 +674,15 @@ mod tests {
         )
         .unwrap();
         let ticket = store.ticket(&ticket.id).unwrap().unwrap();
-        let role = role_text_with_store(&paths, &project, &ticket, "coordinator", &store).unwrap();
+        let role = role_text_with_store(
+            &paths,
+            &project,
+            &ticket,
+            "coordinator",
+            "demo-1-coordinator",
+            &store,
+        )
+        .unwrap();
         assert!(role.contains("new body"));
         assert!(!role.contains("changed body"));
     }
@@ -638,7 +746,15 @@ mod tests {
         store.rebuild().unwrap();
         assert!(store.preparation(&ticket.id).unwrap().is_none());
         let ticket = store.ticket(&ticket.id).unwrap().unwrap();
-        let role = role_text_with_store(&paths, &project, &ticket, "coordinator", &store).unwrap();
+        let role = role_text_with_store(
+            &paths,
+            &project,
+            &ticket,
+            "coordinator",
+            "demo-1-coordinator",
+            &store,
+        )
+        .unwrap();
         assert!(role.contains("legacy instructions"));
     }
 

@@ -17,4 +17,5 @@ pub mod serve;
 pub mod store;
 pub mod tracker;
 pub mod ui;
+pub mod verification;
 pub mod worktree;

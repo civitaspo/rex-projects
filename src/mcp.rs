@@ -115,6 +115,7 @@ impl Server {
                     "ask" => self.ask(args),
                     "request_approval" => self.request_approval(args),
                     "complete" => self.complete(args),
+                    "verify" => self.verify(args),
                     "send" => self.send(args),
                     "inbox_read" => self.inbox_read(),
                     "spawn_agent" => self.spawn_agent(args),
@@ -149,6 +150,9 @@ impl Server {
         let context = self.context()?;
         if is_stale(self.launch, &context.1) {
             bail!(SUPERSEDED);
+        }
+        if context.1.role == "coordinator" && context.2.state == TicketState::Verifying {
+            bail!("Verification is running; Coordinator work is paused");
         }
         Ok(context)
     }
@@ -339,6 +343,9 @@ impl Server {
         }
         let (mut store, agent, ticket) = self.write_context()?;
         require_coordinator(&agent, "complete")?;
+        if ticket.state == TicketState::Verifying {
+            bail!("Verification is running; Coordinator work is paused");
+        }
         self.append_current(
             &mut store,
             &[Event::TicketCompleted {
@@ -348,6 +355,91 @@ impl Server {
                 artifacts: args.artifacts,
             }],
         )?;
+        status(&store, &ticket.id)
+    }
+
+    fn verify(&self, args: Value) -> Result<Value> {
+        #[derive(Deserialize)]
+        struct Args {
+            passed: bool,
+            #[serde(default)]
+            findings: Vec<String>,
+        }
+        let args: Args = parse_args(args)?;
+        let (mut store, agent, ticket) = self.write_context()?;
+        if ticket.state != TicketState::Verifying {
+            bail!("verification is not running for Ticket {}", ticket.id);
+        }
+        let preparation = store
+            .preparation(&ticket.id)?
+            .context("Ticket has no preparation snapshot")?;
+        let spec = preparation
+            .playbook
+            .and_then(|p| p.spec)
+            .and_then(|s| s.verification)
+            .context("Ticket has no verification specification")?;
+        let verifier = spec.verifier.context("Ticket has no declared verifier")?;
+        if agent.role != verifier.role {
+            bail!(
+                "only the declared verifier Role {:?} may report verification",
+                verifier.role
+            );
+        }
+        if args.passed && !args.findings.is_empty() {
+            bail!("a passing verification cannot include findings");
+        }
+        let ticket_events = store.ticket_events(&ticket.id)?;
+        let attempt = ticket_events
+            .iter()
+            .filter(|e| matches!(e.event, Event::VerificationFailed { .. }))
+            .count() as u32
+            + 1;
+        let assigned = ticket_events.iter().rev().find_map(|e| match &e.event {
+            Event::VerificationVerifierAssigned {
+                attempt: a,
+                agent_id,
+                ..
+            } if *a == attempt => Some(agent_id.as_str()),
+            _ => None,
+        });
+        if assigned != Some(agent.id.as_str()) {
+            bail!("this Agent is not the verifier assigned to attempt {attempt}");
+        }
+        let mut events = if args.passed {
+            vec![Event::TicketVerified {
+                ticket_id: ticket.id.clone(),
+                attempt,
+            }]
+        } else {
+            let reason = if args.findings.is_empty() {
+                "Verifier reported failure".to_owned()
+            } else {
+                args.findings.join("\n")
+            };
+            let limit = preparation
+                .policy
+                .map(|p| p.verification_attempts)
+                .unwrap_or(3);
+            let mut failure = vec![Event::VerificationFailed {
+                ticket_id: ticket.id.clone(),
+                attempt,
+                reason: reason.clone(),
+            }];
+            if attempt >= limit {
+                failure.push(Event::TicketAsked { ticket_id: ticket.id.clone(), question: format!("Verification failed {attempt} times. Review the findings and answer to continue with another attempt.\n{reason}") });
+            }
+            failure
+        };
+        events.push(Event::AgentFinished {
+            agent_id: agent.id.clone(),
+            reason: if args.passed {
+                "verification passed"
+            } else {
+                "verification reported findings"
+            }
+            .into(),
+        });
+        self.append_current(&mut store, &events)?;
         status(&store, &ticket.id)
     }
 }
@@ -419,6 +511,19 @@ impl Server {
         crate::config::validate_id(&args.role).context("invalid role")?;
         if args.role == "coordinator" {
             bail!("a Ticket has one Coordinator; spawn a helper Role such as worker or reviewer");
+        }
+        let verifier_role = store
+            .preparation(&ticket.id)?
+            .and_then(|p| p.playbook)
+            .and_then(|p| p.spec)
+            .and_then(|s| s.verification)
+            .and_then(|v| v.verifier)
+            .map(|v| v.role);
+        if verifier_role.as_deref() == Some(args.role.as_str()) {
+            bail!(
+                "Role {:?} is reserved for serve-managed verification",
+                args.role
+            );
         }
         crate::provider::role_base_text(&self.paths, &args.role)?;
         if let Some(preparation) = store.preparation(&ticket.id)?
@@ -734,6 +839,19 @@ fn tools() -> Value {
             },
         },
         {
+            "name": "verify",
+            "description": "Declared verifier only. Report whether verification passed and list findings when it failed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "passed": {"type": "boolean"},
+                    "findings": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["passed"],
+                "additionalProperties": false,
+            },
+        },
+        {
             "name": "send",
             "description": "Send a message to another Agent on your Ticket. It waits in \
                 their inbox and reaches them when their turn ends or they next read it.",
@@ -963,6 +1081,7 @@ pub(crate) mod tests {
                 "ask",
                 "request_approval",
                 "complete",
+                "verify",
                 "send",
                 "spawn_agent",
                 "agents_list",

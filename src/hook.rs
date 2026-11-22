@@ -100,7 +100,7 @@ pub fn handle(
         if agent.role == "coordinator"
             && store
                 .ticket(&agent.ticket_id)?
-                .is_some_and(|t| t.state == TicketState::Waiting)
+                .is_some_and(|t| matches!(t.state, TicketState::Waiting | TicketState::Verifying))
         {
             return Ok(None);
         }

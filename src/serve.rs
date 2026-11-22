@@ -4,6 +4,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -15,6 +16,7 @@ use crate::provider;
 use crate::rex::{Rex, RexCli};
 use crate::store::Store;
 use crate::tracker::TrackerSync;
+use crate::verification::{self, CheckResult};
 use crate::worktree;
 
 /// How many times a Coordinator is resumed after its block disappears.
@@ -29,6 +31,7 @@ const WAKE_RETRY: Duration = Duration::from_secs(120);
 /// How long the pane of a done Ticket stays open for the human to read.
 const DONE_PANE_RETENTION: chrono::Duration = chrono::Duration::minutes(10);
 const ACTOR: &str = "serve";
+const CHECK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Chooses the Tickets to dispatch now, taking one ready Ticket per Project
 /// in turn, starting at Project `rotation`. Returns the Ticket IDs and the
@@ -106,6 +109,7 @@ pub struct Serve<R: Rex> {
     release_done_panes: bool,
     /// When `serve` last typed the wake token into each Agent.
     woken: HashMap<String, Instant>,
+    verification_checks: HashMap<(String, u32, String), JoinHandle<Result<CheckResult>>>,
 }
 
 impl<R: Rex> Serve<R> {
@@ -120,6 +124,7 @@ impl<R: Rex> Serve<R> {
             retry_delay: Duration::from_secs(10),
             release_done_panes: false,
             woken: HashMap::new(),
+            verification_checks: HashMap::new(),
         }
     }
 
@@ -133,10 +138,12 @@ impl<R: Rex> Serve<R> {
             }
         }
         self.release_done_panes = false;
+        self.advance_verification_checks()?;
         self.ensure_coordinators()?;
         self.dispatch(config)?;
         self.ensure_coordinators()?;
         self.launch_helpers()?;
+        self.ensure_verifiers()?;
         self.wake_idle_agents()
     }
 
@@ -215,6 +222,9 @@ impl<R: Rex> Serve<R> {
                     agent_id: agent.id.clone(),
                     reason: format!("ticket {}", ticket.state),
                 })?;
+                continue;
+            }
+            if ticket.state == TicketState::Verifying {
                 continue;
             }
             // A helper created just before an Approval request must stay
@@ -331,11 +341,347 @@ impl<R: Rex> Serve<R> {
         })
     }
 
+    /// Completes finished checks and schedules the next unfinished check for
+    /// every Ticket. A missing completion event means the check is safe to rerun
+    /// after a process restart; check commands therefore have at-least-once
+    /// execution across the narrow process-death window before event commit.
+    fn advance_verification_checks(&mut self) -> Result<()> {
+        let finished: Vec<_> = self
+            .verification_checks
+            .iter()
+            .filter(|(_, handle)| handle.is_finished())
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in finished {
+            let handle = self
+                .verification_checks
+                .remove(&key)
+                .expect("collected handle exists");
+            let (ticket_id, attempt, name) = key;
+            let result = match handle.join() {
+                Ok(Ok(result)) => result,
+                Ok(Err(err)) => CheckResult {
+                    passed: false,
+                    timed_out: false,
+                    exit_code: None,
+                    output_tail: format!("{err:#}"),
+                },
+                Err(_) => CheckResult {
+                    passed: false,
+                    timed_out: false,
+                    exit_code: None,
+                    output_tail: "verification runner panicked".into(),
+                },
+            };
+            if self
+                .store
+                .ticket(&ticket_id)?
+                .is_none_or(|t| t.state != TicketState::Verifying)
+            {
+                continue;
+            }
+            let mut events = vec![Event::VerificationCheckFinished {
+                ticket_id: ticket_id.clone(),
+                attempt,
+                name: name.clone(),
+                passed: result.passed,
+                timed_out: result.timed_out,
+                exit_code: result.exit_code,
+                output_tail: result.output_tail.clone(),
+            }];
+            if !result.passed {
+                let reason = format!(
+                    "Verification check {name:?} {}.\n{}",
+                    if result.timed_out {
+                        "timed out"
+                    } else {
+                        "failed"
+                    },
+                    result.output_tail
+                );
+                events.push(Event::VerificationFailed {
+                    ticket_id: ticket_id.clone(),
+                    attempt,
+                    reason: reason.clone(),
+                });
+                let limit = self
+                    .store
+                    .preparation(&ticket_id)?
+                    .and_then(|p| p.policy)
+                    .map(|p| p.verification_attempts)
+                    .unwrap_or(3);
+                if attempt >= limit {
+                    events.push(Event::TicketAsked { ticket_id: ticket_id.clone(), question: format!("Verification failed {attempt} times. Review the findings and answer to continue with another attempt.\n{reason}") });
+                }
+            }
+            self.store.append_all(ACTOR, &events)?;
+        }
+
+        for ticket in self
+            .store
+            .tickets(None)?
+            .into_iter()
+            .filter(|t| t.state == TicketState::Verifying)
+        {
+            let Some(prep) = self.store.preparation(&ticket.id)? else {
+                continue;
+            };
+            let Some(spec) = prep
+                .playbook
+                .and_then(|p| p.spec)
+                .and_then(|s| s.verification)
+            else {
+                continue;
+            };
+            let events = self.store.ticket_events(&ticket.id)?;
+            let attempt = events
+                .iter()
+                .filter(|e| matches!(e.event, Event::VerificationFailed { .. }))
+                .count() as u32
+                + 1;
+            let completed: std::collections::HashSet<String> = events
+                .iter()
+                .filter_map(|e| match &e.event {
+                    Event::VerificationCheckFinished {
+                        attempt: a, name, ..
+                    } if *a == attempt => Some(name.clone()),
+                    _ => None,
+                })
+                .collect();
+            if let Some(check) = spec
+                .checks
+                .iter()
+                .find(|check| !completed.contains(&check.name))
+            {
+                let key = (ticket.id.clone(), attempt, check.name.clone());
+                if self.verification_checks.contains_key(&key) {
+                    continue;
+                }
+                self.append(Event::VerificationCheckStarted {
+                    ticket_id: ticket.id.clone(),
+                    attempt,
+                    name: check.name.clone(),
+                })?;
+                let check = check.clone();
+                let cwd = self.paths.worktree_dir(&ticket.project_id, &ticket.id);
+                self.verification_checks.insert(
+                    key,
+                    std::thread::spawn(move || verification::execute(&check, &cwd, CHECK_TIMEOUT)),
+                );
+            } else if spec.verifier.is_none() {
+                self.append(Event::TicketVerified {
+                    ticket_id: ticket.id.clone(),
+                    attempt,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Creates and starts the Playbook's verifier after all declared checks pass.
+    fn ensure_verifiers(&mut self) -> Result<()> {
+        for ticket in self
+            .store
+            .tickets(None)?
+            .into_iter()
+            .filter(|t| t.state == TicketState::Verifying)
+        {
+            let Some(prep) = self.store.preparation(&ticket.id)? else {
+                continue;
+            };
+            let Some(verify) = prep
+                .playbook
+                .and_then(|p| p.spec)
+                .and_then(|s| s.verification)
+            else {
+                continue;
+            };
+            let checks = self.store.ticket_events(&ticket.id)?;
+            let attempt = checks
+                .iter()
+                .filter(|e| matches!(e.event, Event::VerificationFailed { .. }))
+                .count() as u32
+                + 1;
+            if verify.checks.iter().any(|c| !checks.iter().any(|e| matches!(&e.event,
+                Event::VerificationCheckFinished { attempt: a, name, passed: true, .. } if *a == attempt && name == &c.name))) { continue; }
+            let Some(verifier) = verify.verifier else {
+                if !checks.iter().any(|e| matches!(&e.event, Event::TicketVerified { attempt: a, .. } if *a == attempt)) {
+                    self.append(Event::TicketVerified { ticket_id: ticket.id.clone(), attempt })?;
+                }
+                continue;
+            };
+            let assigned_id = checks.iter().rev().find_map(|e| match &e.event {
+                Event::VerificationVerifierAssigned {
+                    attempt: a,
+                    agent_id,
+                    ..
+                } if *a == attempt => Some(agent_id.clone()),
+                _ => None,
+            });
+            let existing = if let Some(id) = &assigned_id {
+                self.store.agent(id)?
+            } else {
+                None
+            };
+            let Some(agent) = existing else {
+                let coordinator = ticket
+                    .coordinator_id
+                    .as_deref()
+                    .and_then(|id| self.store.agent(id).ok().flatten());
+                let Some(coordinator) = coordinator else {
+                    continue;
+                };
+                let config = Config::load(&self.paths.config_file())?;
+                let project = config.project(&ticket.project_id)?;
+                let provider = project.agent_spec(&verifier.role).provider;
+                let n = self
+                    .store
+                    .agents_for_ticket(&ticket.id)?
+                    .iter()
+                    .filter(|a| a.role == verifier.role)
+                    .count()
+                    + 1;
+                let id = format!("{}-{}-{n}", ticket.id, verifier.role);
+                let task = self.verifier_task(&ticket, &prep.base_commit);
+                self.store.append_all(
+                    ACTOR,
+                    &[
+                        Event::AgentCreated {
+                            agent_id: id.clone(),
+                            ticket_id: ticket.id.clone(),
+                            project_id: ticket.project_id.clone(),
+                            role: verifier.role.clone(),
+                            provider,
+                            cwd: coordinator.cwd,
+                        },
+                        Event::VerificationVerifierAssigned {
+                            ticket_id: ticket.id.clone(),
+                            attempt,
+                            agent_id: id.clone(),
+                        },
+                        Event::MessageSent {
+                            ticket_id: ticket.id.clone(),
+                            from: "rex-projects".into(),
+                            to: id,
+                            body: task,
+                        },
+                    ],
+                )?;
+                continue;
+            };
+            if agent.state == "created" {
+                if let Err(err) = self.launch_verifier(&agent, &ticket) {
+                    println!("{}: verifier launch failed; will retry: {err:#}", agent.id);
+                }
+            } else if agent.state == "running"
+                && matches!(agent.activity.as_deref(), Some("done" | "exited"))
+            {
+                self.append(Event::AgentFinished {
+                    agent_id: agent.id,
+                    reason: "verifier stopped before reporting".into(),
+                })?;
+            } else if agent.state == "exited" {
+                // Allocate a new identity for a verifier that died; it may not
+                // reuse a finished harness session or consume a stale inbox.
+                let n = self
+                    .store
+                    .agents_for_ticket(&ticket.id)?
+                    .iter()
+                    .filter(|a| a.role == verifier.role)
+                    .count()
+                    + 1;
+                let config = Config::load(&self.paths.config_file())?;
+                let project = config.project(&ticket.project_id)?;
+                let provider = project.agent_spec(&verifier.role).provider;
+                let coordinator = ticket
+                    .coordinator_id
+                    .as_deref()
+                    .and_then(|id| self.store.agent(id).ok().flatten());
+                if let Some(coordinator) = coordinator {
+                    let id = format!("{}-{}-{n}", ticket.id, verifier.role);
+                    let prep = self
+                        .store
+                        .preparation(&ticket.id)?
+                        .context("Ticket has no preparation")?;
+                    self.store.append_all(
+                        ACTOR,
+                        &[
+                            Event::AgentCreated {
+                                agent_id: id.clone(),
+                                ticket_id: ticket.id.clone(),
+                                project_id: ticket.project_id.clone(),
+                                role: verifier.role.clone(),
+                                provider,
+                                cwd: coordinator.cwd,
+                            },
+                            Event::VerificationVerifierAssigned {
+                                ticket_id: ticket.id.clone(),
+                                attempt,
+                                agent_id: id.clone(),
+                            },
+                            Event::MessageSent {
+                                ticket_id: ticket.id.clone(),
+                                from: "rex-projects".into(),
+                                to: id,
+                                body: self.verifier_task(&ticket, &prep.base_commit),
+                            },
+                        ],
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn verifier_task(&self, ticket: &Ticket, base_commit: &str) -> String {
+        let skill = self
+            .paths
+            .worktree_dir(&ticket.project_id, &ticket.id)
+            .join(".rex-projects/verification/SKILL.md");
+        format!(
+            "Verify this Ticket without editing files. Compare against base commit {base_commit}, not HEAD. Coordinator summary: {}. Artifacts: {}. Read the verification skill at {} if it exists. Report your result with the verify tool; include findings on failure.",
+            ticket.summary.as_deref().unwrap_or("(no summary)"),
+            ticket.artifacts.join(", "),
+            skill.display()
+        )
+    }
+
+    fn launch_verifier(&mut self, agent: &Agent, ticket: &Ticket) -> Result<()> {
+        let Some(coordinator_id) = ticket.coordinator_id.as_deref() else {
+            return self.launch(agent, ticket, false);
+        };
+        let Some(coordinator) = self.store.agent(coordinator_id)? else {
+            return self.launch(agent, ticket, false);
+        };
+        let (Some(session), Some(window), Some(anchor)) = (
+            coordinator.rex_session_id,
+            coordinator.rex_window_id,
+            coordinator.rex_block_id,
+        ) else {
+            return self.launch(agent, ticket, false);
+        };
+        let command = self.agent_command(agent);
+        let block = self
+            .rex
+            .split(&session, &anchor, false, &command, Path::new(&agent.cwd))?;
+        self.append(Event::AgentLaunched {
+            agent_id: agent.id.clone(),
+            rex_session_id: session,
+            rex_window_id: window,
+            rex_block_id: block,
+            resume: false,
+        })
+    }
+
     /// Every active Ticket should have a running Coordinator. Starts the
     /// missing ones: a resume when the harness session is known, else a new
     /// launch. Failed attempts back off and eventually fail the Ticket.
     fn ensure_coordinators(&mut self) -> Result<()> {
         for ticket in self.store.tickets(None)? {
+            if ticket.state == TicketState::Verifying {
+                self.launch_failures.remove(&ticket.id);
+                continue;
+            }
             if !ticket.state.is_active() {
                 self.launch_failures.remove(&ticket.id);
                 continue;
@@ -654,6 +1000,27 @@ impl<R: Rex> Serve<R> {
             .with_context(|| format!("failed to read starting commit from {}", dir.display()))?;
         let playbook =
             crate::playbook::resolve_for_ticket(&self.paths, project, ticket.playbook.as_deref())?;
+        if let Some(verifier) = playbook
+            .as_ref()
+            .and_then(|p| p.spec.as_ref())
+            .and_then(|s| s.verification.as_ref())
+            .and_then(|v| v.verifier.as_ref())
+        {
+            provider::role_base_text(&self.paths, &verifier.role).with_context(|| {
+                format!(
+                    "verification verifier Role {:?} is unavailable",
+                    verifier.role
+                )
+            })?;
+            config
+                .provider(&project.agent_spec(&verifier.role).provider)
+                .with_context(|| {
+                    format!(
+                        "provider for verification verifier Role {:?} is unavailable",
+                        verifier.role
+                    )
+                })?;
+        }
         let policy = crate::policy::load(&self.paths.config_dir, &project.id)?;
         let agent_id = coordinator_id(&ticket.id);
         let mut events = Vec::new();
@@ -895,6 +1262,120 @@ mod tests {
         fn events(&self) -> usize {
             self.serve.store.events_since(0, 1000).unwrap().len()
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_check_is_restarted_from_persisted_results() {
+        let mut f = fixture();
+        let id = "demo-1";
+        let cwd = f.serve.paths.worktree_dir("demo", id);
+        std::fs::create_dir_all(&cwd).unwrap();
+        let coordinator = "demo-1-coordinator";
+        f.serve
+            .store
+            .append_all(
+                "serve",
+                &[
+                    Event::AgentCreated {
+                        agent_id: coordinator.into(),
+                        ticket_id: id.into(),
+                        project_id: "demo".into(),
+                        role: "coordinator".into(),
+                        provider: "claude".into(),
+                        cwd: cwd.display().to_string(),
+                    },
+                    Event::TicketDispatched {
+                        ticket_id: id.into(),
+                        agent_id: coordinator.into(),
+                    },
+                    Event::TicketPrepared {
+                        ticket_id: id.into(),
+                        base_commit: "abc123".into(),
+                        playbook: Some(crate::playbook::PlaybookSnapshot {
+                            name: "feature".into(),
+                            sha256: "a".repeat(64),
+                            body: String::new(),
+                            spec: Some(crate::playbook::PlaybookSpec {
+                                stages: vec![],
+                                roles: None,
+                                gates: Default::default(),
+                                budgets: None,
+                                verification: Some(crate::playbook::VerificationSpec {
+                                    checks: vec![crate::playbook::CheckSpec {
+                                        name: "slow".into(),
+                                        argv: vec![
+                                            "sh".into(),
+                                            "-c".into(),
+                                            "sleep 0.2; echo done".into(),
+                                        ],
+                                        timeout_minutes: Some(1),
+                                    }],
+                                    verifier: None,
+                                }),
+                            }),
+                        }),
+                        policy: None,
+                    },
+                ],
+            )
+            .unwrap();
+        f.serve
+            .store
+            .append(
+                coordinator,
+                Event::TicketCompleted {
+                    ticket_id: id.into(),
+                    outcome: Outcome::Delivered,
+                    summary: "done".into(),
+                    artifacts: vec![],
+                },
+            )
+            .unwrap();
+        f.serve.advance_verification_checks().unwrap();
+
+        // Simulate process death: dropping the original Serve detaches its
+        // child thread before it can commit a result. The new Serve sees only
+        // durable events and reruns the unfinished check.
+        let Serve {
+            paths,
+            store,
+            rex,
+            exe,
+            ..
+        } = f.serve;
+        let mut resumed = Serve::new(paths, store, rex, exe);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while resumed.store.ticket(id).unwrap().unwrap().state == TicketState::Verifying
+            && Instant::now() < deadline
+        {
+            resumed.advance_verification_checks().unwrap();
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(
+            resumed.store.ticket(id).unwrap().unwrap().state,
+            TicketState::Done
+        );
+        let checks = resumed.store.ticket_events(id).unwrap();
+        assert!(
+            checks
+                .iter()
+                .filter(|e| matches!(e.event, Event::VerificationCheckStarted { .. }))
+                .count()
+                >= 2
+        );
+        assert_eq!(
+            checks
+                .iter()
+                .filter(|e| matches!(e.event, Event::VerificationCheckFinished { .. }))
+                .count(),
+            1
+        );
+        resumed.store.rebuild().unwrap();
+        assert_eq!(
+            resumed.store.ticket(id).unwrap().unwrap().state,
+            TicketState::Done
+        );
     }
 
     fn spawn(f: &mut Fixture, role: &str) -> String {

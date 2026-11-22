@@ -201,6 +201,35 @@ pub enum Event {
         #[serde(default)]
         artifacts: Vec<String>,
     },
+    /// A declared check was started or completed during one verification attempt.
+    VerificationCheckStarted {
+        ticket_id: String,
+        attempt: u32,
+        name: String,
+    },
+    VerificationCheckFinished {
+        ticket_id: String,
+        attempt: u32,
+        name: String,
+        passed: bool,
+        timed_out: bool,
+        exit_code: Option<i32>,
+        output_tail: String,
+    },
+    VerificationFailed {
+        ticket_id: String,
+        attempt: u32,
+        reason: String,
+    },
+    TicketVerified {
+        ticket_id: String,
+        attempt: u32,
+    },
+    VerificationVerifierAssigned {
+        ticket_id: String,
+        attempt: u32,
+        agent_id: String,
+    },
     TicketCancelled {
         ticket_id: String,
         reason: String,
@@ -279,6 +308,11 @@ impl Event {
             Self::TicketAsked { .. } => "ticket_asked",
             Self::TicketAnswered { .. } => "ticket_answered",
             Self::TicketCompleted { .. } => "ticket_completed",
+            Self::VerificationCheckStarted { .. } => "verification_check_started",
+            Self::VerificationCheckFinished { .. } => "verification_check_finished",
+            Self::VerificationFailed { .. } => "verification_failed",
+            Self::TicketVerified { .. } => "ticket_verified",
+            Self::VerificationVerifierAssigned { .. } => "verification_verifier_assigned",
             Self::TicketCancelled { .. } => "ticket_cancelled",
             Self::TicketFailed { .. } => "ticket_failed",
             Self::ExternalChanged { .. } => "external_changed",
@@ -305,6 +339,11 @@ impl Event {
             | Self::TicketAsked { ticket_id, .. }
             | Self::TicketAnswered { ticket_id, .. }
             | Self::TicketCompleted { ticket_id, .. }
+            | Self::VerificationCheckStarted { ticket_id, .. }
+            | Self::VerificationCheckFinished { ticket_id, .. }
+            | Self::VerificationFailed { ticket_id, .. }
+            | Self::TicketVerified { ticket_id, .. }
+            | Self::VerificationVerifierAssigned { ticket_id, .. }
             | Self::TicketCancelled { ticket_id, .. }
             | Self::TicketFailed { ticket_id, .. }
             | Self::ExternalChanged { ticket_id, .. }
