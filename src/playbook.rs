@@ -109,6 +109,16 @@ impl<'de> Deserialize<'de> for PlaybookSpec {
             }
         }
         if let Some(v) = &raw.verification {
+            if let Some(verifier) = &v.verifier {
+                crate::config::validate_id(&verifier.role).map_err(|err| {
+                    serde::de::Error::custom(format!("verification.verifier.role {err}"))
+                })?;
+                if verifier.role == "coordinator" {
+                    return Err(serde::de::Error::custom(
+                        "verification.verifier.role must not be coordinator",
+                    ));
+                }
+            }
             for check in &v.checks {
                 if check.name.trim().is_empty() {
                     return Err(serde::de::Error::custom(

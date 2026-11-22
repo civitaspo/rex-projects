@@ -575,6 +575,8 @@ pub mod fake {
         pub sessions: BTreeMap<String, String>,
         pub blocks: BTreeMap<String, Block>,
         pub fail_new_window: bool,
+        /// Optional marker written when a pane closes, for ordering tests.
+        pub close_marker: Option<PathBuf>,
         next: u32,
     }
 
@@ -681,6 +683,9 @@ pub mod fake {
 
         fn close_block(&mut self, _session_id: &str, block_id: &str) -> Result<()> {
             self.blocks.remove(block_id);
+            if let Some(path) = &self.close_marker {
+                std::fs::write(path, block_id)?;
+            }
             Ok(())
         }
 

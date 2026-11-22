@@ -666,6 +666,109 @@ fn preparation_in(
         .transpose()
 }
 
+fn require_attempt_in(
+    tx: &Transaction<'_>,
+    ticket_id: &str,
+    attempt: u32,
+    admit: bool,
+) -> Result<()> {
+    if !admit {
+        return Ok(());
+    }
+    let failures: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM events WHERE ticket_id = ?1 AND kind = 'verification_failed'",
+        params![ticket_id],
+        |row| row.get(0),
+    )?;
+    if attempt == 0 || i64::from(attempt) != failures + 1 {
+        bail!("stale or invalid verification attempt {attempt} for Ticket {ticket_id}");
+    }
+    Ok(())
+}
+
+fn validate_check_in(
+    tx: &Transaction<'_>,
+    ticket_id: &str,
+    attempt: u32,
+    name: &str,
+    admit: bool,
+) -> Result<()> {
+    require_attempt_in(tx, ticket_id, attempt, admit)?;
+    let prep = preparation_in(tx, ticket_id)?.context("Ticket has no preparation")?;
+    let names = prep
+        .playbook
+        .and_then(|p| p.spec)
+        .and_then(|s| s.verification)
+        .map(|v| v.checks.into_iter().map(|c| c.name).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if !names.iter().any(|declared| declared == name) {
+        bail!("verification check {name:?} is not declared by the Ticket's Playbook");
+    }
+    Ok(())
+}
+
+fn ensure_checks_passed_in(tx: &Transaction<'_>, ticket_id: &str, attempt: u32) -> Result<()> {
+    let prep = preparation_in(tx, ticket_id)?.context("Ticket has no preparation")?;
+    let checks = prep
+        .playbook
+        .and_then(|p| p.spec)
+        .and_then(|s| s.verification)
+        .map(|v| v.checks)
+        .unwrap_or_default();
+    for check in checks {
+        let passed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE ticket_id = ?1 AND kind = 'verification_check_finished' AND json_extract(payload, '$.attempt') = ?2 AND json_extract(payload, '$.name') = ?3 AND json_extract(payload, '$.passed') = 1)",
+            params![ticket_id, attempt, check.name], |row| row.get(0),
+        )?;
+        if !passed {
+            bail!(
+                "verification check {:?} has not passed in attempt {attempt}",
+                check.name
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ensure_verification_complete_in(
+    tx: &Transaction<'_>,
+    ticket_id: &str,
+    attempt: u32,
+) -> Result<()> {
+    ensure_checks_passed_in(tx, ticket_id, attempt)?;
+    let prep = preparation_in(tx, ticket_id)?.context("Ticket has no preparation")?;
+    let verifier = prep
+        .playbook
+        .and_then(|p| p.spec)
+        .and_then(|s| s.verification)
+        .and_then(|v| v.verifier);
+    if let Some(verifier) = verifier {
+        let Some(agent_id) = assigned_verifier_in(tx, ticket_id, attempt)? else {
+            bail!("the declared verifier has not reported for attempt {attempt}");
+        };
+        let role: String = tx.query_row(
+            "SELECT role FROM agents WHERE id = ?1",
+            params![agent_id],
+            |r| r.get(0),
+        )?;
+        if role != verifier.role {
+            bail!("verifier assignment does not match the declared Role");
+        }
+    }
+    Ok(())
+}
+
+fn assigned_verifier_in(
+    tx: &Transaction<'_>,
+    ticket_id: &str,
+    attempt: u32,
+) -> Result<Option<String>> {
+    Ok(tx.query_row(
+        "SELECT json_extract(payload, '$.agent_id') FROM events WHERE ticket_id = ?1 AND kind = 'verification_verifier_assigned' AND json_extract(payload, '$.attempt') = ?2 ORDER BY seq DESC LIMIT 1",
+        params![ticket_id, attempt], |row| row.get(0),
+    ).optional()?)
+}
+
 fn require_approval(conn: &Connection, ticket_id: &str, kind: &str) -> Result<()> {
     let approved: bool = conn.query_row(
         "SELECT COALESCE((SELECT approved FROM approval_decisions WHERE ticket_id = ?1 AND kind = ?2), 0)",
@@ -963,7 +1066,14 @@ fn project(
                     require_approval(tx, ticket_id, &kind)?;
                 }
             }
+            let verify = *outcome == Outcome::Delivered
+                && preparation_in(tx, ticket_id)?
+                    .and_then(|p| p.playbook)
+                    .and_then(|p| p.spec)
+                    .and_then(|s| s.verification)
+                    .is_some();
             let next = match outcome {
+                Outcome::Delivered if verify => TicketState::Verifying,
                 Outcome::Delivered => Done,
                 Outcome::Abandoned => Abandoned,
                 Outcome::Failed => Failed,
@@ -972,15 +1082,200 @@ fn project(
             // An ended Ticket has no next step, and a delivered one is complete.
             tx.execute(
                 "UPDATE tickets SET summary = ?2, outcome = ?3, question = NULL, next = NULL,
-                   progress = CASE WHEN ?3 = 'delivered' THEN 100 ELSE progress END
+                   stage = CASE WHEN ?3 = 'delivered' AND ?4 = 1 THEN 'verification' ELSE stage END,
+                   progress = CASE WHEN ?3 = 'delivered' AND ?4 = 0 THEN 100 ELSE progress END
                  WHERE id = ?1",
-                params![ticket_id, summary, serde_json::to_value(outcome)?.as_str()],
+                params![
+                    ticket_id,
+                    summary,
+                    serde_json::to_value(outcome)?.as_str(),
+                    verify
+                ],
             )?;
             tx.execute(
                 "DELETE FROM pending_approvals WHERE ticket_id = ?1",
                 params![ticket_id],
             )?;
             merge_artifacts(tx, ticket_id, artifacts)?;
+            if verify {
+                tx.execute("UPDATE agents SET state = 'finished', exit_reason = 'verification started', updated_at = ?2 WHERE ticket_id = ?1 AND role != 'coordinator' AND state IN ('created', 'running')", params![ticket_id, at])?;
+            }
+        }
+        Event::VerificationCheckStarted {
+            ticket_id,
+            attempt,
+            name,
+        } => {
+            require(
+                ticket_id,
+                ticket_state(tx, ticket_id)?,
+                &[Verifying],
+                "record verification",
+            )?;
+            if admit && actor != "serve" {
+                bail!("only serve may start verification checks");
+            }
+            validate_check_in(tx, ticket_id, *attempt, name, admit)?;
+            tx.execute(
+                "UPDATE tickets SET stage = ?2 WHERE id = ?1",
+                params![ticket_id, format!("verification attempt {attempt}: {name}")],
+            )?;
+        }
+        Event::VerificationCheckFinished {
+            ticket_id,
+            attempt,
+            name,
+            ..
+        } => {
+            require(
+                ticket_id,
+                ticket_state(tx, ticket_id)?,
+                &[Verifying],
+                "record verification",
+            )?;
+            if admit && actor != "serve" {
+                bail!("only serve may finish verification checks");
+            }
+            validate_check_in(tx, ticket_id, *attempt, name, admit)?;
+            if admit {
+                let started: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE ticket_id = ?1 AND kind = 'verification_check_started' AND json_extract(payload, '$.attempt') = ?2 AND json_extract(payload, '$.name') = ?3)", params![ticket_id, attempt, name], |r| r.get(0))?;
+                let finished: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE ticket_id = ?1 AND kind = 'verification_check_finished' AND json_extract(payload, '$.attempt') = ?2 AND json_extract(payload, '$.name') = ?3)", params![ticket_id, attempt, name], |r| r.get(0))?;
+                if !started || finished {
+                    bail!("verification check was not pending or already finished");
+                }
+            }
+        }
+        Event::VerificationFailed {
+            ticket_id,
+            attempt,
+            reason,
+        } => {
+            require(
+                ticket_id,
+                ticket_state(tx, ticket_id)?,
+                &[Verifying],
+                "fail verification",
+            )?;
+            require_attempt_in(tx, ticket_id, *attempt, admit)?;
+            if admit && actor != "serve" {
+                let assigned = assigned_verifier_in(tx, ticket_id, *attempt)?;
+                if assigned.as_deref() != Some(actor) {
+                    bail!("only serve or the current assigned verifier may fail verification");
+                }
+                let state: String = tx.query_row(
+                    "SELECT state FROM agents WHERE id = ?1",
+                    params![actor],
+                    |r| r.get(0),
+                )?;
+                if state != "running" {
+                    bail!("the assigned verifier is not running");
+                }
+            }
+            if reason.trim().is_empty() {
+                bail!("verification failure reason must not be empty");
+            }
+            let preparation = preparation_in(tx, ticket_id)?;
+            let limit = preparation
+                .and_then(|p| p.policy)
+                .map(|p| p.verification_attempts)
+                .unwrap_or(3);
+            let next = Running;
+            set_ticket_state(tx, ticket_id, next, at)?;
+            tx.execute(
+                "UPDATE tickets SET stage = 'implementation', question = NULL, next = NULL, summary = ?2 WHERE id = ?1",
+                params![ticket_id, reason],
+            )?;
+            if let Some(coordinator_id) = tx.query_row(
+                "SELECT coordinator_id FROM tickets WHERE id = ?1",
+                params![ticket_id],
+                |row| row.get::<_, Option<String>>(0),
+            )? {
+                tx.execute(
+                    "INSERT INTO messages (ticket_id, sender, recipient, body, sent_at) VALUES (?1, 'rex-projects', ?2, ?3, ?4)",
+                    params![ticket_id, coordinator_id, reason, at],
+                )?;
+            }
+            if *attempt >= limit {
+                // The next TicketAsked event records a human decision point.
+                // Keep the failure transition in this projection replay-safe.
+            }
+        }
+        Event::TicketVerified { ticket_id, attempt } => {
+            require(
+                ticket_id,
+                ticket_state(tx, ticket_id)?,
+                &[Verifying],
+                "finish verification",
+            )?;
+            require_attempt_in(tx, ticket_id, *attempt, admit)?;
+            ensure_verification_complete_in(tx, ticket_id, *attempt)?;
+            if admit {
+                let verifier_declared = preparation_in(tx, ticket_id)?
+                    .and_then(|p| p.playbook)
+                    .and_then(|p| p.spec)
+                    .and_then(|s| s.verification)
+                    .and_then(|v| v.verifier)
+                    .is_some();
+                let authorized = if verifier_declared {
+                    let assigned = assigned_verifier_in(tx, ticket_id, *attempt)?;
+                    if assigned.as_deref() != Some(actor) {
+                        false
+                    } else {
+                        let state: String = tx.query_row(
+                            "SELECT state FROM agents WHERE id = ?1",
+                            params![actor],
+                            |r| r.get(0),
+                        )?;
+                        state == "running"
+                    }
+                } else {
+                    actor == "serve"
+                };
+                if !authorized {
+                    bail!("only the assigned verifier or serve may finish verification");
+                }
+            }
+            set_ticket_state(tx, ticket_id, Done, at)?;
+            tx.execute(
+                "UPDATE tickets SET stage = NULL, question = NULL, next = NULL, progress = 100 WHERE id = ?1",
+                params![ticket_id],
+            )?;
+        }
+        Event::VerificationVerifierAssigned {
+            ticket_id,
+            attempt,
+            agent_id,
+        } => {
+            require(
+                ticket_id,
+                ticket_state(tx, ticket_id)?,
+                &[Verifying],
+                "assign verifier",
+            )?;
+            require_attempt_in(tx, ticket_id, *attempt, admit)?;
+            if admit && actor != "serve" {
+                bail!("only serve may assign a verifier");
+            }
+            ensure_checks_passed_in(tx, ticket_id, *attempt)?;
+            let prep = preparation_in(tx, ticket_id)?.context("Ticket has no preparation")?;
+            let role = prep
+                .playbook
+                .and_then(|p| p.spec)
+                .and_then(|s| s.verification)
+                .and_then(|v| v.verifier)
+                .map(|v| v.role)
+                .context("Ticket has no verifier role")?;
+            let matches: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1 AND ticket_id = ?2 AND role = ?3)", params![agent_id, ticket_id, role], |r| r.get(0))?;
+            if !matches {
+                bail!("assigned Agent is not the declared verifier");
+            }
+            tx.execute(
+                "UPDATE tickets SET stage = ?2 WHERE id = ?1",
+                params![
+                    ticket_id,
+                    format!("verification attempt {attempt}: verifier")
+                ],
+            )?;
         }
         Event::TicketCancelled { ticket_id, reason }
         | Event::TicketFailed { ticket_id, reason } => {
@@ -1023,6 +1318,16 @@ fn project(
             to,
             body,
         } => {
+            let state: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM tickets WHERE id = ?1",
+                    params![ticket_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if admit && state.as_deref() == Some("verifying") && from != "rex-projects" {
+                bail!("Verification is running; Agents cannot send ordinary messages");
+            }
             let agent = |id: &str| {
                 tx.query_row(
                     "SELECT ticket_id, role, state FROM agents WHERE id = ?1",
@@ -1087,8 +1392,27 @@ fn project(
         } => {
             let state = ticket_state(tx, ticket_id)?;
             // A helper joins only a Ticket that is still being worked on.
-            if admit && role != "coordinator" && !matches!(state, Running | Waiting) {
+            let is_declared_verifier = role != "coordinator"
+                && preparation_in(tx, ticket_id)?
+                    .and_then(|p| p.playbook)
+                    .and_then(|p| p.spec)
+                    .and_then(|s| s.verification)
+                    .and_then(|v| v.verifier)
+                    .is_some_and(|v| v.role == *role);
+            if admit
+                && role != "coordinator"
+                && !(matches!(state, Running | Waiting) && !is_declared_verifier)
+                && !(state == Verifying && is_declared_verifier && actor == "serve")
+            {
                 bail!("ticket {ticket_id} is {state}; helpers run only on a running Ticket");
+            }
+            if admit && state == Verifying && is_declared_verifier {
+                let failures: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM events WHERE ticket_id = ?1 AND kind = 'verification_failed'",
+                    params![ticket_id],
+                    |r| r.get(0),
+                )?;
+                ensure_checks_passed_in(tx, ticket_id, failures as u32 + 1)?;
             }
             if admit && role != "coordinator" && pending_approval_in(tx, ticket_id)?.is_some() {
                 bail!("ticket {ticket_id} is waiting for Approval; helpers cannot be spawned");
@@ -1109,10 +1433,10 @@ fn project(
             ..
         } => {
             require_agent(tx, agent_id)?;
-            let (state, ticket_id): (String, String) = tx.query_row(
-                "SELECT state, ticket_id FROM agents WHERE id = ?1",
+            let (state, ticket_id, role): (String, String, String) = tx.query_row(
+                "SELECT state, ticket_id, role FROM agents WHERE id = ?1",
                 params![agent_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
             if admit && state == "finished" {
                 bail!("agent {agent_id} was stopped before it launched");
@@ -1120,6 +1444,18 @@ fn project(
             let ticket = ticket_state(tx, &ticket_id)?;
             if admit && ticket.is_terminal() {
                 bail!("ticket {ticket_id} is {ticket}; agent {agent_id} cannot launch");
+            }
+            if admit && ticket == Verifying && role != "coordinator" {
+                let failures: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM events WHERE ticket_id = ?1 AND kind = 'verification_failed'",
+                    params![ticket_id],
+                    |r| r.get(0),
+                )?;
+                if assigned_verifier_in(tx, &ticket_id, failures as u32 + 1)?.as_deref()
+                    != Some(agent_id)
+                {
+                    bail!("Verification is running; only the assigned verifier may launch");
+                }
             }
             tx.execute(
                 "UPDATE agents SET state = 'running', rex_session_id = ?2, rex_window_id = ?3,
@@ -1153,6 +1489,14 @@ fn project(
         }
         Event::AgentFinished { agent_id, reason } => {
             require_agent(tx, agent_id)?;
+            let ticket_id: String = tx.query_row(
+                "SELECT ticket_id FROM agents WHERE id = ?1",
+                params![agent_id],
+                |row| row.get(0),
+            )?;
+            if admit && ticket_state(tx, &ticket_id)? == Verifying && actor != "serve" {
+                bail!("Verification is running; an Agent must report with verify");
+            }
             let changed = tx.execute(
                 "UPDATE agents SET state = 'finished', exit_reason = ?2, updated_at = ?3
                  WHERE id = ?1 AND state IN ('created', 'running')",
@@ -1625,6 +1969,419 @@ mod tests {
         assert_eq!(before.playbook.as_ref().unwrap().body, "old body");
         store.rebuild().unwrap();
         assert_eq!(store.preparation(&id).unwrap().unwrap(), before);
+    }
+
+    #[test]
+    fn verification_requires_declared_checks_and_assigned_verifier_then_replays() {
+        let mut store = Store::open_in_memory().unwrap();
+        let ticket = new_ticket(&mut store, true);
+        let id = ticket.id.clone();
+        let coordinator = agent(&mut store, &id);
+        store
+            .append_all(
+                "serve",
+                &[
+                    Event::TicketDispatched {
+                        ticket_id: id.clone(),
+                        agent_id: coordinator.clone(),
+                    },
+                    Event::TicketPrepared {
+                        ticket_id: id.clone(),
+                        base_commit: "base".into(),
+                        playbook: Some(crate::playbook::PlaybookSnapshot {
+                            name: "feature".into(),
+                            sha256: "a".repeat(64),
+                            body: String::new(),
+                            spec: Some(crate::playbook::PlaybookSpec {
+                                stages: vec![],
+                                roles: None,
+                                gates: Default::default(),
+                                verification: Some(crate::playbook::VerificationSpec {
+                                    checks: vec![crate::playbook::CheckSpec {
+                                        name: "test".into(),
+                                        argv: vec!["true".into()],
+                                        timeout_minutes: None,
+                                    }],
+                                    verifier: Some(crate::playbook::VerifierSpec {
+                                        role: "verifier".into(),
+                                    }),
+                                }),
+                                budgets: None,
+                            }),
+                        }),
+                        policy: None,
+                    },
+                ],
+            )
+            .unwrap();
+        store
+            .append(
+                &coordinator,
+                Event::TicketCompleted {
+                    ticket_id: id.clone(),
+                    outcome: Outcome::Delivered,
+                    summary: "done".into(),
+                    artifacts: vec![],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.ticket(&id).unwrap().unwrap().state,
+            TicketState::Verifying
+        );
+        assert!(
+            store
+                .append(
+                    "serve",
+                    Event::TicketVerified {
+                        ticket_id: id.clone(),
+                        attempt: 1
+                    }
+                )
+                .is_err(),
+            "checks and verifier cannot be skipped"
+        );
+        store
+            .append(
+                "serve",
+                Event::VerificationCheckStarted {
+                    ticket_id: id.clone(),
+                    attempt: 1,
+                    name: "test".into(),
+                },
+            )
+            .unwrap();
+        store
+            .append(
+                "serve",
+                Event::VerificationCheckFinished {
+                    ticket_id: id.clone(),
+                    attempt: 1,
+                    name: "test".into(),
+                    passed: true,
+                    timed_out: false,
+                    exit_code: Some(0),
+                    output_tail: String::new(),
+                },
+            )
+            .unwrap();
+        assert!(
+            store
+                .append(
+                    "serve",
+                    Event::TicketVerified {
+                        ticket_id: id.clone(),
+                        attempt: 1
+                    }
+                )
+                .is_err(),
+            "declared verifier must report"
+        );
+        let verifier_id = format!("{id}-verifier-1");
+        let replacement_id = format!("{id}-verifier-2");
+        let launched = |agent_id: &str| Event::AgentLaunched {
+            agent_id: agent_id.into(),
+            rex_session_id: "s".into(),
+            rex_window_id: "w".into(),
+            rex_block_id: agent_id.into(),
+            resume: false,
+        };
+        store
+            .append_all(
+                "serve",
+                &[
+                    Event::AgentCreated {
+                        agent_id: verifier_id.clone(),
+                        ticket_id: id.clone(),
+                        project_id: "demo".into(),
+                        role: "verifier".into(),
+                        provider: "claude".into(),
+                        cwd: "/tmp".into(),
+                    },
+                    Event::VerificationVerifierAssigned {
+                        ticket_id: id.clone(),
+                        attempt: 1,
+                        agent_id: verifier_id.clone(),
+                    },
+                    launched(&verifier_id),
+                    Event::AgentCreated {
+                        agent_id: replacement_id.clone(),
+                        ticket_id: id.clone(),
+                        project_id: "demo".into(),
+                        role: "verifier".into(),
+                        provider: "claude".into(),
+                        cwd: "/tmp".into(),
+                    },
+                    Event::VerificationVerifierAssigned {
+                        ticket_id: id.clone(),
+                        attempt: 1,
+                        agent_id: replacement_id.clone(),
+                    },
+                    launched(&replacement_id),
+                ],
+            )
+            .unwrap();
+        assert!(
+            store
+                .append(
+                    &verifier_id,
+                    Event::TicketVerified {
+                        ticket_id: id.clone(),
+                        attempt: 1
+                    }
+                )
+                .is_err(),
+            "superseded verifier cannot finish"
+        );
+        assert!(
+            store
+                .append(
+                    &verifier_id,
+                    Event::VerificationFailed {
+                        ticket_id: id.clone(),
+                        attempt: 1,
+                        reason: "stale".into()
+                    }
+                )
+                .is_err(),
+            "superseded verifier cannot fail"
+        );
+        store
+            .append(
+                &replacement_id,
+                Event::TicketVerified {
+                    ticket_id: id.clone(),
+                    attempt: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(store.ticket(&id).unwrap().unwrap().state, TicketState::Done);
+        store.rebuild().unwrap();
+        assert_eq!(store.ticket(&id).unwrap().unwrap().state, TicketState::Done);
+    }
+
+    #[test]
+    fn failed_verification_can_be_retried_with_a_new_attempt() {
+        let mut store = Store::open_in_memory().unwrap();
+        let ticket = new_ticket(&mut store, true);
+        let id = ticket.id.clone();
+        let coordinator = agent(&mut store, &id);
+        store
+            .append_all(
+                "serve",
+                &[
+                    Event::TicketDispatched {
+                        ticket_id: id.clone(),
+                        agent_id: coordinator.clone(),
+                    },
+                    Event::TicketPrepared {
+                        ticket_id: id.clone(),
+                        base_commit: "base".into(),
+                        playbook: Some(crate::playbook::PlaybookSnapshot {
+                            name: "feature".into(),
+                            sha256: "a".repeat(64),
+                            body: String::new(),
+                            spec: Some(crate::playbook::PlaybookSpec {
+                                stages: vec![],
+                                roles: None,
+                                gates: Default::default(),
+                                verification: Some(crate::playbook::VerificationSpec {
+                                    checks: vec![crate::playbook::CheckSpec {
+                                        name: "test".into(),
+                                        argv: vec!["false".into()],
+                                        timeout_minutes: None,
+                                    }],
+                                    verifier: None,
+                                }),
+                                budgets: None,
+                            }),
+                        }),
+                        policy: None,
+                    },
+                ],
+            )
+            .unwrap();
+        store
+            .append(
+                &coordinator,
+                Event::TicketCompleted {
+                    ticket_id: id.clone(),
+                    outcome: Outcome::Delivered,
+                    summary: "done".into(),
+                    artifacts: vec![],
+                },
+            )
+            .unwrap();
+        store
+            .append_all(
+                "serve",
+                &[
+                    Event::VerificationCheckStarted {
+                        ticket_id: id.clone(),
+                        attempt: 1,
+                        name: "test".into(),
+                    },
+                    Event::VerificationCheckFinished {
+                        ticket_id: id.clone(),
+                        attempt: 1,
+                        name: "test".into(),
+                        passed: false,
+                        timed_out: false,
+                        exit_code: Some(1),
+                        output_tail: "failed".into(),
+                    },
+                    Event::VerificationFailed {
+                        ticket_id: id.clone(),
+                        attempt: 1,
+                        reason: "test failed".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            store.ticket(&id).unwrap().unwrap().state,
+            TicketState::Running
+        );
+        store
+            .append(
+                &coordinator,
+                Event::TicketCompleted {
+                    ticket_id: id.clone(),
+                    outcome: Outcome::Delivered,
+                    summary: "fixed".into(),
+                    artifacts: vec![],
+                },
+            )
+            .unwrap();
+        assert!(
+            store
+                .append(
+                    "serve",
+                    Event::VerificationCheckStarted {
+                        ticket_id: id.clone(),
+                        attempt: 1,
+                        name: "test".into()
+                    }
+                )
+                .is_err()
+        );
+        store
+            .append(
+                "serve",
+                Event::VerificationCheckStarted {
+                    ticket_id: id.clone(),
+                    attempt: 2,
+                    name: "test".into(),
+                },
+            )
+            .unwrap();
+        store.rebuild().unwrap();
+        assert_eq!(
+            store.ticket(&id).unwrap().unwrap().state,
+            TicketState::Verifying
+        );
+    }
+
+    #[test]
+    fn verification_failure_limit_opens_a_human_question() {
+        let mut store = Store::open_in_memory().unwrap();
+        let ticket = new_ticket(&mut store, true);
+        let id = ticket.id.clone();
+        let coordinator = agent(&mut store, &id);
+        store
+            .append_all(
+                "serve",
+                &[
+                    Event::TicketDispatched {
+                        ticket_id: id.clone(),
+                        agent_id: coordinator.clone(),
+                    },
+                    Event::TicketPrepared {
+                        ticket_id: id.clone(),
+                        base_commit: "base".into(),
+                        playbook: Some(crate::playbook::PlaybookSnapshot {
+                            name: "feature".into(),
+                            sha256: "a".repeat(64),
+                            body: String::new(),
+                            spec: Some(crate::playbook::PlaybookSpec {
+                                stages: vec![],
+                                roles: None,
+                                gates: Default::default(),
+                                verification: Some(crate::playbook::VerificationSpec {
+                                    checks: vec![crate::playbook::CheckSpec {
+                                        name: "test".into(),
+                                        argv: vec!["false".into()],
+                                        timeout_minutes: None,
+                                    }],
+                                    verifier: None,
+                                }),
+                                budgets: None,
+                            }),
+                        }),
+                        policy: Some(crate::policy::Policy {
+                            autonomy: crate::policy::Autonomy::A1,
+                            required_approvals: vec![],
+                            verification_attempts: 1,
+                            approvers: Default::default(),
+                            budgets: Default::default(),
+                        }),
+                    },
+                ],
+            )
+            .unwrap();
+        store
+            .append(
+                &coordinator,
+                Event::TicketCompleted {
+                    ticket_id: id.clone(),
+                    outcome: Outcome::Delivered,
+                    summary: "done".into(),
+                    artifacts: vec![],
+                },
+            )
+            .unwrap();
+        store
+            .append_all(
+                "serve",
+                &[
+                    Event::VerificationCheckStarted {
+                        ticket_id: id.clone(),
+                        attempt: 1,
+                        name: "test".into(),
+                    },
+                    Event::VerificationCheckFinished {
+                        ticket_id: id.clone(),
+                        attempt: 1,
+                        name: "test".into(),
+                        passed: false,
+                        timed_out: false,
+                        exit_code: Some(1),
+                        output_tail: "failed".into(),
+                    },
+                    Event::VerificationFailed {
+                        ticket_id: id.clone(),
+                        attempt: 1,
+                        reason: "test failed".into(),
+                    },
+                    Event::TicketAsked {
+                        ticket_id: id.clone(),
+                        question: "Verification failed once. Continue?".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        let waiting = store.ticket(&id).unwrap().unwrap();
+        assert_eq!(waiting.state, TicketState::Waiting);
+        assert_eq!(
+            waiting.question.as_deref(),
+            Some("Verification failed once. Continue?")
+        );
+        assert_eq!(store.unread(&coordinator).unwrap().len(), 1);
+        store.rebuild().unwrap();
+        assert_eq!(
+            store.ticket(&id).unwrap().unwrap().state,
+            TicketState::Waiting
+        );
     }
 
     #[test]

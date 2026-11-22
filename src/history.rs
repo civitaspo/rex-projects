@@ -149,6 +149,40 @@ fn describe(actor: &str, event: &Event) -> Option<String> {
         }
         Event::TicketCancelled { reason, .. } => format!("cancelled by {actor}: {reason}"),
         Event::TicketFailed { reason, .. } => format!("failed: {reason}"),
+        Event::VerificationCheckStarted { attempt, name, .. } => {
+            format!("verification attempt {attempt}: started check {name}")
+        }
+        Event::VerificationCheckFinished {
+            attempt,
+            name,
+            passed,
+            timed_out,
+            output_tail,
+            ..
+        } => {
+            let outcome = if *passed {
+                "passed"
+            } else if *timed_out {
+                "timed out"
+            } else {
+                "failed"
+            };
+            format!(
+                "verification attempt {attempt}: check {name} {outcome}{}",
+                if output_tail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {output_tail}")
+                }
+            )
+        }
+        Event::VerificationFailed {
+            attempt, reason, ..
+        } => format!("verification attempt {attempt} failed: {reason}"),
+        Event::TicketVerified { attempt, .. } => format!("verification attempt {attempt} passed"),
+        Event::VerificationVerifierAssigned {
+            attempt, agent_id, ..
+        } => format!("assigned {agent_id} as verifier for attempt {attempt}"),
         Event::ExternalChanged {
             tracker,
             reference,
